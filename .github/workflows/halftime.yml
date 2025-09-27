@@ -1,0 +1,20 @@
+name: Halftime Bot
+
+on:
+  workflow_dispatch: {}   # allow manual run
+  schedule:
+    - cron: "*/10 16-23 * * 6"  # Sat 12-7 PM ET (NCAAF)
+    - cron: "*/10 17-23 * * 0"  # Sun 1-7 PM ET (NFL)
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - run: npm install
+      - run: npx playwright install --with-deps chromium
+      - name: Run orchestrator
+        run: npm start
