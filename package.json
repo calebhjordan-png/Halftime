@@ -4,11 +4,11 @@
   "type": "module",
   "private": true,
   "scripts": {
-    "start": "node orchestrator.mjs"
+    "start": "node orchestrator.mjs",
+    "probe": "node probe.mjs"
   },
   "dependencies": {
-    "playwright": "^1.47.0",
-    "node-fetch": "^3.3.2",
-    "googleapis": "^131.0.0"
+    "googleapis": "^131.0.0",
+    "playwright": "^1.47.0"
   }
 }
