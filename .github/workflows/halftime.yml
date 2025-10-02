@@ -2,8 +2,9 @@ name: Halftime Bot
 
 on:
   workflow_dispatch:
+  # optional: every 15 min Fri–Sun (UTC). Remove if you don't want auto.
   schedule:
-    - cron: "*/15 12-23 * * 5-7"   # optional: auto Fri–Sun
+    - cron: "*/15 12-23 * * 5-7"
 
 jobs:
   run-bot:
@@ -20,10 +21,35 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: 20
+
+      - name: Show repo files
+        run: |
+          echo "PWD=$(pwd)"
+          ls -la
+
+      - name: Preflight env (safe)
+        run: |
+          node -e "console.log('SHEET_ID len:', (process.env.GOOGLE_SHEET_ID||'').length);
+                   console.log('SERVICE_ACCOUNT present:', !!process.env.GOOGLE_SERVICE_ACCOUNT);"
 
       - name: Install deps
         run: npm install
+
+      - name: Probe Google Sheets (inline)
+        run: |
+          node --input-type=module -e "
+            import { google } from 'googleapis';
+            const id = process.env.GOOGLE_SHEET_ID;
+            const raw = process.env.GOOGLE_SERVICE_ACCOUNT || '';
+            console.log('[probe] SHEET_ID len:', id ? id.length : 0);
+            console.log('[probe] SERVICE_ACCOUNT present:', !!raw);
+            const creds = JSON.parse(raw || '{}');
+            const key = (creds.private_key || '').replace(/\\n/g, '\n');
+            const jwt = new google.auth.JWT(creds.client_email, null, key, ['https://www.googleapis.com/auth/spreadsheets.readonly']);
+            const sheets = google.sheets({version:'v4', auth: jwt});
+            const res = await sheets.spreadsheets.get({ spreadsheetId: id });
+            console.log('[probe] Sheets auth OK. Title:', res.data.properties?.title || '(unknown)');"
 
       - name: Install Playwright (Chromium)
         run: npx playwright install --with-deps chromium
