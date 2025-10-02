@@ -1,20 +1,33 @@
 name: Halftime Bot
 
 on:
-  workflow_dispatch: {}   # allow manual run
+  workflow_dispatch:          # manual run button
   schedule:
-    - cron: "*/10 16-23 * * 6"  # Sat 12-7 PM ET (NCAAF)
-    - cron: "*/10 17-23 * * 0"  # Sun 1-7 PM ET (NFL)
+    - cron: "*/15 12-23 * * 5-7"   # every 15 min Fri–Sun (UTC hours 12–23)
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
+
+    # <- pass secrets to the process.env used by orchestrator.mjs
+    env:
+      GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+      GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
         with:
-          node-version: '20'
-      - run: npm install
-      - run: npx playwright install --with-deps chromium
+          node-version: 22
+
+      - name: Install deps
+        run: npm install
+
+      - name: Install Playwright (Chromium)
+        run: npx playwright install --with-deps chromium
+
       - name: Run orchestrator
-        run: npm start
+        run: node orchestrator.mjs
