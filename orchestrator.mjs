@@ -1,14 +1,24 @@
-// orchestrator.mjs
+// orchestrator.mjs — TEMP TEST: prove secrets + Google Sheets write.
+// It appends a simple row to the "Data" sheet. Once this passes, we can
+// swap back in your full halftime/pregame logic confidently.
+
 import { google } from "googleapis";
 
 // ---- Load Secrets from GitHub Actions ----
-const SHEET_ID = process.env.GOOGLE_SHEET_ID;
-const CREDS = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT || "{}");
+const SHEET_ID = process.env.GOOGLE_SHEET_ID || "";
+const RAW = process.env.GOOGLE_SERVICE_ACCOUNT || "";
 
-// ---- Debug Logs ----
 console.log("=== DEBUG START ===");
-console.log("Loaded Sheet ID:", SHEET_ID);
-console.log("Creds keys:", Object.keys(CREDS));
+console.log("[dbg] SHEET_ID len:", SHEET_ID.length);
+console.log("[dbg] SERVICE_ACCOUNT present:", !!RAW);
+let CREDS = {};
+try {
+  CREDS = JSON.parse(RAW);
+  console.log("[dbg] creds keys:", Object.keys(CREDS));
+} catch (e) {
+  console.error("❌ JSON parse failed for GOOGLE_SERVICE_ACCOUNT:", e.message);
+  process.exit(1);
+}
 console.log("=== DEBUG END ===");
 
 // ---- Authenticate with Google Sheets ----
@@ -17,46 +27,38 @@ async function authorize() {
     const auth = new google.auth.GoogleAuth({
       credentials: {
         client_email: CREDS.client_email,
-        private_key: CREDS.private_key?.replace(/\\n/g, "\n"),
+        private_key: (CREDS.private_key || "").replace(/\\n/g, "\n")
       },
-      scopes: ["https://www.googleapis.com/auth/spreadsheets"],
+      scopes: ["https://www.googleapis.com/auth/spreadsheets"]
     });
     const sheets = google.sheets({ version: "v4", auth });
     return sheets;
   } catch (err) {
-    console.error("❌ Auth error:", err);
+    console.error("❌ Auth error:", err.message);
     process.exit(1);
   }
 }
 
 // ---- Append a Test Row ----
-async function appendTestRow() {
-  const sheets = await authorize();
-  const now = new Date().toLocaleString("en-US", { timeZone: "America/New_York" });
-  const row = [now, "GitHub Actions test", "Success ✅"];
-
+(async () => {
   try {
+    const sheets = await authorize();
+
+    // Write into the "Data" tab explicitly so we don't hit the wrong sheet.
+    const nowET = new Date().toLocaleString("en-US", { timeZone: "America/New_York" });
+    const row = [nowET, "GitHub Actions test", "Success ✅"];
+
     const res = await sheets.spreadsheets.values.append({
       spreadsheetId: SHEET_ID,
-      range: "A1",
+      range: "Data!A2",
       valueInputOption: "USER_ENTERED",
-      requestBody: {
-        values: [row],
-      },
+      requestBody: { values: [row] }
     });
+
     console.log("✅ Row appended:", res.data.updates);
+    console.log("🎉 Test completed successfully");
   } catch (err) {
-    console.error("❌ Write error:", err);
+    console.error("❌ Write error:", err.message);
     process.exit(1);
   }
-}
-
-// ---- Run ----
-appendTestRow()
-  .then(() => {
-    console.log("🎉 Script completed successfully");
-  })
-  .catch((err) => {
-    console.error("💥 Unexpected error:", err);
-    process.exit(1);
-  });
+})();
