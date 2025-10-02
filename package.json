@@ -4,8 +4,7 @@
   "type": "module",
   "private": true,
   "scripts": {
-    "start": "node orchestrator.mjs",
-    "probe": "node probe.mjs"
+    "start": "node orchestrator.mjs"
   },
   "dependencies": {
     "googleapis": "^131.0.0",
