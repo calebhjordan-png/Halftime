@@ -36,23 +36,31 @@ jobs:
       - name: Install deps
         run: npm install
 
-      - name: Probe Google Sheets (inline)
+      # --- NEW: strict validator for the GOOGLE_SERVICE_ACCOUNT secret ---
+      - name: Validate GOOGLE_SERVICE_ACCOUNT JSON (inline)
         run: |
           node --input-type=module -e "
-            import { google } from 'googleapis';
-            const id = process.env.GOOGLE_SHEET_ID;
             const raw = process.env.GOOGLE_SERVICE_ACCOUNT || '';
-            console.log('[probe] SHEET_ID len:', id ? id.length : 0);
-            console.log('[probe] SERVICE_ACCOUNT present:', !!raw);
-            const creds = JSON.parse(raw || '{}');
-            const key = (creds.private_key || '').replace(/\\n/g, '\n');
-            const jwt = new google.auth.JWT(creds.client_email, null, key, ['https://www.googleapis.com/auth/spreadsheets.readonly']);
-            const sheets = google.sheets({version:'v4', auth: jwt});
-            const res = await sheets.spreadsheets.get({ spreadsheetId: id });
-            console.log('[probe] Sheets auth OK. Title:', res.data.properties?.title || '(unknown)');"
+            console.log('[val] RAW length:', raw.length);
+            try {
+              const j = JSON.parse(raw);
+              console.log('[val] Parsed OK. Keys:', Object.keys(j));
+              console.log('[val] client_email:', j.client_email || '(missing)');
+              const pk = j.private_key || '';
+              console.log('[val] private_key starts with:', pk.slice(0, 30));
+              console.log('[val] contains literal \\n characters?', /\\n/.test(pk));
+              console.log('[val] contains BEGIN header?', pk.includes('-----BEGIN PRIVATE KEY-----'));
+            } catch (e) {
+              console.error('[val] JSON parse FAILED:', e.message);
+              process.exit(1);
+            }
+          "
+        env:
+          GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
 
+      # Playwright is not required for the test write, but keep if you'll need it later.
       - name: Install Playwright (Chromium)
         run: npx playwright install --with-deps chromium
 
-      - name: Run orchestrator
+      - name: Run orchestrator (test write)
         run: node orchestrator.mjs
