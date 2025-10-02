@@ -1,15 +1,14 @@
 name: Halftime Bot
 
 on:
-  workflow_dispatch:          # manual run button
+  workflow_dispatch:
   schedule:
-    - cron: "*/15 12-23 * * 5-7"   # every 15 min Fri–Sun (UTC hours 12–23)
+    - cron: "*/15 12-23 * * 5-7"   # optional: auto Fri–Sun
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
 
-    # <- pass secrets to the process.env used by orchestrator.mjs
     env:
       GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
       GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
