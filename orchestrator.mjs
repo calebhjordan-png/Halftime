@@ -1,5 +1,5 @@
-// orchestrator.mjs — stateless writer for your NFL/CFB sheet
-// Sheet columns (A..P):
+// orchestrator.mjs — stateless writer for your NFL/CFB Google Sheet
+// Columns (A..P) expected in both tabs (NFL, CFB):
 // Date | Week | Status | Matchup | Final Score | Away Spread | Away ML | Home Spread | Home ML | Total | Half Score | Live Away Spread | Live Away ML | Live Home Spread | Live Home ML | Live Total
 
 import { execSync } from "child_process";
@@ -7,9 +7,9 @@ import fetch from "node-fetch";
 import { google } from "googleapis";
 
 // ---------- CONFIG ----------
-const OPENING_MIN_BEFORE_KICK = 15;           // write OPENING 15m before kickoff
-const DEFAULT_PROVIDER = "ESPN BET";          // prefer ESPN BET, then fall back to ESPN
-const TABS = { nfl: "NFL", ncaaf: "CFB" };    // tab names in your sheet
+const OPENING_MIN_BEFORE_KICK = 15;             // write OPENING 15 minutes before kickoff
+const DEFAULT_PROVIDER = "ESPN BET";            // prefer ESPN BET, then fallback to ESPN
+const TABS = { nfl: "NFL", ncaaf: "CFB" };      // tab names in your sheet
 // --------------------------------
 
 // ---- Secrets (GitHub Actions -> Settings -> Secrets and variables -> Actions) ----
@@ -21,12 +21,24 @@ if (!SHEET_ID || !CREDS.client_email) {
   process.exit(1);
 }
 
+// Normalize private key newlines (handles \\n and real newlines)
+const normalizedKey = (CREDS.private_key || "").replace(/\\n/g, "\n");
+
 // Google Sheets client
-const jwt = new google.auth.JWT(
-  CREDS.client_email, null, CREDS.private_key,
-  ["https://www.googleapis.com/auth/spreadsheets"]
-);
-const sheets = google.sheets({ version: "v4", auth: jwt });
+let sheets;
+try {
+  const jwt = new google.auth.JWT(
+    CREDS.client_email,
+    null,
+    normalizedKey,
+    ["https://www.googleapis.com/auth/spreadsheets"]
+  );
+  sheets = google.sheets({ version: "v4", auth: jwt });
+  console.log("Google Sheets auth: OK");
+} catch (err) {
+  console.error("Google Sheets auth error:", err.message);
+  process.exit(1);
+}
 
 // ---------- Helpers ----------
 function mmdd(d = new Date()) {
@@ -79,7 +91,7 @@ function runEspn({ league, away, home, provider = DEFAULT_PROVIDER }) {
     const cmd = `node espn.mjs --league=${league} --away="${away}" --home="${home}" --provider="${prov}" --dom`;
     try {
       const out = execSync(cmd, { encoding: "utf8" });
-      const json = (out.match(/JSON:\\s*\\n([\\s\\S]+)$/) || [])[1];
+      const json = (out.match(/JSON:\s*\n([\s\S]+)$/) || [])[1];
       return json ? JSON.parse(json) : null;
     } catch {
       return null;
@@ -104,7 +116,7 @@ function mapToAwayHome(spread, favML, dogML) {
   } else if (s > 0) {
     return { aSpr: -Math.abs(s), aML: dogML ?? "", hSpr: s, hML: favML ?? "" };
   } else {
-    // pick ML sign to infer favorite if available
+    // if spread is 0, try ML sign to infer
     if (typeof favML === "number" && favML < 0) {
       // assume away favorite
       return { aSpr: -0, aML: favML, hSpr: 0, hML: dogML ?? "" };
@@ -144,9 +156,9 @@ async function handleLeague(lg) {
 
     const matchup = matchupString(away, home);
     const kickoffIso = comp.date || ev.date;
-    const status = comp?.status?.type || {};
-    const statusName = status.name || "";
-    const isFinal = status.completed === true || statusName === "STATUS_FINAL";
+    const statusObj = comp?.status?.type || {};
+    const statusName = statusObj.name || "";
+    const isFinal = statusObj.completed === true || statusName === "STATUS_FINAL";
     const now = new Date();
 
     // 1) OPENING — 15 minutes BEFORE kickoff
@@ -191,7 +203,7 @@ async function handleLeague(lg) {
             "HALFTIME",                  // C Status
             matchup,                     // D Matchup
             "",                          // E Final Score (not yet)
-            "", "", "", "", "",          // F..J opening columns untouched here
+            "", "", "", "", "",          // F..J opening columns not changed here
             scoreString(comp),           // K Half Score
             aSpr ?? "", aML ?? "",       // L,M Live Away Spread / ML
             hSpr ?? "", hML ?? "",       // N,O Live Home Spread / ML
@@ -213,8 +225,8 @@ async function handleLeague(lg) {
           "FINAL",          // C
           matchup,          // D
           scoreString(comp),// E Final Score
-          "", "", "", "", "", // F..J (leave as-is)
-          "", "", "", "", "", // K..O (live fields blank in FINAL row)
+          "", "", "", "", "", // F..J
+          "", "", "", "", "", // K..O
           ""                 // P
         ];
         await appendRow(lg.tab, row);
