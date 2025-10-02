@@ -1,22 +1,23 @@
-// orchestrator.mjs — stateless scheduler for espn.mjs
-// Tabs: NFL, CFB
-// Columns (A→P): 
-// Date | Week | Status | Matchup | Final Score | Away Spread | Away ML | Home Spread | Home ML | Total | Live Score | Live Away Spread | Live Away ML | Live Home Spread | Live Home ML | Live Total
+// orchestrator.mjs — stateless writer for your NFL/CFB sheet
+// Sheet columns (A..P):
+// Date | Week | Status | Matchup | Final Score | Away Spread | Away ML | Home Spread | Home ML | Total | Half Score | Live Away Spread | Live Away ML | Live Home Spread | Live Home ML | Live Total
 
 import { execSync } from "child_process";
 import fetch from "node-fetch";
 import { google } from "googleapis";
 
 // ---------- CONFIG ----------
-const OPENING_OFFSET_MIN_BEFORE_KICK = 15;   // capture opening 15 min BEFORE kickoff
-const DEFAULT_PROVIDER = "ESPN BET";         // prefer ESPN BET, fallback to ESPN
-const TABS = { nfl: "NFL", ncaaf: "CFB" };   // sheet tab names
+const OPENING_MIN_BEFORE_KICK = 15;           // write OPENING 15m before kickoff
+const DEFAULT_PROVIDER = "ESPN BET";          // prefer ESPN BET, then fall back to ESPN
+const TABS = { nfl: "NFL", ncaaf: "CFB" };    // tab names in your sheet
 // --------------------------------
 
-const SHEET_ID = process.env.SHEET_ID;
-const CREDS = JSON.parse(process.env.GOOGLE_CREDENTIALS || "{}");
+// ---- Secrets (GitHub Actions -> Settings -> Secrets and variables -> Actions) ----
+const SHEET_ID = process.env.GOOGLE_SHEET_ID;
+const CREDS = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT || "{}");
+
 if (!SHEET_ID || !CREDS.client_email) {
-  console.error("Missing SHEET_ID or GOOGLE_CREDENTIALS in GitHub secrets.");
+  console.error("Missing GOOGLE_SHEET_ID or GOOGLE_SERVICE_ACCOUNT secrets.");
   process.exit(1);
 }
 
@@ -61,7 +62,7 @@ async function appendRow(tab, row) {
 }
 // de-dupe by (Date, Matchup, Status)
 async function alreadyLogged(tab, date, matchup, status) {
-  const rows = await readRange(`${tab}!A2:P`); // through Live Total
+  const rows = await readRange(`${tab}!A2:P`);
   const key = `${date}|${matchup}|${status}`.toUpperCase();
   for (const r of rows) {
     if (!r?.length) continue;
@@ -72,13 +73,13 @@ async function alreadyLogged(tab, date, matchup, status) {
   return false;
 }
 
-// run your espn.mjs; try ESPN BET, then ESPN
+// call your espn.mjs; try ESPN BET then ESPN
 function runEspn({ league, away, home, provider = DEFAULT_PROVIDER }) {
   const tryOnce = (prov) => {
     const cmd = `node espn.mjs --league=${league} --away="${away}" --home="${home}" --provider="${prov}" --dom`;
     try {
       const out = execSync(cmd, { encoding: "utf8" });
-      const json = (out.match(/JSON:\s*\n([\s\S]+)$/) || [])[1];
+      const json = (out.match(/JSON:\\s*\\n([\\s\\S]+)$/) || [])[1];
       return json ? JSON.parse(json) : null;
     } catch {
       return null;
@@ -87,23 +88,47 @@ function runEspn({ league, away, home, provider = DEFAULT_PROVIDER }) {
   return tryOnce(provider) || tryOnce("ESPN");
 }
 
-// ESPN scoreboards
+// map a single spread/ML pair to Away/Home columns (best-effort)
+function mapToAwayHome(spread, favML, dogML) {
+  if (spread == null && favML == null && dogML == null) {
+    return { aSpr: "", aML: "", hSpr: "", hML: "" };
+  }
+  const s = Number(spread);
+  if (!Number.isFinite(s)) {
+    return { aSpr: "", aML: "", hSpr: "", hML: "" };
+  }
+  // Heuristic:
+  // if spread < 0 => treat Away as favorite; if spread > 0 => Home as favorite
+  if (s < 0) {
+    return { aSpr: s, aML: favML ?? "", hSpr: Math.abs(s), hML: dogML ?? "" };
+  } else if (s > 0) {
+    return { aSpr: -Math.abs(s), aML: dogML ?? "", hSpr: s, hML: favML ?? "" };
+  } else {
+    // pick ML sign to infer favorite if available
+    if (typeof favML === "number" && favML < 0) {
+      // assume away favorite
+      return { aSpr: -0, aML: favML, hSpr: 0, hML: dogML ?? "" };
+    }
+    return { aSpr: 0, aML: "", hSpr: 0, hML: "" };
+  }
+}
+
+// ESPN scoreboards (NFL + CFB)
 const LEAGUES = [
   { key: "nfl",   tab: TABS.nfl,   url: "https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard" },
   { key: "ncaaf", tab: TABS.ncaaf, url: "https://site.api.espn.com/apis/site/v2/sports/football/college-football/scoreboard" }
 ];
 
-// pull a readable "Week" label if ESPN provides it
+// try to pull week label
 function getWeekLabel(sb) {
   try {
     const lg = sb?.leagues?.[0];
     if (lg?.week?.number) return `Week ${lg.week.number}`;
-    // Fallback to season type (e.g., "Bowl Season" / "Regular Season")
     return lg?.season?.type?.name || "";
   } catch { return ""; }
 }
 
-// ---------- Per-league work ----------
+// ---------- Per-league handler ----------
 async function handleLeague(lg) {
   const sb = await fetchJSON(lg.url);
   const weekLabel = getWeekLabel(sb);
@@ -112,32 +137,42 @@ async function handleLeague(lg) {
 
   for (const ev of events) {
     const comp = ev.competitions?.[0]; if (!comp) continue;
+
     const home = comp.competitors.find(c => c.homeAway === "home")?.team?.shortDisplayName;
     const away = comp.competitors.find(c => c.homeAway === "away")?.team?.shortDisplayName;
     if (!home || !away) continue;
 
     const matchup = matchupString(away, home);
     const kickoffIso = comp.date || ev.date;
-    const statusName = comp?.status?.type?.name || "";
-    const isFinal = (comp?.status?.type?.completed === true) || statusName === "STATUS_FINAL";
+    const status = comp?.status?.type || {};
+    const statusName = status.name || "";
+    const isFinal = status.completed === true || statusName === "STATUS_FINAL";
     const now = new Date();
 
     // 1) OPENING — 15 minutes BEFORE kickoff
-    if (now >= isoMinusMinutes(kickoffIso, OPENING_OFFSET_MIN_BEFORE_KICK)) {
+    if (now >= isoMinusMinutes(kickoffIso, OPENING_MIN_BEFORE_KICK)) {
       const logged = await alreadyLogged(lg.tab, today, matchup, "OPENING");
       if (!logged) {
         const r = runEspn({ league: lg.key, away, home });
         if (r) {
-          // A..P: Date | Week | Status | Matchup | Final Score | AwaySpr | AwayML | HomeSpr | HomeML | Total | LiveScore | LiveAwaySpr | LiveAwayML | LiveHomeSpr | LiveHomeML | LiveTotal
-          await appendRow(lg.tab, [
-            today, weekLabel, "OPENING", matchup,
-            "",                           // Final Score (E) — not known yet
-            r.spread ?? "", r.favML ?? "",  // F,G   (Away side)
-            "", "",                          // H,I   (Home side) — opening lines usually quoted from favorite side
-            r.total ?? "",                   // J     (Total)
-            "", "", "", "", "",              // K..O  Live fields blank for opening
-            ""                                // P     Live Total blank for opening
-          ]);
+          const { aSpr, aML, hSpr, hML } = mapToAwayHome(r.spread, r.favML, r.dogML);
+          const row = [
+            today,                       // A Date
+            weekLabel,                   // B Week
+            "OPENING",                   // C Status
+            matchup,                     // D Matchup
+            "",                          // E Final Score
+            aSpr ?? "",                  // F Away Spread
+            aML ?? "",                   // G Away ML
+            hSpr ?? "",                  // H Home Spread
+            hML ?? "",                   // I Home ML
+            r.total ?? "",               // J Total
+            "",                          // K Half Score
+            "", "",                      // L,M Live Away Spread/ML
+            "", "",                      // N,O Live Home Spread/ML
+            ""                           // P Live Total
+          ];
+          await appendRow(lg.tab, row);
           console.log(`[${lg.tab}] OPENING wrote: ${matchup}`);
         }
       }
@@ -149,32 +184,40 @@ async function handleLeague(lg) {
       if (!logged) {
         const r = runEspn({ league: lg.key, away, home });
         if (r) {
-          // Map favorite/dog to Away/Home buckets if you want; here we just write the single live line on both "away/home" slots as neutral live data
-          await appendRow(lg.tab, [
-            today, weekLabel, "HALFTIME", matchup,
-            "",                               // Final Score unknown at halftime
-            "", "", "", "", "",               // F..J pregame columns not re-written here
-            scoreString(comp),                // K  Live Score
-            r.spread ?? "", r.favML ?? "",    // L..M Live Away Spread / Live Away ML (generic live line)
-            "", "",                           // N..O Live Home Spread / Live Home ML (leave blank unless you split sides)
-            r.total ?? ""                     // P  Live Total
-          ]);
+          const { aSpr, aML, hSpr, hML } = mapToAwayHome(r.spread, r.favML, r.dogML);
+          const row = [
+            today,                       // A Date
+            weekLabel,                   // B Week
+            "HALFTIME",                  // C Status
+            matchup,                     // D Matchup
+            "",                          // E Final Score (not yet)
+            "", "", "", "", "",          // F..J opening columns untouched here
+            scoreString(comp),           // K Half Score
+            aSpr ?? "", aML ?? "",       // L,M Live Away Spread / ML
+            hSpr ?? "", hML ?? "",       // N,O Live Home Spread / ML
+            r.total ?? ""                // P Live Total
+          ];
+          await appendRow(lg.tab, row);
           console.log(`[${lg.tab}] HALFTIME wrote: ${matchup}`);
         }
       }
     }
 
-    // 3) FINAL — always record final score once
+    // 3) FINAL — always capture once
     if (isFinal) {
       const logged = await alreadyLogged(lg.tab, today, matchup, "FINAL");
       if (!logged) {
-        await appendRow(lg.tab, [
-          today, weekLabel, "FINAL", matchup,
-          scoreString(comp),                 // Final Score (E)
-          "", "", "", "", "",                // F..J unchanged
-          "", "", "", "", "",                // K..O live blanks
-          ""                                 // P
-        ]);
+        const row = [
+          today,            // A
+          weekLabel,        // B
+          "FINAL",          // C
+          matchup,          // D
+          scoreString(comp),// E Final Score
+          "", "", "", "", "", // F..J (leave as-is)
+          "", "", "", "", "", // K..O (live fields blank in FINAL row)
+          ""                 // P
+        ];
+        await appendRow(lg.tab, row);
         console.log(`[${lg.tab}] FINAL wrote: ${matchup}`);
       }
     }
