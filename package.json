@@ -3,7 +3,9 @@
   "version": "1.0.0",
   "type": "module",
   "private": true,
-  "scripts": { "start": "node orchestrator.mjs" },
+  "scripts": {
+    "start": "node orchestrator.mjs"
+  },
   "dependencies": {
     "playwright": "^1.47.0",
     "node-fetch": "^3.3.2",
