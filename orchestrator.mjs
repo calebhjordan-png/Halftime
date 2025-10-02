@@ -1,134 +1,171 @@
-// orchestrator.mjs
-// Finds halftime games (NFL + NCAAF) and calls your existing espn.mjs with proper args.
-// Node 18+
+// orchestrator.mjs — stateless, ESPN/ESPN BET only
+// Writes to two tabs: NFL, CFB
+// Columns: Date | Week | Status | Matchup | Live Score | Live Spread | Live Total | Opening Line | Opening Total | Live Fav ML | Live Dog ML | 2H Spread | 2H Total | Final Score
 
-import { spawn } from "node:child_process";
-import fs from "node:fs/promises";
+import { execSync } from "child_process";
+import fetch from "node-fetch";
+import { google } from "googleapis";
 
-const LEAGUES = [
-  { key: "nfl",   sportKey: "football", leagueKey: "nfl" },
-  { key: "ncaaf", sportKey: "football", leagueKey: "college-football" },
-];
+// ---------- CONFIG ----------
+const PREGAME_OFFSET_MIN = 2;               // capture pregame at kickoff + 2 minutes
+const DEFAULT_PROVIDER = "ESPN BET";        // prefer ESPN BET, fall back to ESPN if blank
+const TABS = { nfl: "NFL", ncaaf: "CFB" };  // sheet tab names
+// --------------------------------
 
-function yyyymmdd(d = new Date()) {
-  const y = d.getFullYear(), m = String(d.getMonth()+1).padStart(2,"0"), dd = String(d.getDate()).padStart(2,"0");
-  return `${y}${m}${dd}`;
+const SHEET_ID = process.env.SHEET_ID;
+const CREDS = JSON.parse(process.env.GOOGLE_CREDENTIALS || "{}");
+if (!SHEET_ID || !CREDS.client_email) {
+  console.error("Missing SHEET_ID or GOOGLE_CREDENTIALS in GitHub secrets.");
+  process.exit(1);
 }
 
-function scoreboardUrl({sportKey, leagueKey}, date=yyyymmdd()){
-  return `https://site.api.espn.com/apis/site/v2/sports/${sportKey}/${leagueKey}/scoreboard?dates=${date}`;
-}
+// Google Sheets client
+const jwt = new google.auth.JWT(
+  CREDS.client_email, null, CREDS.private_key,
+  ["https://www.googleapis.com/auth/spreadsheets"]
+);
+const sheets = google.sheets({ version: "v4", auth: jwt });
 
+// Helpers ---------------------------------------------------------
+function mmdd(d = new Date()) {
+  return `${String(d.getMonth() + 1).padStart(2, "0")}/${String(d.getDate()).padStart(2, "0")}`;
+}
+function isoPlusMinutes(iso, mins) {
+  return new Date(new Date(iso).getTime() + mins * 60000);
+}
 async function fetchJSON(url) {
-  const r = await fetch(url, { headers: { "User-Agent": "orchestrator.mjs" }});
+  const r = await fetch(url, { headers: { "User-Agent": "halftime-orchestrator" } });
   if (!r.ok) throw new Error(`HTTP ${r.status} ${url}`);
   return r.json();
 }
-
-function normalizeName(s){ return (s||"").toUpperCase().replace(/[^A-Z0-9]/g,""); }
-function isHalftime(comp){
-  const t = comp?.status?.type;
-  if ((t?.name||"").toUpperCase() === "STATUS_HALFTIME") return true;
-  const period = comp?.status?.period ?? 0;
-  const clock = (comp?.status?.displayClock || "").toUpperCase();
-  return (period === 2 && (clock === "0:00" || clock.includes("HALFTIME")));
+function scoreString(comp) {
+  const home = comp.competitors.find(c => c.homeAway === "home");
+  const away = comp.competitors.find(c => c.homeAway === "away");
+  return `${away.score}-${home.score}`;
 }
-
-function getTeamsAbbr(comp){
-  const comps = comp?.competitors || [];
-  const home = comps.find(x => x.homeAway === "home") || comps[1];
-  const away = comps.find(x => x.homeAway === "away") || comps[0];
-  const homeName = home?.team?.shortDisplayName || home?.team?.abbreviation || home?.team?.name;
-  const awayName = away?.team?.shortDisplayName || away?.team?.abbreviation || away?.team?.name;
-  return { homeName, awayName };
+function matchupString(away, home) {
+  return `${away} @ ${home}`;
 }
-
-// simple local dedupe store
-const STATE_FILE = "./orchestrator_state.json";
-async function loadState(){
-  try { return JSON.parse(await fs.readFile(STATE_FILE, "utf8")); }
-  catch { return { logged: {} }; }
+async function readRange(range) {
+  const res = await sheets.spreadsheets.values.get({ spreadsheetId: SHEET_ID, range });
+  return res.data.values || [];
 }
-async function saveState(state){ await fs.writeFile(STATE_FILE, JSON.stringify(state, null, 2)); }
-
-async function callEspnMjs({ leagueKey, away, home }) {
-  return new Promise((resolve) => {
-    const args = ["espn.mjs", `--league=${leagueKey}`, `--away=${away}`, `--home=${home}`, "--dom", "--debug"];
-    const child = spawn("node", args, { stdio: ["ignore", "pipe", "pipe"] });
-
-    let out = "", err = "";
-    child.stdout.on("data", d => out += d.toString());
-    child.stderr.on("data", d => err += d.toString());
-    child.on("close", code => resolve({ code, out, err }));
+async function appendRow(tab, row) {
+  await sheets.spreadsheets.values.append({
+    spreadsheetId: SHEET_ID,
+    range: `${tab}!A2`,
+    valueInputOption: "RAW",
+    requestBody: { values: [row] }
   });
 }
-
-async function processLeague(leagueCfg, state){
-  const url = scoreboardUrl(leagueCfg);
-  const sb = await fetchJSON(url);
-  const events = sb?.events || [];
-  const results = [];
-
-  for (const e of events) {
-    const comp = e?.competitions?.[0];
-    if (!comp) continue;
-    const eventId = comp.id || e.id;
-    const already = state.logged[eventId];
-    if (!isHalftime(comp) || already) continue;
-
-    const { homeName, awayName } = getTeamsAbbr(comp);
-    if (!homeName || !awayName) continue;
-
-    // Mark first to avoid duplicate triggers if espn.mjs is slow; if it fails, we can unmark or let the next run try again based on output.
-    state.logged[eventId] = { at: new Date().toISOString(), league: leagueCfg.key, home: homeName, away: awayName };
-
-    // Invoke your existing script
-    const { code, out, err } = await callEspnMjs({ leagueKey: leagueCfg.key, away: awayName, home: homeName });
-
-    // Optional: if call failed, roll back dedupe so we try again next tick
-    if (code !== 0) {
-      delete state.logged[eventId];
-      await saveState(state);
-      console.error(`[orchestrator] espn.mjs failed for ${leagueCfg.key} ${awayName} @ ${homeName}:`, err || out);
-      continue;
-    }
-
-    // Extract JSON block your espn.mjs prints (after "JSON:")
-    const jsonMatch = out.match(/JSON:\s*\n([\s\S]+)$/);
-    let parsed = null;
-    if (jsonMatch) {
-      try { parsed = JSON.parse(jsonMatch[1]); }
-      catch { /* ignore parse error, keep raw out */ }
-    }
-
-    results.push({ league: leagueCfg.key, eventId, homeName, awayName, output: parsed || null, raw: out });
+// dedupe by (Date, Matchup, Status)
+async function alreadyLogged(tab, date, matchup, status) {
+  const rows = await readRange(`${tab}!A2:N`); // A..N (through Final Score column)
+  const key = `${date}|${matchup}|${status}`.toUpperCase();
+  for (const r of rows) {
+    if (!r?.length) continue;
+    const rowKey = `${(r[0]||"")}|${(r[3]||"")}|${(r[2]||"")}`.toUpperCase(); // Date (A), Matchup (D), Status (C)
+    if (rowKey === key) return true;
   }
-
-  return results;
+  return false;
 }
 
-async function main(){
-  const state = await loadState();
-  const all = [];
-  for (const lg of LEAGUES) {
+// call your espn.mjs; prefer ESPN BET, fall back to ESPN if needed
+function runEspn({ league, away, home, provider = DEFAULT_PROVIDER }) {
+  const tryOnce = (prov) => {
+    const cmd = `node espn.mjs --league=${league} --away="${away}" --home="${home}" --provider="${prov}" --dom`;
     try {
-      const res = await processLeague(lg, state);
-      all.push(...res);
+      const out = execSync(cmd, { encoding: "utf8" });
+      const json = (out.match(/JSON:\s*\n([\s\S]+)$/) || [])[1];
+      return json ? JSON.parse(json) : null;
     } catch (e) {
-      console.error(`[orchestrator] league ${lg.key} error:`, e.message);
+      return null;
     }
-  }
-  await saveState(state);
+  };
+  // try ESPN BET, then ESPN (generic)
+  return tryOnce(provider) || tryOnce("ESPN");
+}
 
-  if (all.length) {
-    console.log(`\n[orchestrator] captured ${all.length} halftime game(s):`);
-    for (const r of all) {
-      console.log(`- ${r.league.toUpperCase()}: ${r.awayName} @ ${r.homeName}`);
-      if (r.output) console.log(`  spread=${r.output.spread} total=${r.output.total} favML=${r.output.favML} dogML=${r.output.dogML}`);
+// ESPN scoreboards
+const LEAGUES = [
+  { key: "nfl",   tab: TABS.nfl,   url: "https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard" },
+  { key: "ncaaf", tab: TABS.ncaaf, url: "https://site.api.espn.com/apis/site/v2/sports/football/college-football/scoreboard" }
+];
+
+function getWeekLabel(sb) {
+  try {
+    const lg = sb?.leagues?.[0];
+    const wk = lg?.calendar?.find?.(c => c?.label && c?.entries)?.entries?.find?.(e => e?.startDate && e?.endDate);
+    // fallback to simple "Week" if provided
+    return lg?.season?.type?.name === "Regular Season" ? (lg?.week?.number ? `Week ${lg.week.number}` : "") : (lg?.season?.type?.name || "");
+  } catch { return ""; }
+}
+
+// Main per-league handler -----------------------------------------
+async function handleLeague(lg) {
+  const sb = await fetchJSON(lg.url);
+  const weekLabel = getWeekLabel(sb);
+  const events = sb.events || [];
+  const today = mmdd();
+
+  for (const ev of events) {
+    const comp = ev.competitions?.[0]; if (!comp) continue;
+    const home = comp.competitors.find(c => c.homeAway === "home")?.team?.shortDisplayName;
+    const away = comp.competitors.find(c => c.homeAway === "away")?.team?.shortDisplayName;
+    if (!home || !away) continue;
+
+    const matchup = matchupString(away, home);
+    const kickoffIso = comp.date || ev.date;
+    const statusName = comp?.status?.type?.name || "";
+
+    // ---------- PREGAME at Kickoff + 2 min ----------
+    if (new Date() >= isoPlusMinutes(kickoffIso, PREGAME_OFFSET_MIN)) {
+      const logged = await alreadyLogged(lg.tab, today, matchup, "PREGAME");
+      if (!logged) {
+        const r = runEspn({ league: lg.key, away, home });
+        if (r) {
+          // row: Date | Week | Status | Matchup | Live Score | Live Spread | Live Total | Opening Line | Opening Total | Live Fav ML | Live Dog ML | 2H Spread | 2H Total | Final Score
+          await appendRow(lg.tab, [
+            today, weekLabel, "PREGAME", matchup, "", "", "",          // A..G
+            r.spread ?? "", r.total ?? "",                               // Opening Line, Opening Total (H..I)
+            "", "",                                                      // Live Fav ML, Live Dog ML (J..K) blank at pregame
+            "", "",                                                      // 2H Spread, 2H Total (L..M) blank
+            ""                                                           // Final Score (N)
+          ]);
+          console.log(`[${lg.tab}] PREGAME wrote: ${matchup}`);
+        }
+      }
     }
-  } else {
-    console.log("[orchestrator] no new halftimes this run.");
+
+    // ---------- HALFTIME (live) ----------
+    if (statusName === "STATUS_HALFTIME") {
+      const logged = await alreadyLogged(lg.tab, today, matchup, "HALFTIME");
+      if (!logged) {
+        const r = runEspn({ league: lg.key, away, home });
+        if (r) {
+          await appendRow(lg.tab, [
+            today, weekLabel, "HALFTIME", matchup,                      // A..D
+            scoreString(comp),                                          // Live Score (E)
+            r.spread ?? "", r.total ?? "",                              // Live Spread, Live Total (F..G)
+            "", "",                                                     // Opening Line/Total (H..I) blank here; already captured at PREGAME
+            r.favML ?? "", r.dogML ?? "",                               // Live Fav ML, Live Dog ML (J..K)
+            "", "",                                                     // 2H Spread, 2H Total (L..M) — TODO if you want later
+            ""                                                          // Final Score (N)
+          ]);
+          console.log(`[${lg.tab}] HALFTIME wrote: ${matchup}`);
+        }
+      }
+    }
   }
 }
 
-main().catch(e => { console.error("[orchestrator fatal]", e); process.exit(1); });
+// Entry ------------------------------------------------------------
+async function main() {
+  for (const lg of LEAGUES) {
+    if (!lg.tab) continue;
+    try { await handleLeague(lg); }
+    catch (e) { console.error(`[${lg.key}] error:`, e.message); }
+  }
+  console.log("✓ run complete.");
+}
+await main();
