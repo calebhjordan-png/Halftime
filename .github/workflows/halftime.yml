@@ -2,9 +2,6 @@ name: Halftime Bot
 
 on:
   workflow_dispatch:
-  # optional: every 15 min Fri–Sun (UTC). Remove if you don't want auto.
-  schedule:
-    - cron: "*/15 12-23 * * 5-7"
 
 jobs:
   run-bot:
@@ -21,46 +18,10 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: 20
-
-      - name: Show repo files
-        run: |
-          echo "PWD=$(pwd)"
-          ls -la
-
-      - name: Preflight env (safe)
-        run: |
-          node -e "console.log('SHEET_ID len:', (process.env.GOOGLE_SHEET_ID||'').length);
-                   console.log('SERVICE_ACCOUNT present:', !!process.env.GOOGLE_SERVICE_ACCOUNT);"
+          node-version: 22
 
       - name: Install deps
         run: npm install
 
-      # --- NEW: strict validator for the GOOGLE_SERVICE_ACCOUNT secret ---
-      - name: Validate GOOGLE_SERVICE_ACCOUNT JSON (inline)
-        run: |
-          node --input-type=module -e "
-            const raw = process.env.GOOGLE_SERVICE_ACCOUNT || '';
-            console.log('[val] RAW length:', raw.length);
-            try {
-              const j = JSON.parse(raw);
-              console.log('[val] Parsed OK. Keys:', Object.keys(j));
-              console.log('[val] client_email:', j.client_email || '(missing)');
-              const pk = j.private_key || '';
-              console.log('[val] private_key starts with:', pk.slice(0, 30));
-              console.log('[val] contains literal \\n characters?', /\\n/.test(pk));
-              console.log('[val] contains BEGIN header?', pk.includes('-----BEGIN PRIVATE KEY-----'));
-            } catch (e) {
-              console.error('[val] JSON parse FAILED:', e.message);
-              process.exit(1);
-            }
-          "
-        env:
-          GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
-
-      # Playwright is not required for the test write, but keep if you'll need it later.
-      - name: Install Playwright (Chromium)
-        run: npx playwright install --with-deps chromium
-
-      - name: Run orchestrator (test write)
+      - name: Run orchestrator
         run: node orchestrator.mjs
