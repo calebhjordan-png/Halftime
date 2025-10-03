@@ -1,20 +1,18 @@
 import { google } from "googleapis";
-import fs from "fs";
-import path from "path";
 
-// ---- Secrets (GitHub Actions -> Settings -> Secrets and variables -> Actions) ----
+// ---- Load Secrets ----
 const SHEET_ID = process.env.GOOGLE_SHEET_ID;
 const CREDS_JSON = process.env.GOOGLE_SERVICE_ACCOUNT;
 const CREDS = JSON.parse(Buffer.from(CREDS_JSON, "base64").toString("utf-8"));
 
-// ---- Authenticate ----
+// ---- Google Auth ----
 const auth = new google.auth.GoogleAuth({
   credentials: CREDS,
   scopes: ["https://www.googleapis.com/auth/spreadsheets"],
 });
 const sheets = google.sheets({ version: "v4", auth });
 
-// ---- Example write ----
+// ---- Write Test Row ----
 async function writeTestRow() {
   try {
     const now = new Date().toLocaleString("en-US", { timeZone: "America/New_York" });
