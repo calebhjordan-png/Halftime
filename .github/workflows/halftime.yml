@@ -2,15 +2,18 @@ name: Halftime Bot
 
 on:
   workflow_dispatch:
+  schedule:
+    # Every 15 minutes on Sat/Sun (NCAAF/NFL typical) and Mon/Tue for MNF/CFB - adjust as you prefer
+    - cron: "*/15 12-23 * * 0,1,2,5,6"  # UTC; adjust to your needs
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
-
     env:
       GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
       GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
-
+      LEAGUE: nfl         # "nfl" or "college-football"
+      TAB_NAME: NFL       # where rows go
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -23,5 +26,5 @@ jobs:
       - name: Install deps
         run: npm install
 
-      - name: Run orchestrator
+      - name: Run collector
         run: node orchestrator.mjs
