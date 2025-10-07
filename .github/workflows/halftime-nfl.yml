@@ -1,44 +1,31 @@
 name: Halftime Bot (NFL)
 
 on:
-  workflow_dispatch:
   schedule:
-    # NFL: Sundays day window
+    # Sunday day games (12–7 PM ET)
     - cron: "*/15 16-23 * * 0"
-    # SNF wrap (late finals)
-    - cron: "*/20 0-2 * * 1"
-    # Mondays (MNF)
-    - cron: "*/20 0-4 * * 2"
-    # Thursdays (TNF)
-    - cron: "*/20 0-3 * * 5"
+    # Sunday Night wrap (7 PM–11 PM ET)
+    - cron: "*/15 0-3 * * 1"
+    # Monday Night Football (7 PM–12 AM ET)
+    - cron: "*/20 0-5 * * 2"
+    # Thursday Night Football (7 PM–11 PM ET)
+    - cron: "*/20 0-4 * * 5"
+  workflow_dispatch:
 
 jobs:
   run-bot:
-    name: NFL collector
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    concurrency:
-      group: halftime-nfl
-      cancel-in-progress: false
     env:
       GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
       GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
       LEAGUE: nfl
       TAB_NAME: NFL
+      RUN_SCOPE: today
     steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
-
-      - name: Setup Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: 22
-
-      - name: Install deps
-        run: npm install
-
-      - name: Install Playwright (Chromium)
-        run: npx playwright install --with-deps chromium
-
-      - name: Run collector
-        run: node orchestrator.mjs
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
+      - run: npm install
+      - run: npx playwright install --with-deps chromium
+      - run: node orchestrator.mjs
