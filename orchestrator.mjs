@@ -4,7 +4,7 @@ import * as playwright from "playwright";
 /** ====== CONFIG via GitHub Action env ====== */
 const SHEET_ID  = (process.env.GOOGLE_SHEET_ID || "").trim();
 const CREDS_RAW = (process.env.GOOGLE_SERVICE_ACCOUNT || "").trim();
-const LEAGUE    = (process.env.LEAGUE || "nfl").toLowerCase(); // "nfl" or "college-football"
+const LEAGUE    = (process.env.LEAGUE || "nfl").toLowerCase(); // "nfl" | "college-football"
 const TAB_NAME  = (process.env.TAB_NAME || "NFL").trim();
 
 /** Column names we expect in the sheet */
@@ -54,7 +54,68 @@ function mapHeadersToIndex(headerRow) {
 }
 function keyOf(dateStr, matchup) { return `${(dateStr||"").trim()}__${(matchup||"").trim()}`; }
 
-/** Build pregame row for a scoreboard event */
+/** Normalize numeric-ish value */
+function numOrBlank(v) {
+  if (v === 0) return 0;
+  if (v == null) return "";
+  const n = parseFloat(String(v).replace(/[^\d.+-]/g, ""));
+  return Number.isFinite(n) ? (String(v).trim().startsWith("+") ? `+${n}` : `${n}`) : "";
+}
+
+/** Try to pull moneylines for each team from many ESPN shapes */
+function extractMoneylines(o, awayId, homeId) {
+  let awayML = "", homeML = "";
+
+  const trySetByIds = (teamOddsArr) => {
+    if (!Array.isArray(teamOddsArr)) return false;
+    for (const t of teamOddsArr) {
+      const tid = String(t?.teamId ?? t?.team?.id ?? "");
+      const ml  = numOrBlank(t?.moneyLine ?? t?.moneyline ?? t?.money_line);
+      if (!ml) continue;
+      if (tid && tid === String(awayId)) awayML = ml;
+      if (tid && tid === String(homeId)) homeML = ml;
+    }
+    return !!(awayML || homeML);
+  };
+
+  // 1) teamOdds: [{ teamId, moneyLine }]
+  if (trySetByIds(o.teamOdds)) return { awayML, homeML };
+
+  // 2) nested competitors-> odds info (sometimes used)
+  if (Array.isArray(o.competitors)) {
+    const a = o.competitors.find(c => String(c?.id) === String(awayId) || String(c?.teamId) === String(awayId));
+    const h = o.competitors.find(c => String(c?.id) === String(homeId) || String(c?.teamId) === String(homeId));
+    if (a) awayML = awayML || numOrBlank(a.moneyLine ?? a.moneyline);
+    if (h) homeML = homeML || numOrBlank(h.moneyLine ?? h.moneyline);
+    if (awayML || homeML) return { awayML, homeML };
+  }
+
+  // 3) direct fields
+  awayML = awayML || numOrBlank(o.moneyLineAway ?? o.awayTeamMoneyLine ?? o.awayMoneyLine ?? o.awayMl);
+  homeML = homeML || numOrBlank(o.moneyLineHome ?? o.homeTeamMoneyLine ?? o.homeMoneyLine ?? o.homeMl);
+  if (awayML || homeML) return { awayML, homeML };
+
+  // 4) favorite/underdog mapping
+  const favId = String(o.favorite || "");
+  const favML = numOrBlank(o.favoriteMoneyLine);
+  const dogML = numOrBlank(o.underdogMoneyLine);
+  if (favId && (favML || dogML)) {
+    if (String(awayId) === favId) {
+      awayML = favML || awayML;
+      homeML = dogML || homeML;
+      return { awayML, homeML };
+    }
+    if (String(homeId) === favId) {
+      homeML = favML || homeML;
+      awayML = dogML || awayML;
+      return { awayML, homeML };
+    }
+  }
+
+  return { awayML, homeML };
+}
+
+/** Build pregame row */
 function pregameRow(event, weekText) {
   const comp = event.competitions?.[0] || {};
   const status = event.status?.type?.name || comp.status?.type?.name || "";
@@ -71,20 +132,13 @@ function pregameRow(event, weekText) {
     ? `${away?.score ?? ""}-${home?.score ?? ""}`
     : "";
 
-  // Pregame odds
   const o = pickOdds(comp.odds || event.odds || []);
   let awaySpread = "", homeSpread = "", total = "", awayML = "", homeML = "";
+
   if (o) {
     total = (o.overUnder ?? o.total) ?? "";
-    // Team moneylines (varies by feed)
-    if (o.moneyLineAway !== undefined) awayML = o.moneyLineAway;
-    if (o.moneyLineHome !== undefined) homeML = o.moneyLineHome;
-    if (!awayML && o.underdogMoneyLine !== undefined) {
-      const favId = String(o.favorite || "");
-      awayML = (String(away?.team?.id||"") === favId) ? o.favoriteMoneyLine : o.underdogMoneyLine;
-      homeML = (String(home?.team?.id||"") === favId) ? o.favoriteMoneyLine : o.underdogMoneyLine;
-    }
 
+    // spreads
     const favId = String(o.favorite || "");
     const spread = Number.isFinite(o.spread) ? o.spread :
                    (typeof o.spread === "string" ? parseFloat(o.spread) : NaN);
@@ -97,14 +151,19 @@ function pregameRow(event, weekText) {
         awaySpread = `+${Math.abs(spread)}`;
       }
     } else if (o.details) {
-      const m = o.details.match(/([A-Za-z]+)\s*([+-]?\d+(\.\d+)?)/);
+      const m = o.details.match(/([+-]?\d+(\.\d+)?)/);
       if (m) {
-        const line = parseFloat(m[2]);
-        // Without reliable team tag, just mirror +/- to away/home
+        const line = parseFloat(m[1]);
         awaySpread = line > 0 ? `+${Math.abs(line)}` : `${line}`;
         homeSpread = line > 0 ? `-${Math.abs(line)}` : `+${Math.abs(line)}`;
       }
     }
+
+    // moneylines (robust)
+    const ids = { awayId: away?.team?.id, homeId: home?.team?.id };
+    const ml = extractMoneylines(o, ids.awayId, ids.homeId);
+    awayML = ml.awayML || "";
+    homeML = ml.homeML || "";
   }
 
   const dateET = new Date(event.date).toLocaleDateString("en-US", { timeZone: "America/New_York" });
@@ -121,50 +180,42 @@ function pregameRow(event, weekText) {
       homeSpread || "",       // Home Spread
       String(homeML || ""),   // Home ML
       String(total || ""),    // Total
-      "", "", "", "", "", ""  // live cols empty for now
+      "", "", "", "", "", ""  // live cols
     ],
     dateET,
     matchup
   };
 }
 
-/** Detect halftime-ish (ESPN uses STATUS_HALFTIME; sometimes end of Q2 shows 0:00) */
+/** Halftime-ish? */
 function isHalftimeLike(evt) {
   const t = (evt.status?.type?.name || evt.competitions?.[0]?.status?.type?.name || "").toUpperCase();
   const short = (evt.status?.type?.shortDetail || "").toUpperCase();
   return t.includes("HALFTIME") || /Q2.*0:0?0/i.test(short);
 }
 
-/** Use Playwright to read the LIVE ODDS box from the game page (one-time) */
+/** Playwright DOM scrape for LIVE odds at halftime (one-time) */
 async function scrapeLiveOddsOnce(league, gameId) {
   const url = gameUrl(league, gameId);
   const browser = await playwright.chromium.launch({ headless: true });
   const page = await browser.newPage();
   try {
     await page.goto(url, { timeout: 60000, waitUntil: "domcontentloaded" });
-    // Look for a section containing "LIVE ODDS"
     const section = page.locator("section:has-text('LIVE ODDS'), div:has(h2:has-text('LIVE ODDS'))").first();
     await section.waitFor({ timeout: 8000 });
     const txt = (await section.innerText()).replace(/\u00a0/g," ").replace(/\s+/g," ").trim();
 
-    // Patterns: spreads like "-7.5" / "+7.5"
-    // totals like "o38.5", "u38.5"; ML like "-185", "+160"
     const spreadMatches = txt.match(/([+-]\d+(\.\d+)?)/g) || [];
     const totalOver = txt.match(/o\s?(\d+(\.\d+)?)/i);
     const totalUnder = txt.match(/u\s?(\d+(\.\d+)?)/i);
     const mlMatches = txt.match(/\s[+-]\d{2,4}\b/g) || [];
 
-    // Heuristic: first spread -> away, second -> home
     const liveAwaySpread = spreadMatches[0] || "";
     const liveHomeSpread = spreadMatches[1] || "";
-    // Prefer the number part of total (if over shown)
     const liveTotal = (totalOver && totalOver[1]) || (totalUnder && totalUnder[1]) || "";
-    // Heuristic: first ML -> away, second -> home
     const liveAwayML = (mlMatches[0]||"").trim();
     const liveHomeML = (mlMatches[1]||"").trim();
 
-    // Live score text from the page header (scoreboard cluster)
-    const scoreNode = page.locator("div:has-text('Gamecast')").first();
     let liveScore = "";
     try {
       const allTxt = (await page.locator("body").innerText()).replace(/\s+/g," ");
@@ -183,7 +234,6 @@ async function scrapeLiveOddsOnce(league, gameId) {
   }
 }
 
-/** Update a single row (A1 notation) */
 async function updateRow(sheets, rowNumber, colIndex, value) {
   const colLetter = String.fromCharCode("A".charCodeAt(0) + colIndex);
   const range = `${TAB_NAME}!${colLetter}${rowNumber}:${colLetter}${rowNumber}`;
@@ -201,7 +251,6 @@ async function updateRow(sheets, rowNumber, colIndex, value) {
     console.error("Missing secrets.");
     process.exit(1);
   }
-  // Auth
   const CREDS = parseServiceAccount(CREDS_RAW);
   const auth = new google.auth.GoogleAuth({
     credentials: { client_email: CREDS.client_email, private_key: CREDS.private_key },
@@ -218,7 +267,6 @@ async function updateRow(sheets, rowNumber, colIndex, value) {
       requestBody: { requests: [{ addSheet: { properties: { title: TAB_NAME } } }] }
     });
   }
-  // Read sheet
   const read = await sheets.spreadsheets.values.get({
     spreadsheetId: SHEET_ID,
     range: `${TAB_NAME}!A1:Z`,
@@ -226,7 +274,6 @@ async function updateRow(sheets, rowNumber, colIndex, value) {
   const values = read.data.values || [];
   let header = values[0] || [];
   if (header.length === 0) {
-    // set headers
     await sheets.spreadsheets.values.update({
       spreadsheetId: SHEET_ID,
       range: `${TAB_NAME}!A1`,
@@ -236,15 +283,13 @@ async function updateRow(sheets, rowNumber, colIndex, value) {
     header = COLS.slice();
   }
   const hmap = mapHeadersToIndex(header);
-  // Build index -> row map
-  const rows = values.slice(1); // data rows
-  const keyToRowNum = new Map(); // key -> sheet row number
+  const rows = values.slice(1);
+  const keyToRowNum = new Map();
   rows.forEach((r, i) => {
     const k = keyOf(r[hmap["date"]], r[hmap["matchup"]]);
-    keyToRowNum.set(k, i + 2); // +2 because rows start at 2 (A2 = row 2)
+    keyToRowNum.set(k, i + 2);
   });
 
-  // Scoreboard
   const dates = yyyymmddInET(new Date());
   const sb = await fetchJson(scoreboardUrl(LEAGUE, dates));
   const weekText = sb?.week?.text || sb?.leagues?.[0]?.season?.type?.name || "Regular Season";
@@ -252,7 +297,7 @@ async function updateRow(sheets, rowNumber, colIndex, value) {
 
   let appendBatch = [];
 
-  // 1) build/append pregame rows where missing
+  // Pregame append
   for (const ev of events) {
     const { values: rowVals, dateET, matchup } = pregameRow(ev, weekText);
     const k = keyOf(dateET, matchup);
@@ -267,7 +312,6 @@ async function updateRow(sheets, rowNumber, colIndex, value) {
       valueInputOption: "RAW",
       requestBody: { values: appendBatch },
     });
-    // refresh map after append
     const re = await sheets.spreadsheets.values.get({
       spreadsheetId: SHEET_ID,
       range: `${TAB_NAME}!A1:Z`,
@@ -282,7 +326,7 @@ async function updateRow(sheets, rowNumber, colIndex, value) {
     console.log(`✅ Appended ${appendBatch.length} pregame row(s).`);
   }
 
-  // 2) For in-progress games: halftime once, and update final score if final
+  // Halftime / Final updates
   for (const ev of events) {
     const comp = ev.competitions?.[0] || {};
     const away = comp.competitors?.find(c => c.homeAway === "away");
@@ -293,28 +337,26 @@ async function updateRow(sheets, rowNumber, colIndex, value) {
     const dateET = new Date(ev.date).toLocaleDateString("en-US", { timeZone: "America/New_York" });
     const k = keyOf(dateET, matchup);
     const rowNum = keyToRowNum.get(k);
-    if (!rowNum) continue; // must exist now
+    if (!rowNum) continue;
 
     const statusName = (ev.status?.type?.name || comp.status?.type?.name || "").toUpperCase();
     const scorePair = `${away?.score ?? ""}-${home?.score ?? ""}`;
 
-    // 2a) Update final score if Final
+    // Final score
     if (statusName.includes("FINAL")) {
       if (hmap["final score"] !== undefined) {
         await updateRow(sheets, rowNum, hmap["final score"], scorePair);
       }
-      // also update status text
       if (hmap["status"] !== undefined) {
         const short = ev.status?.type?.shortDetail || "Final";
         await updateRow(sheets, rowNum, hmap["status"], short);
       }
-      continue; // no halftime scrape if final
+      continue;
     }
 
-    // 2b) Halftime one-time scrape
-    // Only if the "Live Total" (or any live col) is blank
-    const row = (values[rowNum-1] || []);
-    const liveTotalVal = row[hmap["live total"]] || "";
+    // Halftime (one-time) live odds
+    const currentRow = (values[rowNum-1] || []);
+    const liveTotalVal = currentRow[hmap["live total"]] || "";
     if (isHalftimeLike(ev) && !liveTotalVal) {
       const live = await scrapeLiveOddsOnce(LEAGUE, ev.id);
       if (live) {
