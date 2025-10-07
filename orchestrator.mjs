@@ -6,7 +6,7 @@ const SHEET_ID      = (process.env.GOOGLE_SHEET_ID || "").trim();
 const CREDS_RAW     = (process.env.GOOGLE_SERVICE_ACCOUNT || "").trim();
 const LEAGUE        = (process.env.LEAGUE || "nfl").toLowerCase();          // "nfl" | "college-football"
 const TAB_NAME      = (process.env.TAB_NAME || "NFL").trim();
-/** NEW: scope + optional explicit week */
+/** Scope + optional explicit week */
 const RUN_SCOPE     = (process.env.RUN_SCOPE || "today").toLowerCase();     // "today" | "week"
 const WEEK_OVERRIDE = process.env.WEEK_OVERRIDE ? Number(process.env.WEEK_OVERRIDE) : null;
 
@@ -14,7 +14,7 @@ const WEEK_OVERRIDE = process.env.WEEK_OVERRIDE ? Number(process.env.WEEK_OVERRI
 const COLS = [
   "Date","Week","Status","Matchup","Final Score",
   "Away Spread","Away ML","Home Spread","Home ML","Total",
-  "Live Score","Live Away Spread","Live Away ML","Live Home Spread","Live Home ML","Live Total"
+  "Half Score","Live Away Spread","Live Away ML","Live Home Spread","Live Home ML","Live Total"
 ];
 
 /** ====== Helpers ====== */
@@ -52,6 +52,10 @@ function scoreboardUrl(league, { dates, week }) {
     return `https://site.api.espn.com/apis/site/v2/sports/football/${lg}/scoreboard?week=${week}${extra}`;
   }
   return `https://site.api.espn.com/apis/site/v2/sports/football/${lg}/scoreboard?dates=${dates}${extra}`;
+}
+function summaryUrl(league, eventId) {
+  const lg = normLeague(league);
+  return `https://site.api.espn.com/apis/site/v2/sports/football/${lg}/summary?event=${eventId}`;
 }
 function gameUrl(league, gameId) {
   const lg = normLeague(league);
@@ -180,7 +184,6 @@ function pregameRow(event, weekText) {
   const homeName = home?.team?.shortDisplayName || home?.team?.abbreviation || home?.team?.name || "Home";
   const matchup = `${awayName} @ ${homeName}`;
 
-  // Final?
   const finalScore = /final/i.test(status)
     ? `${away?.score ?? ""}-${home?.score ?? ""}`
     : "";
@@ -189,10 +192,8 @@ function pregameRow(event, weekText) {
   let awaySpread = "", homeSpread = "", total = "", awayML = "", homeML = "";
 
   if (o) {
-    // total
     total = (o.overUnder ?? o.total) ?? "";
 
-    // spreads
     const favId = String(o.favorite || "");
     const spread = Number.isFinite(o.spread) ? o.spread :
                    (typeof o.spread === "string" ? parseFloat(o.spread) : NaN);
@@ -205,7 +206,6 @@ function pregameRow(event, weekText) {
         awaySpread = `+${Math.abs(spread)}`;
       }
     } else if (o.details) {
-      // fallback parse from text like "Team X -7.5"
       const m = o.details.match(/([+-]?\d+(\.\d+)?)/);
       if (m) {
         const line = parseFloat(m[1]);
@@ -214,7 +214,6 @@ function pregameRow(event, weekText) {
       }
     }
 
-    // moneylines (robust)
     const ids = { awayId: away?.team?.id, homeId: home?.team?.id };
     const ml = extractMoneylines(o, ids.awayId, ids.homeId, competitors);
     awayML = ml.awayML || "";
@@ -235,21 +234,41 @@ function pregameRow(event, weekText) {
       homeSpread || "",       // Home Spread
       String(homeML || ""),   // Home ML
       String(total || ""),    // Total
-      "", "", "", "", "", ""  // live cols
+      "", "", "", "", "", ""  // Half + live cols
     ],
     dateET,
     matchup
   };
 }
 
-/** Halftime-ish? */
-function isHalftimeLike(evt) {
-  const t = (evt.status?.type?.name || evt.competitions?.[0]?.status?.type?.name || "").toUpperCase();
-  const short = (evt.status?.type?.shortDetail || "").toUpperCase();
-  return t.includes("HALFTIME") || /Q2.*0:0?0/i.test(short) || /HALF\s*TIME/i.test(short);
+/** Halftime detection */
+function isHalftimeLike(evtOrSnap) {
+  const t = (evtOrSnap?.status?.type?.name || evtOrSnap?.competitions?.[0]?.status?.type?.name || "").toUpperCase();
+  const short = (evtOrSnap?.status?.type?.shortDetail || "").toUpperCase();
+  return t.includes("HALFTIME") || /HALF\s*TIME/i.test(short);
 }
 
-/** ====== Resilient Playwright DOM scrape for LIVE odds (one-time) ====== */
+/** Return a compact snapshot of status + scores from summary endpoint */
+async function getEventSnapshot(league, eventId) {
+  try {
+    const sum = await fetchJson(summaryUrl(league, eventId));
+    const comp = sum?.header?.competitions?.[0] || {};
+    const status = comp?.status || sum?.header?.competitions?.[0]?.status || {};
+    const competitors = comp?.competitors || [];
+    const away = competitors.find(c => c.homeAway === "away");
+    const home = competitors.find(c => c.homeAway === "home");
+    const aScore = away?.score != null ? String(away.score) : "";
+    const hScore = home?.score != null ? String(home.score) : "";
+    return {
+      status: { type: { name: status?.type?.name, shortDetail: status?.type?.shortDetail } },
+      scores: { half: `${aScore}-${hScore}` }
+    };
+  } catch {
+    return null;
+  }
+}
+
+/** Resilient Playwright DOM scrape for LIVE odds (one-time, at halftime only) */
 async function scrapeLiveOddsOnce(league, gameId) {
   const url = gameUrl(league, gameId);
   const browser = await playwright.chromium.launch({ headless: true });
@@ -259,7 +278,6 @@ async function scrapeLiveOddsOnce(league, gameId) {
     await page.waitForLoadState("networkidle", { timeout: 6000 }).catch(() => {});
     await page.waitForTimeout(750);
 
-    // Anchor by stable footer/labels rather than brittle classnames
     const primaryFooter = page.getByText(/All Live Odds on ESPN BET Sportsbook/i).first();
     const altFooter = page.getByText(/^Odds by$/i).first();
 
@@ -271,20 +289,17 @@ async function scrapeLiveOddsOnce(league, gameId) {
 
     const raw = (await container.innerText()).replace(/\u00a0/g," ").replace(/\s+/g," ").trim();
 
-    // Total: "o/u 45.5" OR "Total 45.5" OR "o45.5 / u45.5"
     const totalMatch =
       raw.match(/\b(?:o\/?u|total)\s*([0-9]+(?:\.[0-9])?)/i) ||
       raw.match(/\bo\s*([0-9]+(?:\.[0-9])?)\b/i) ||
       raw.match(/\bu\s*([0-9]+(?:\.[0-9])?)\b/i);
     const liveTotal = totalMatch ? totalMatch[1] : "";
 
-    // Spreads: take first two signed numbers that are likely spreads (<= 40 abs)
     const spreadNums = [...raw.matchAll(/([+-]\d+(?:\.\d+)?)(?!\s*(?:o|u)\b)/gi)]
       .map(m => Number(m[1])).filter(n => Number.isFinite(n) && Math.abs(n) <= 40);
     const liveAwaySpread = (spreadNums[0] != null) ? (spreadNums[0] > 0 ? `+${spreadNums[0]}` : `${spreadNums[0]}`) : "";
     const liveHomeSpread = (spreadNums[1] != null) ? (spreadNums[1] > 0 ? `+${spreadNums[1]}` : `${spreadNums[1]}`) : "";
 
-    // Moneylines: prefer explicit "ML -120" tokens, fallback to bare +/- near the grid
     const mlTokens = [...raw.matchAll(/\bML\s*([+-]?\d{2,4})\b/gi)].map(m => m[1]);
     let liveAwayML = mlTokens[0] || "";
     let liveHomeML = mlTokens[1] || "";
@@ -294,19 +309,10 @@ async function scrapeLiveOddsOnce(league, gameId) {
       liveHomeML = liveHomeML || bare[1] || "";
     }
 
-    // Live score: grab from global header text if present
-    let liveScore = "";
-    try {
-      const allTxt = (await page.locator("body").innerText()).replace(/\s+/g," ");
-      const sc = allTxt.match(/(\b\d{1,2}\b)\s*-\s*(\b\d{1,2}\b)/);
-      if (sc) liveScore = `${sc[1]}-${sc[2]}`;
-    } catch {}
-
-    // Only write if we parsed something meaningful
-    const parsedAny = !!(liveTotal || liveAwaySpread || liveHomeSpread || liveAwayML || liveHomeML || liveScore);
+    const parsedAny = !!(liveTotal || liveAwaySpread || liveHomeSpread || liveAwayML || liveHomeML);
     if (!parsedAny) return null;
 
-    return { liveAwaySpread, liveHomeSpread, liveTotal, liveAwayML, liveHomeML, liveScore };
+    return { liveAwaySpread, liveHomeSpread, liveTotal, liveAwayML, liveHomeML };
 
   } catch (err) {
     console.warn("Live DOM scrape failed:", err.message, url);
@@ -336,6 +342,8 @@ async function scrapeLiveOddsOnce(league, gameId) {
     }
   }
 }
+
+async function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 async function updateRow(sheets, rowNumber, colIndex, value) {
   if (value === "" || value == null) return; // don't overwrite with blank
@@ -454,7 +462,9 @@ async function updateRow(sheets, rowNumber, colIndex, value) {
     console.log(`✅ Appended ${appendBatch.length} pregame row(s).`);
   }
 
-  /** ===== Halftime / Final updates ===== */
+  /** ===== Halftime (only) updates with Watch Window ===== */
+  const nowET = new Date(new Date().toLocaleString("en-US", { timeZone: "America/New_York" }));
+
   for (const ev of events) {
     const comp = ev.competitions?.[0] || {};
     const away = comp.competitors?.find(c => c.homeAway === "away");
@@ -467,13 +477,12 @@ async function updateRow(sheets, rowNumber, colIndex, value) {
     const rowNum = keyToRowNum.get(k);
     if (!rowNum) continue;
 
+    // Final score updates (unchanged)
     const statusName = (ev.status?.type?.name || comp.status?.type?.name || "").toUpperCase();
-    const scorePair = `${away?.score ?? ""}-${home?.score ?? ""}`;
-
-    // Final score
+    const scorePairFinal = `${away?.score ?? ""}-${home?.score ?? ""}`;
     if (statusName.includes("FINAL")) {
       if (hmap["final score"] !== undefined) {
-        await updateRow(sheets, rowNum, hmap["final score"], scorePair);
+        await updateRow(sheets, rowNum, hmap["final score"], scorePairFinal);
       }
       if (hmap["status"] !== undefined) {
         const short = ev.status?.type?.shortDetail || "Final";
@@ -482,30 +491,40 @@ async function updateRow(sheets, rowNumber, colIndex, value) {
       continue;
     }
 
-    // Halftime (one-time) live odds: use "Live Total" as the guard
-    const snapshot = (await sheets.spreadsheets.values.get({
+    // Guard: only write once, using either "Live Total" or "Half Score"
+    const snapshotRow = (await sheets.spreadsheets.values.get({
       spreadsheetId: SHEET_ID,
       range: `${TAB_NAME}!A${rowNum}:Z${rowNum}`,
     })).data.values?.[0] || [];
-    const liveAlready = (snapshot[hmap["live total"]] || "").toString().trim();
+    const halfAlready = (snapshotRow[hmap["half score"]] || "").toString().trim();
+    const liveTotalAlready = (snapshotRow[hmap["live total"]] || "").toString().trim();
+    if (halfAlready || liveTotalAlready) continue;
 
-    if (isHalftimeLike(ev) && !liveAlready) {
-      const live = await scrapeLiveOddsOnce(LEAGUE, ev.id);
-      if (live) {
-        const {
-          liveAwaySpread, liveHomeSpread, liveTotal, liveAwayML, liveHomeML, liveScore
-        } = live;
+    // If it's halftime *right now* per scoreboard, do it
+    if (isHalftimeLike(ev)) {
+      await writeHalftime(sheets, rowNum, ev.id, hmap);
+      console.log(`🕐 Halftime LIVE written for ${matchup}`);
+      continue;
+    }
 
-        await updateRow(sheets, rowNum, hmap["live score"],        liveScore);
-        await updateRow(sheets, rowNum, hmap["live away spread"],  liveAwaySpread);
-        await updateRow(sheets, rowNum, hmap["live home spread"],  liveHomeSpread);
-        await updateRow(sheets, rowNum, hmap["live away ml"],      liveAwayML);
-        await updateRow(sheets, rowNum, hmap["live home ml"],      liveHomeML);
-        await updateRow(sheets, rowNum, hmap["live total"],        liveTotal);
+    // Otherwise enter the Halftime Watch Window based on scheduled start
+    // ESPN event.date is scheduled kickoff; we treat 55–95 mins post-kickoff as watch window.
+    const kickET = new Date(new Date(ev.date).toLocaleString("en-US", { timeZone: "America/New_York" }));
+    const minsSinceKick = (nowET - kickET) / 60000;
 
-        console.log(`🕐 Halftime LIVE written for ${matchup}`);
-      } else {
-        console.log(`(Halftime) live odds not found for ${matchup}`);
+    if (minsSinceKick >= 55 && minsSinceKick <= 95) {
+      // Poll summary a few times (up to ~10 minutes total) for HALFTIME flip
+      const attempts = 7;       // 7 * ~90s ≈ 10–11 minutes
+      const waitMs = 90 * 1000; // 90 seconds
+      for (let i=0; i<attempts; i++) {
+        const snap = await getEventSnapshot(LEAGUE, ev.id);
+        if (snap && isHalftimeLike(snap)) {
+          // write half score + odds once
+          await writeHalftime(sheets, rowNum, ev.id, hmap, snap?.scores?.half);
+          console.log(`🕐 Halftime LIVE written (watch window) for ${matchup}`);
+          break;
+        }
+        await sleep(waitMs);
       }
     }
   }
@@ -515,3 +534,26 @@ async function updateRow(sheets, rowNumber, colIndex, value) {
   console.error("❌ Error:", err);
   process.exit(1);
 });
+
+/** ===== Helpers for halftime write ===== */
+async function writeHalftime(sheets, rowNum, eventId, hmap, halfScoreFromSnap = "") {
+  // Half score string "Away-Home"
+  let halfScore = halfScoreFromSnap;
+  if (!halfScore) {
+    const snap = await getEventSnapshot(LEAGUE, eventId);
+    if (snap) halfScore = snap?.scores?.half || "";
+  }
+
+  const live = await scrapeLiveOddsOnce(LEAGUE, eventId);
+  if (hmap["half score"] !== undefined && halfScore) {
+    await updateRow(sheets, rowNum, hmap["half score"], halfScore);
+  }
+  if (live) {
+    const { liveAwaySpread, liveHomeSpread, liveTotal, liveAwayML, liveHomeML } = live;
+    if (hmap["live away spread"] !== undefined) await updateRow(sheets, rowNum, hmap["live away spread"],  liveAwaySpread);
+    if (hmap["live home spread"] !== undefined) await updateRow(sheets, rowNum, hmap["live home spread"],  liveHomeSpread);
+    if (hmap["live away ml"]     !== undefined) await updateRow(sheets, rowNum, hmap["live away ml"],      liveAwayML);
+    if (hmap["live home ml"]     !== undefined) await updateRow(sheets, rowNum, hmap["live home ml"],      liveHomeML);
+    if (hmap["live total"]       !== undefined) await updateRow(sheets, rowNum, hmap["live total"],        liveTotal);
+  }
+}
