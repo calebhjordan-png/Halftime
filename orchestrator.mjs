@@ -1,13 +1,14 @@
-// Halftime Bot — VERBOSE + BATCHED FINALS
-// - Pregame append (today or whole week)
-// - One-time halftime capture (status -> "Half", half score, live odds)
-// - Final score/status updates
-// - **NEW**: Batch Sheets writes for finals to avoid 429 rate limits
+// Halftime Bot — VERBOSE + BATCHED + CFB Week Fallback (2025)
+// - Pregame append (today|week)
+// - Halftime-only capture (status->"Half", "Half Score", live odds)
+// - Finals (batched to avoid 429)
+// - College Football week label fallback using 2025 ranges
+// - Keeps public/free ESPN + Google Sheets approach
 
 import { google } from "googleapis";
 import * as playwright from "playwright";
 
-/** ====== CONFIG via GitHub Action env ====== */
+/** ====== CONFIG (from GitHub Actions env) ====== */
 const SHEET_ID      = (process.env.GOOGLE_SHEET_ID || "").trim();
 const CREDS_RAW     = (process.env.GOOGLE_SERVICE_ACCOUNT || "").trim();
 const LEAGUE        = (process.env.LEAGUE || "nfl").toLowerCase();          // "nfl" | "college-football"
@@ -15,24 +16,28 @@ const TAB_NAME      = (process.env.TAB_NAME || "NFL").trim();
 const RUN_SCOPE     = (process.env.RUN_SCOPE || "today").toLowerCase();     // "today" | "week"
 const WEEK_OVERRIDE = process.env.WEEK_OVERRIDE ? Number(process.env.WEEK_OVERRIDE) : null;
 
-/** ====== SHEET COLUMNS ====== */
+/** ====== SHEET COLUMNS (order matters) ====== */
 const COLS = [
   "Date","Week","Status","Matchup","Final Score",
   "Away Spread","Away ML","Home Spread","Home ML","Total",
   "Half Score","Live Away Spread","Live Away ML","Live Home Spread","Live Home ML","Live Total"
 ];
 
-function log(...a){ console.log(...a); }
-function warn(...a){ console.warn(...a); }
+/** ====== Logging ====== */
+const log = (...a)=>console.log(...a);
+const warn = (...a)=>console.warn(...a);
 
-/** ===== Helpers ===== */
+/** ====== Utilities ====== */
 function parseServiceAccount(raw) {
   if (raw.startsWith("{")) return JSON.parse(raw);
   const json = Buffer.from(raw, "base64").toString("utf8");
   return JSON.parse(json);
 }
+function toET(dateLike) {
+  return new Date(new Date(dateLike).toLocaleString("en-US", { timeZone: "America/New_York" }));
+}
 function yyyymmddInET(d=new Date()) {
-  const et = new Date(d.toLocaleString("en-US", { timeZone: "America/New_York" }));
+  const et = toET(d);
   const y = et.getFullYear();
   const m = String(et.getMonth()+1).padStart(2,"0");
   const day = String(et.getDate()).padStart(2,"0");
@@ -82,7 +87,7 @@ function mapHeadersToIndex(headerRow) {
   return map;
 }
 function keyOf(dateStr, matchup) { return `${(dateStr||"").trim()}__${(matchup||"").trim()}`; }
-function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
+const sleep = ms => new Promise(r=>setTimeout(r,ms));
 function numOrBlank(v) {
   if (v === 0) return "0";
   if (v == null) return "";
@@ -92,9 +97,59 @@ function numOrBlank(v) {
   return s.startsWith("+") ? `+${n}` : `${n}`;
 }
 
-/** ===== Week math (Tue→Mon ET) ===== */
+/** ====== CFB Week Fallback (2025) ======
+ * Ranges are ET inclusive on both ends.
+ * If ESPN returns "Regular Season", we map by date below.
+ * (You can tweak/extend later or swap per-season constants.)
+ */
+const CFB_2025_RANGES = [
+  // From screenshots: Week 4..16, Bowls, CFP
+  { label: "Week 4",  start: "2025-09-15", end: "2025-09-21" },
+  { label: "Week 5",  start: "2025-09-22", end: "2025-09-28" },
+  { label: "Week 6",  start: "2025-09-29", end: "2025-10-05" },
+  { label: "Week 7",  start: "2025-10-06", end: "2025-10-12" },
+  { label: "Week 8",  start: "2025-10-13", end: "2025-10-19" },
+  { label: "Week 9",  start: "2025-10-20", end: "2025-10-26" },
+  { label: "Week 10", start: "2025-10-27", end: "2025-11-02" },
+  { label: "Week 11", start: "2025-11-03", end: "2025-11-09" },
+  { label: "Week 12", start: "2025-11-10", end: "2025-11-16" },
+  { label: "Week 13", start: "2025-11-17", end: "2025-11-23" },
+  { label: "Week 14", start: "2025-11-24", end: "2025-11-30" },
+  { label: "Week 15", start: "2025-12-01", end: "2025-12-07" },
+  { label: "Week 16", start: "2025-12-08", end: "2025-12-13" },
+  { label: "Bowls",   start: "2025-12-13", end: "2026-01-20" },
+  { label: "CFP",     start: "2025-12-19", end: "2026-01-19" }, // overlay
+];
+function inRangeET(d, startISO, endISO) {
+  const x = toET(d).getTime();
+  const s = toET(startISO + "T00:00:00").getTime();
+  const e = toET(endISO   + "T23:59:59").getTime();
+  return x >= s && x <= e;
+}
+function cfbWeekFallbackLabel(dateObj) {
+  // Prefer specific CFP overlay label first
+  for (const r of CFB_2025_RANGES.filter(r=>r.label==="CFP")) {
+    if (inRangeET(dateObj, r.start, r.end)) return r.label;
+  }
+  // Then regular weeks/bowls
+  for (const r of CFB_2025_RANGES.filter(r=>r.label!=="CFP")) {
+    if (inRangeET(dateObj, r.start, r.end)) return r.label;
+  }
+  return "Regular Season";
+}
+function computeWeekLabel(league, espnWeekText, dateStrET) {
+  if (/Week\s*\d+/i.test(espnWeekText || "")) return espnWeekText;
+  if (normLeague(league) === "college-football") {
+    const parsed = toET(dateStrET);
+    return cfbWeekFallbackLabel(parsed);
+  }
+  // NFL: ESPN week text is usually fine; fallback to "Regular Season"
+  return espnWeekText || "Regular Season";
+}
+
+/** ====== Week math (Tue→Mon ET) for RUN_SCOPE=week ====== */
 function startOfLeagueWeekET(d=new Date()) {
-  const et = new Date(d.toLocaleString("en-US", { timeZone: "America/New_York" }));
+  const et = toET(d);
   const dow = et.getDay(); // 0 Sun ... 6 Sat
   const offsetToTue = ((dow - 2) + 7) % 7;
   const start = new Date(et);
@@ -162,7 +217,7 @@ function extractMoneylines(o, awayId, homeId, competitors = []) {
 }
 
 /** ===== Build pregame row ===== */
-function pregameRow(event, weekText) {
+function pregameRow(event, weekTextFromESPN) {
   const comp = event.competitions?.[0] || {};
   const status = event.status?.type?.name || comp.status?.type?.name || "";
   const shortStatus = event.status?.type?.shortDetail || comp.status?.type?.shortDetail || "";
@@ -194,12 +249,17 @@ function pregameRow(event, weekText) {
     const ml = extractMoneylines(o, ids.awayId, ids.homeId, competitors);
     awayML = ml.awayML || ""; homeML = ml.homeML || "";
   }
-  const dateET = new Date(event.date).toLocaleDateString("en-US", { timeZone: "America/New_York" });
+
+  const dateET = toET(event.date);
+  const dateETStr = dateET.toLocaleDateString("en-US", { timeZone: "America/New_York" });
+  const weekText = computeWeekLabel(LEAGUE, weekTextFromESPN, dateET);
+
   return {
-    values: [dateET, weekText || "", shortStatus || status, matchup, finalScore,
+    values: [dateETStr, weekText || "", shortStatus || status, matchup, finalScore,
       awaySpread || "", String(awayML||""), homeSpread || "", String(homeML||""), String(total||""),
       "", "", "", "", "", ""],
-    dateET, matchup
+    dateET: dateETStr,
+    matchup
   };
 }
 
@@ -300,7 +360,7 @@ async function scrapeLiveOddsOnce(league, gameId) {
   }
 }
 
-/** ===== Batch update manager (NEW) ===== */
+/** ====== Batch update manager (avoid 429s) ====== */
 function colLetter(i){ return String.fromCharCode("A".charCodeAt(0) + i); }
 class BatchWriter {
   constructor(tabName){ this.tab = tabName; this.data = []; }
@@ -311,14 +371,16 @@ class BatchWriter {
   }
   async flush(sheets){
     if (!this.data.length) return;
-    const body = { data: this.data, valueInputOption: "RAW" };
-    await sheets.spreadsheets.values.batchUpdate({ spreadsheetId: SHEET_ID, requestBody: body });
+    await sheets.spreadsheets.values.batchUpdate({
+      spreadsheetId: SHEET_ID,
+      requestBody: { valueInputOption: "RAW", data: this.data }
+    });
     log(`🟩 Batched ${this.data.length} cell update(s).`);
     this.data = [];
   }
 }
 
-/** ===== MAIN ===== */
+/** ====== MAIN ====== */
 (async function main() {
   if (!SHEET_ID || !CREDS_RAW) { console.error("Missing secrets."); process.exit(1); }
   const CREDS = parseServiceAccount(CREDS_RAW);
@@ -359,32 +421,34 @@ class BatchWriter {
 
   // Fetch events (today|week|override)
   let events = [];
-  let weekText = "Regular Season";
+  let weekTextFromESPN = "Regular Season";
   if (WEEK_OVERRIDE != null && Number.isFinite(WEEK_OVERRIDE)) {
     const sb = await fetchJson(scoreboardUrl(LEAGUE, { week: WEEK_OVERRIDE }));
-    weekText = sb?.week?.text || (Number.isFinite(sb?.week?.number) ? `Week ${sb.week.number}` : "Regular Season");
+    weekTextFromESPN = sb?.week?.text || (Number.isFinite(sb?.week?.number) ? `Week ${sb.week.number}` : "Regular Season");
     events = sb?.events || [];
   } else if (RUN_SCOPE === "week") {
     const all = datesForWeekET(new Date());
     let agg = [];
     for (const d of all) {
       const sb = await fetchJson(scoreboardUrl(LEAGUE, { dates: d }));
-      if (weekText === "Regular Season") weekText = sb?.week?.text || (Number.isFinite(sb?.week?.number) ? `Week ${sb.week.number}` : "Regular Season");
+      if (weekTextFromESPN === "Regular Season") {
+        weekTextFromESPN = sb?.week?.text || (Number.isFinite(sb?.week?.number) ? `Week ${sb.week.number}` : "Regular Season");
+      }
       agg = agg.concat(sb?.events || []);
     }
     events = uniqueById(agg);
   } else {
     const d = yyyymmddInET(new Date());
     const sb = await fetchJson(scoreboardUrl(LEAGUE, { dates: d }));
-    weekText = sb?.week?.text || (Number.isFinite(sb?.week?.number) ? `Week ${sb.week.number}` : "Regular Season");
+    weekTextFromESPN = sb?.week?.text || (Number.isFinite(sb?.week?.number) ? `Week ${sb.week.number}` : "Regular Season");
     events = sb?.events || [];
   }
-  log(`Events found: ${events.length}, Week label: ${weekText}`);
+  log(`Events found: ${events.length}, ESPN week: ${weekTextFromESPN}`);
 
   // Pregame append
   let appendBatch = [];
   for (const ev of events) {
-    const { values: rowVals, dateET, matchup } = pregameRow(ev, weekText);
+    const { values: rowVals, dateET, matchup } = pregameRow(ev, weekTextFromESPN);
     const k = keyOf(dateET, matchup);
     if (!keyToRowNum.has(k)) appendBatch.push(rowVals);
   }
@@ -400,9 +464,9 @@ class BatchWriter {
     (v2.slice(1)).forEach((r, i) => { const key = keyOf(r[h2["date"]], r[h2["matchup"]]); keyToRowNum.set(key, i + 2); });
   }
 
-  /** ===== Halftime + Finals ===== */
-  const nowET = new Date(new Date().toLocaleString("en-US", { timeZone: "America/New_York" }));
-  const batch = new BatchWriter(TAB_NAME); // NEW
+  /** ===== Halftime + Finals (batched finals) ===== */
+  const nowET = toET(new Date());
+  const batch = new BatchWriter(TAB_NAME);
 
   for (const ev of events) {
     const comp = ev.competitions?.[0] || {};
@@ -411,21 +475,21 @@ class BatchWriter {
     const awayName = away?.team?.shortDisplayName || away?.team?.abbreviation || away?.team?.name || "Away";
     const homeName = home?.team?.shortDisplayName || home?.team?.abbreviation || home?.team?.name || "Home";
     const matchup = `${awayName} @ ${homeName}`;
-    const dateET = new Date(ev.date).toLocaleDateString("en-US", { timeZone: "America/New_York" });
+    const dateET = toET(ev.date).toLocaleDateString("en-US", { timeZone: "America/New_York" });
     const rowNum = keyToRowNum.get(keyOf(dateET, matchup));
     if (!rowNum) continue;
 
     const statusName = (ev.status?.type?.name || comp.status?.type?.name || "").toUpperCase();
     const scorePairFinal = `${away?.score ?? ""}-${home?.score ?? ""}`;
 
-    // Final → queue batched writes (NEW)
+    // Final → queue batched writes
     if (statusName.includes("FINAL")) {
       if (hmap["final score"] !== undefined) batch.addCell(rowNum, hmap["final score"], scorePairFinal);
       if (hmap["status"]      !== undefined) batch.addCell(rowNum, hmap["status"], ev.status?.type?.shortDetail || "Final");
       continue;
     }
 
-    // One-time halftime write guard
+    // Halftime one-time (guard using existing row)
     const snapshotRow = (await sheets.spreadsheets.values.get({
       spreadsheetId: SHEET_ID, range: `${TAB_NAME}!A${rowNum}:Z${rowNum}`,
     })).data.values?.[0] || [];
@@ -433,15 +497,14 @@ class BatchWriter {
     const liveTotalAlready = (snapshotRow[hmap["live total"]] || "").toString().trim();
     if (halfAlready || liveTotalAlready) continue;
 
-    // Immediate halftime?
     if (isHalftimeLike(ev)) {
       log(`HALFTIME (scoreboard) for ${matchup} → writing now.`);
       await writeHalftime(sheets, rowNum, ev.id, hmap, matchup);
       continue;
     }
 
-    // Watch window (55–95 mins post scheduled kickoff)
-    const kickET = new Date(new Date(ev.date).toLocaleString("en-US", { timeZone: "America/New_York" }));
+    // Watch window (55–95 mins after scheduled kickoff)
+    const kickET = toET(ev.date);
     const minsSinceKick = (nowET - kickET) / 60000;
     if (minsSinceKick >= 55 && minsSinceKick <= 95) {
       log(`⏳ Watch window for ${matchup}`);
@@ -457,45 +520,12 @@ class BatchWriter {
     }
   }
 
-  // Flush any queued finals in one call (NEW)
-  await batch.flush(sheets);
-
+  await batch.flush(sheets); // flush finals
   log("✅ Run complete.");
 })().catch(err => { console.error("❌ Error:", err); process.exit(1); });
 
-/** ===== Halftime write (status->Half) ===== */
-async function writeHalftime(sheets, rowNum, hmap, matchup, halfScoreFromSnap="") {
-  if (hmap["status"] !== undefined) {
-    await sheets.spreadsheets.values.batchUpdate({
-      spreadsheetId: SHEET_ID,
-      requestBody: {
-        valueInputOption: "RAW",
-        data: [{ range: `${TAB_NAME}!${String.fromCharCode(65+hmap["status"])}${rowNum}:${String.fromCharCode(65+hmap["status"])}${rowNum}`,
-                 values: [["Half"]] }]
-      }
-    });
-  }
-
-  let halfScore = halfScoreFromSnap;
-  if (!halfScore) {
-    // Best-effort snapshot for score; safe if summary used writeHalftime(ev.id,...)
-    try {
-      const sum = await fetchJson(summaryUrl(LEAGUE, matchup)); // not used if provided
-      // intentionally ignored; we already supply halfScoreFromSnap in watcher path
-    } catch {}
-  }
-
-  // Scrape odds with small retry loop (quick; halftime DOM can be late)
-  let live = null;
-  for (let i=0; i<4; i++) {
-    live = await scrapeLiveOddsOnce(LEAGUE, matchup);
-    const gotAny = !!(live && (live.liveTotal || live.liveAwaySpread || live.liveHomeSpread || live.liveAwayML || live.liveHomeML));
-    if (gotAny) break;
-    await sleep(7500);
-  }
-  if (!live) live = { liveAwaySpread:"", liveHomeSpread:"", liveAwayML:"", liveHomeML:"", liveTotal:"" };
-
-  const { liveAwaySpread, liveHomeSpread, liveTotal, liveAwayML, liveHomeML } = live;
+/** ===== Halftime write (status->Half) — batched in one call ===== */
+async function writeHalftime(sheets, rowNum, eventId, hmap, matchup, halfScoreFromSnap="") {
   const payload = [];
 
   const add = (colName, value) => {
@@ -505,12 +535,24 @@ async function writeHalftime(sheets, rowNum, hmap, matchup, halfScoreFromSnap=""
     payload.push({ range: `${TAB_NAME}!${col}${rowNum}:${col}${rowNum}`, values: [[value]] });
   };
 
-  if (hmap["half score"] !== undefined && halfScore) add("half score", halfScore);
-  add("live away spread", liveAwaySpread || "-");
-  add("live home spread", liveHomeSpread || "-");
-  add("live away ml",     liveAwayML     || "-");
-  add("live home ml",     liveHomeML     || "-");
-  add("live total",       liveTotal      || "-");
+  add("status", "Half");
+  if (halfScoreFromSnap) add("half score", halfScoreFromSnap);
+
+  // Odds with short retry — halftime DOM can be late
+  let live = null;
+  for (let i=0; i<4; i++) {
+    live = await scrapeLiveOddsOnce(LEAGUE, eventId);
+    const gotAny = !!(live && (live.liveTotal || live.liveAwaySpread || live.liveHomeSpread || live.liveAwayML || live.liveHomeML));
+    if (gotAny) break;
+    await sleep(7500);
+  }
+  if (!live) live = { liveAwaySpread:"", liveHomeSpread:"", liveAwayML:"", liveHomeML:"", liveTotal:"" };
+
+  add("live away spread", live.liveAwaySpread || "-");
+  add("live home spread", live.liveHomeSpread || "-");
+  add("live away ml",     live.liveAwayML     || "-");
+  add("live home ml",     live.liveHomeML     || "-");
+  add("live total",       live.liveTotal      || "-");
 
   if (payload.length) {
     await sheets.spreadsheets.values.batchUpdate({
@@ -518,6 +560,5 @@ async function writeHalftime(sheets, rowNum, hmap, matchup, halfScoreFromSnap=""
       requestBody: { valueInputOption: "RAW", data: payload }
     });
   }
-
   log(`🕐 Halftime LIVE written for ${matchup}`);
 }
