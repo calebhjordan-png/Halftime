@@ -1,4 +1,4 @@
-name: Halftime Bot (CFB)
+name: Halftime (CFB)
 
 on:
   schedule:
@@ -11,6 +11,7 @@ on:
 jobs:
   run-bot:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     env:
       GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
       GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
