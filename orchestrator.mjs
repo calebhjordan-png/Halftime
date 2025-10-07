@@ -7,9 +7,8 @@ const CREDS_RAW     = (process.env.GOOGLE_SERVICE_ACCOUNT || "").trim();
 const LEAGUE        = (process.env.LEAGUE || "nfl").toLowerCase();          // "nfl" | "college-football"
 const TAB_NAME      = (process.env.TAB_NAME || "NFL").trim();
 const RUN_SCOPE     = (process.env.RUN_SCOPE || "today").toLowerCase();     // "today" | "week"
-const WEEK_OVERRIDE = process.env.WEEK_OVERRIDE ? Number(process.env.WEEK_OVERRIDE) : null;
 
-/** Column names we expect in the sheet */
+/** Column names we expect in the sheet (Half Score, not Live Score) */
 const COLS = [
   "Date","Week","Status","Matchup","Final Score",
   "Away Spread","Away ML","Home Spread","Home ML","Total",
@@ -71,7 +70,7 @@ function mapHeadersToIndex(headerRow) {
 }
 function keyOf(dateStr, matchup) { return `${(dateStr||"").trim()}__${(matchup||"").trim()}`; }
 
-/** Normalize numeric-ish value */
+/** Normalize numeric-ish value (preserve +) */
 function numOrBlank(v) {
   if (v === 0) return "0";
   if (v == null) return "";
@@ -81,49 +80,82 @@ function numOrBlank(v) {
   return s.startsWith("+") ? `+${n}` : `${n}`;
 }
 
-/** Try to pull moneylines for each team from many ESPN shapes */
+/** Clean status labels (no time/tz) */
+function tidyStatus(evt) {
+  const name = (evt.status?.type?.name || evt.competitions?.[0]?.status?.type?.name || "").toUpperCase();
+  const sd = (evt.status?.type?.shortDetail || "").toUpperCase();
+  if (name.includes("FINAL")) return "Final";
+  if (name.includes("HALFTIME") || /HALF/.test(sd)) return "Half";
+  if (name.includes("IN_PROGRESS") || name.includes("LIVE")) return "In Progress";
+  if (name.includes("SCHEDULED") || name.includes("STATUS_SCHEDULED") || name.includes("PRE")) return "Scheduled";
+  return evt.status?.type?.description || "Scheduled";
+}
+
+/** NFL Week label */
+function nflWeekLabel(weekNum, weekText) {
+  if (Number.isFinite(weekNum)) return `Week ${weekNum}`;
+  if (/Week\s*\d+/i.test(weekText || "")) return weekText;
+  return "Regular Season";
+}
+
+/** Extract MLs from many shapes (now includes PickCenter shapes) */
 function extractMoneylines(o, awayId, homeId, competitors = []) {
   let awayML = "", homeML = "";
 
-  const trySetByIds = (teamOddsArr) => {
-    if (!Array.isArray(teamOddsArr)) return false;
-    for (const t of teamOddsArr) {
+  // 0) PickCenter shape: awayTeamOdds/homeTeamOdds.moneyLine
+  if (o && (o.awayTeamOdds || o.homeTeamOdds)) {
+    const aObj = o.awayTeamOdds || {};
+    const hObj = o.homeTeamOdds || {};
+    awayML = awayML || numOrBlank(aObj.moneyLine ?? aObj.moneyline ?? aObj.money_line);
+    homeML = homeML || numOrBlank(hObj.moneyLine ?? hObj.moneyline ?? hObj.money_line);
+    if (awayML || homeML) return { awayML, homeML };
+  }
+
+  // 0b) PickCenter rich "moneyline" field (away/home -> close.odds or open.odds)
+  if (o && o.moneyline && (o.moneyline.away || o.moneyline.home)) {
+    const awayClose = numOrBlank(o.moneyline.away?.close?.odds ?? o.moneyline.away?.open?.odds);
+    const homeClose = numOrBlank(o.moneyline.home?.close?.odds ?? o.moneyline.home?.open?.odds);
+    awayML = awayML || awayClose;
+    homeML = homeML || homeClose;
+    if (awayML || homeML) return { awayML, homeML };
+  }
+
+  // 1) teamOdds: [{ teamId, moneyLine }]
+  if (Array.isArray(o?.teamOdds)) {
+    for (const t of o.teamOdds) {
       const tid = String(t?.teamId ?? t?.team?.id ?? "");
       const ml  = numOrBlank(t?.moneyLine ?? t?.moneyline ?? t?.money_line);
       if (!ml) continue;
-      if (tid && tid === String(awayId)) awayML = awayML || ml;
-      if (tid && tid === String(homeId)) homeML = homeML || ml;
+      if (tid === String(awayId)) awayML = awayML || ml;
+      if (tid === String(homeId)) homeML = homeML || ml;
     }
-    return !!(awayML || homeML);
-  };
-
-  // 1) teamOdds: [{ teamId, moneyLine }]
-  if (trySetByIds(o.teamOdds)) return { awayML, homeML };
+    if (awayML || homeML) return { awayML, homeML };
+  }
 
   // 2) nested competitors odds
-  if (Array.isArray(o.competitors)) {
-    const a = o.competitors.find(c => String(c?.id) === String(awayId) || String(c?.teamId) === String(awayId));
-    const h = o.competitors.find(c => String(c?.id) === String(homeId) || String(c?.teamId) === String(homeId));
-    if (a) awayML = awayML || numOrBlank(a.moneyLine ?? a.moneyline ?? a?.odds?.moneyLine);
-    if (h) homeML = homeML || numOrBlank(h.moneyLine ?? h.moneyline ?? h?.odds?.moneyLine);
+  if (Array.isArray(o?.competitors)) {
+    const findML = c => numOrBlank(c?.moneyLine ?? c?.moneyline ?? c?.odds?.moneyLine ?? c?.odds?.moneyline);
+    const aML = findML(o.competitors.find(c => String(c?.id ?? c?.teamId) === String(awayId)));
+    const hML = findML(o.competitors.find(c => String(c?.id ?? c?.teamId) === String(homeId)));
+    awayML = awayML || aML; homeML = homeML || hML;
     if (awayML || homeML) return { awayML, homeML };
   }
 
   // 3) direct fields
-  awayML = awayML || numOrBlank(o.moneyLineAway ?? o.awayTeamMoneyLine ?? o.awayMoneyLine ?? o.awayMl);
-  homeML = homeML || numOrBlank(o.moneyLineHome ?? o.homeTeamMoneyLine ?? o.homeMoneyLine ?? o.homeMl);
+  awayML = awayML || numOrBlank(o?.moneyLineAway ?? o?.awayTeamMoneyLine ?? o?.awayMoneyLine ?? o?.awayMl);
+  homeML = homeML || numOrBlank(o?.moneyLineHome ?? o?.homeTeamMoneyLine ?? o?.homeMoneyLine ?? o?.homeMl);
   if (awayML || homeML) return { awayML, homeML };
 
   // 4) favorite/underdog mapping
-  const favId = String(o.favorite || o.favoriteId || "");
-  const favML = numOrBlank(o.favoriteMoneyLine);
-  const dogML = numOrBlank(o.underdogMoneyLine);
+  const favId = String(o?.favorite ?? o?.favoriteId ?? o?.favoriteTeamId ?? "");
+  const favML = numOrBlank(o?.favoriteMoneyLine);
+  const dogML = numOrBlank(o?.underdogMoneyLine);
   if (favId && (favML || dogML)) {
-    if (String(awayId) === favId) { awayML = favML || awayML; homeML = dogML || homeML; return { awayML, homeML }; }
-    if (String(homeId) === favId) { homeML = favML || homeML; awayML = dogML || awayML; return { awayML, homeML }; }
+    if (String(awayId) === favId) { awayML = awayML || favML; homeML = homeML || dogML; return { awayML, homeML }; }
+    if (String(homeId) === favId) { homeML = homeML || favML; awayML = awayML || dogML; return { awayML, homeML }; }
   }
 
-  // 5) competitors[] odds object (another variant)
+  // 5) competitors[] { odds: { moneyLine } } variant
   if (Array.isArray(competitors)) {
     for (const c of competitors) {
       const ml = numOrBlank(c?.odds?.moneyLine ?? c?.odds?.moneyline ?? c?.odds?.money_line);
@@ -131,7 +163,6 @@ function extractMoneylines(o, awayId, homeId, competitors = []) {
       if (c.homeAway === "away") awayML = awayML || ml;
       if (c.homeAway === "home") homeML = homeML || ml;
     }
-    if (awayML || homeML) return { awayML, homeML };
   }
 
   return { awayML, homeML };
@@ -142,12 +173,9 @@ async function extractMLWithFallback(event, baseOdds, away, home) {
   const base = extractMoneylines(baseOdds || {}, away?.team?.id, home?.team?.id, (event.competitions?.[0]?.competitors)||[]);
   if (base.awayML && base.homeML) return base;
 
-  // Fallback to summary endpoints (multiple shapes)
   try {
     const sum = await fetchJson(summaryUrl(LEAGUE, event.id));
     const candidates = [];
-
-    // Common places MLs live:
     if (Array.isArray(sum?.header?.competitions?.[0]?.odds)) candidates.push(...sum.header.competitions[0].odds);
     if (Array.isArray(sum?.odds)) candidates.push(...sum.odds);
     if (Array.isArray(sum?.pickcenter)) candidates.push(...sum.pickcenter);
@@ -155,7 +183,9 @@ async function extractMLWithFallback(event, baseOdds, away, home) {
     for (const cand of candidates) {
       const ml = extractMoneylines(cand, away?.team?.id, home?.team?.id, (event.competitions?.[0]?.competitors)||[]);
       if (ml.awayML || ml.homeML) {
-        console.log(`(ML fallback via summary) ${away?.team?.shortDisplayName} vs ${home?.team?.shortDisplayName}:`, ml);
+        if (!base.awayML && !base.homeML) {
+          console.log(`(ML fallback via summary) ${away?.team?.abbreviation}@${home?.team?.abbreviation}:`, ml);
+        }
         return ml;
       }
     }
@@ -166,18 +196,10 @@ async function extractMLWithFallback(event, baseOdds, away, home) {
   return base; // may be blanks
 }
 
-/** Build pregame row */
-function computeWeekLabelNFL(espnWeekText, number) {
-  if (/Week\s*\d+/i.test(espnWeekText || "")) return espnWeekText;
-  if (Number.isFinite(number)) return `Week ${number}`;
-  return espnWeekText || "Regular Season";
-}
-
+/** Build pregame row — week label & tidy status */
 function pregameRowFactory(weekTextFromESPN, weekNumFromESPN) {
   return async function pregameRow(event) {
     const comp = event.competitions?.[0] || {};
-    const status = event.status?.type?.name || comp.status?.type?.name || "";
-    const shortStatus = event.status?.type?.shortDetail || comp.status?.type?.shortDetail || "";
     const away = comp.competitors?.find(c => c.homeAway === "away");
     const home = comp.competitors?.find(c => c.homeAway === "home");
 
@@ -185,22 +207,19 @@ function pregameRowFactory(weekTextFromESPN, weekNumFromESPN) {
     const homeName = home?.team?.shortDisplayName || home?.team?.abbreviation || home?.team?.name || "Home";
     const matchup = `${awayName} @ ${homeName}`;
 
-    // Final?
-    const finalScore = /final/i.test(status)
-      ? `${away?.score ?? ""}-${home?.score ?? ""}`
-      : "";
+    const isFinal = /final/i.test(event.status?.type?.name || comp.status?.type?.name || "");
+    const finalScore = isFinal ? `${away?.score ?? ""}-${home?.score ?? ""}` : "";
 
-    // Odds (spread/total from scoreboard if present)
     const o0 = pickOdds(comp.odds || event.odds || []);
     let awaySpread = "", homeSpread = "", total = "", awayML = "", homeML = "";
 
     if (o0) {
       total = (o0.overUnder ?? o0.total) ?? "";
 
-      // spreads
-      const favId = String(o0.favorite || "");
+      // spreads (favorite + spread or parse details)
+      const favId = String(o0.favorite || o0.favoriteTeamId || "");
       const spread = Number.isFinite(o0.spread) ? o0.spread :
-                    (typeof o0.spread === "string" ? parseFloat(o0.spread) : NaN);
+                     (typeof o0.spread === "string" ? parseFloat(o0.spread) : NaN);
       if (!Number.isNaN(spread) && favId) {
         if (String(away?.team?.id||"") === favId) {
           awaySpread = `-${Math.abs(spread)}`;
@@ -218,29 +237,28 @@ function pregameRowFactory(weekTextFromESPN, weekNumFromESPN) {
         }
       }
 
-      // moneylines (robust + summary fallback)
+      // MLs (robust + /summary fallback)
       const ml = await extractMLWithFallback(event, o0, away, home);
       awayML = ml.awayML || "";
       homeML = ml.homeML || "";
     } else {
-      // No odds block at all -> pure summary fallback
       const ml = await extractMLWithFallback(event, {}, away, home);
       awayML = ml.awayML || "";
       homeML = ml.homeML || "";
     }
 
-    // Week label (NFL sometimes gives "Regular Season" but has week number)
     const weekText = normLeague(LEAGUE) === "nfl"
-      ? computeWeekLabelNFL(weekTextFromESPN, weekNumFromESPN)
+      ? nflWeekLabel(weekNumFromESPN, weekTextFromESPN)
       : (weekTextFromESPN || "Regular Season");
 
+    const statusClean = tidyStatus(event);
     const dateET = toET(event.date).toLocaleDateString("en-US", { timeZone: "America/New_York" });
 
     return {
       values: [
         dateET,                 // Date
         weekText || "",         // Week
-        shortStatus || status,  // Status
+        statusClean,            // Status
         matchup,                // Matchup
         finalScore,             // Final Score
         awaySpread || "",       // Away Spread
@@ -248,7 +266,7 @@ function pregameRowFactory(weekTextFromESPN, weekNumFromESPN) {
         homeSpread || "",       // Home Spread
         String(homeML || ""),   // Home ML
         String(total || ""),    // Total
-        "", "", "", "", "", ""  // live cols
+        "", "", "", "", "", ""  // Half & live cols (fill later)
       ],
       dateET,
       matchup
@@ -373,7 +391,7 @@ class BatchWriter {
 
   // Pull events (today or week)
   const datesList = RUN_SCOPE === "week"
-    ? (()=>{ // Tue→Mon
+    ? (()=>{ // Tue→Mon window
         const et = toET(new Date());
         const dow = et.getDay(); // 0 Sun..6 Sat
         const offsetToTue = ((dow - 2) + 7) % 7;
@@ -389,7 +407,6 @@ class BatchWriter {
     if (weekText === "Regular Season") weekText = sb?.week?.text || "Regular Season";
     events = events.concat(sb?.events || []);
   }
-  // de-dup by id
   const seen = new Set(); events = events.filter(e => !seen.has(e.id) && seen.add(e.id));
   log(`Events found: ${events.length}, Week label: ${weekText}, Week num: ${weekNum}`);
 
@@ -421,7 +438,7 @@ class BatchWriter {
     log(`✅ Appended ${appendBatch.length} pregame row(s).`);
   }
 
-  // Halftime / Final updates (with batched finals)
+  // Halftime / Final updates (batched finals)
   const batch = new BatchWriter(TAB_NAME);
 
   for (const ev of events) {
@@ -442,7 +459,7 @@ class BatchWriter {
     // Final score
     if (statusName.includes("FINAL")) {
       if (hmap["final score"] !== undefined) batch.add(rowNum, hmap["final score"], scorePair);
-      if (hmap["status"] !== undefined)      batch.add(rowNum, hmap["status"], ev.status?.type?.shortDetail || "Final");
+      if (hmap["status"] !== undefined)      batch.add(rowNum, hmap["status"], "Final");
       continue;
     }
 
