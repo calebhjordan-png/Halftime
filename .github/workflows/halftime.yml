@@ -1,19 +1,30 @@
-name: Halftime Bot
+name: Halftime Bot (NFL)
 
 on:
   workflow_dispatch:
   schedule:
-    # every 15 minutes during common windows; tweak to taste (UTC)
-    - cron: "*/15 12-23 * * 0,1,2,5,6"
+    # NFL: Sundays day window
+    - cron: "*/15 16-23 * * 0"
+    # SNF wrap (late finals)
+    - cron: "*/20 0-2 * * 1"
+    # Mondays (MNF)
+    - cron: "*/20 0-4 * * 2"
+    # Thursdays (TNF)
+    - cron: "*/20 0-3 * * 5"
 
 jobs:
   run-bot:
+    name: NFL collector
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    concurrency:
+      group: halftime-nfl
+      cancel-in-progress: false
     env:
       GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
       GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
-      LEAGUE: nfl      # "nfl" or "college-football"
-      TAB_NAME: NFL    # sheet tab to write to
+      LEAGUE: nfl
+      TAB_NAME: NFL
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
