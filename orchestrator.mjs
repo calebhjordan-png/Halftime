@@ -8,7 +8,7 @@ const LEAGUE        = (process.env.LEAGUE || "nfl").toLowerCase();          // "
 const TAB_NAME      = (process.env.TAB_NAME || "NFL").trim();
 const RUN_SCOPE     = (process.env.RUN_SCOPE || "today").toLowerCase();     // "today" | "week"
 
-/** Column names we expect in the sheet (Half Score header) */
+/** Column names (Half Score header) */
 const COLS = [
   "Date","Week","Status","Matchup","Final Score",
   "Away Spread","Away ML","Home Spread","Home ML","Total",
@@ -81,7 +81,7 @@ function numOrBlank(v) {
 }
 
 /** ===== Status formatting =====
- * Pre: show scheduled ET time (no TZ string)
+ * Pre: show scheduled New York time like '4:15 PM'
  * Live: show shortDetail (e.g., 'Q2 03:12')
  * Half: 'Half'
  * Final: 'Final'
@@ -95,27 +95,20 @@ function tidyStatus(evt) {
   if (tName.includes("IN_PROGRESS") || tName.includes("LIVE")) {
     return short || "In Progress";
   }
-  // scheduled → show start time in ET like '8:15 PM'
   try {
     const et = toET(evt.date);
-    const time = et.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit", hour12: true, timeZone: "America/New_York" });
-    return time;
+    // New York time, no timezone suffix in string
+    return et.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit", hour12: true, timeZone: "America/New_York" });
   } catch { return "Scheduled"; }
 }
 
-/** ===== NFL Week label resolver =====
- * 1) If week.number exists → 'Week N'
- * 2) Else use scoreboard calendar (find the week range containing the event date)
- *    calendar entries typically include: { label: 'Week 5', startDate, endDate }
- */
+/** NFL Week label via calendar if number missing */
 function resolveWeekLabelNFL(sb, eventDateISO) {
   const wnum = sb?.week?.number;
   if (Number.isFinite(wnum)) return `Week ${wnum}`;
-  // calendar scan
   const cal = sb?.leagues?.[0]?.calendar || sb?.calendar || [];
   const t = new Date(eventDateISO).getTime();
   for (const item of cal) {
-    // Some calendars nest entries under item.entries
     const entries = Array.isArray(item?.entries) ? item.entries : [item];
     for (const e of entries) {
       const label = e?.label || e?.detail || e?.text || "";
@@ -124,15 +117,11 @@ function resolveWeekLabelNFL(sb, eventDateISO) {
       if (!start || !end) continue;
       const s = new Date(start).getTime();
       const ed = new Date(end).getTime();
-      if (Number.isFinite(s) && Number.isFinite(ed) && t >= s && t <= ed) {
-        if (/Week\s*\d+/i.test(label)) {
-          console.log(`[debug] Week via calendar: ${label}`); // <— debug
-          return label;
-        }
+      if (Number.isFinite(s) && Number.isFinite(ed) && t >= s && t <= ed && /Week\s*\d+/i.test(label)) {
+        return label;
       }
     }
   }
-  console.log("[debug] Week fallback → Regular Season"); // <— debug
   return "Regular Season";
 }
 
@@ -206,7 +195,7 @@ function extractMoneylines(o, awayId, homeId, competitors = []) {
   return { awayML, homeML };
 }
 
-/** ML fallback: if scoreboard odds lack MLs, pull from /summary */
+/** ML fallback: /summary */
 async function extractMLWithFallback(event, baseOdds, away, home) {
   const base = extractMoneylines(baseOdds || {}, away?.team?.id, home?.team?.id, (event.competitions?.[0]?.competitors)||[]);
   if (base.awayML && base.homeML) return base;
@@ -220,10 +209,7 @@ async function extractMLWithFallback(event, baseOdds, away, home) {
 
     for (const cand of candidates) {
       const ml = extractMoneylines(cand, away?.team?.id, home?.team?.id, (event.competitions?.[0]?.competitors)||[]);
-      if (ml.awayML || ml.homeML) {
-        if (!base.awayML && !base.homeML) console.log(`(ML fallback via summary) ${away?.team?.abbreviation}@${home?.team?.abbreviation}:`, ml);
-        return ml;
-      }
+      if (ml.awayML || ml.homeML) return ml;
     }
   } catch (e) {
     warn("Summary fallback failed:", e?.message || e);
@@ -232,9 +218,9 @@ async function extractMLWithFallback(event, baseOdds, away, home) {
   return base;
 }
 
-/** Build pregame row (uses tidyStatus + week resolver) */
-function pregameRowFactory(weekFromScoreboard) {
-  return async function pregameRow(event, sbForDay) {
+/** Build pregame row */
+function pregameRowFactory(sbForDay) {
+  return async function pregameRow(event) {
     const comp = event.competitions?.[0] || {};
     const away = comp.competitors?.find(c => c.homeAway === "away");
     const home = comp.competitors?.find(c => c.homeAway === "home");
@@ -279,10 +265,10 @@ function pregameRowFactory(weekFromScoreboard) {
       homeML = ml.homeML || "";
     }
 
-    const eventDate = event.date;
+    // Week label
     const weekText = (normLeague(LEAGUE) === "nfl")
-      ? resolveWeekLabelNFL(weekFromScoreboard, eventDate)
-      : (weekFromScoreboard?.week?.text || "Regular Season");
+      ? resolveWeekLabelNFL(sbForDay, event.date)
+      : (sbForDay?.week?.text || "Regular Season");
 
     const statusClean = tidyStatus(event);
     const dateET = toET(event.date).toLocaleDateString("en-US", { timeZone: "America/New_York" });
@@ -357,7 +343,7 @@ async function scrapeLiveOddsOnce(league, gameId) {
   }
 }
 
-/** Batch writer (avoid 429s) */
+/** Batch writer */
 function colLetter(i){ return String.fromCharCode("A".charCodeAt(0) + i); }
 class BatchWriter {
   constructor(tab){ this.tab = tab; this.acc = []; }
@@ -375,6 +361,38 @@ class BatchWriter {
     log(`🟩 Batched ${this.acc.length} cell update(s).`);
     this.acc = [];
   }
+}
+
+/** Center-align all columns A–P (run once per job; idempotent) */
+async function applyCenterFormatting(sheets) {
+  await sheets.spreadsheets.batchUpdate({
+    spreadsheetId: SHEET_ID,
+    requestBody: {
+      requests: [
+        {
+          repeatCell: {
+            range: {
+              sheetId: (await getSheetId(sheets, TAB_NAME)),
+              startRowIndex: 0,
+              startColumnIndex: 0,
+              endColumnIndex: 16 // A..P (0-based, end exclusive)
+            },
+            cell: {
+              userEnteredFormat: {
+                horizontalAlignment: "CENTER"
+              }
+            },
+            fields: "userEnteredFormat.horizontalAlignment"
+          }
+        }
+      ]
+    }
+  });
+}
+async function getSheetId(sheets, title) {
+  const meta = await sheets.spreadsheets.get({ spreadsheetId: SHEET_ID });
+  const sh = (meta.data.sheets || []).find(s => s.properties?.title === title);
+  return sh?.properties?.sheetId;
 }
 
 /** ====== MAIN ====== */
@@ -422,6 +440,9 @@ class BatchWriter {
     keyToRowNum.set(k, i + 2);
   });
 
+  // Apply centering (A..P)
+  await applyCenterFormatting(sheets);
+
   // Pull events (today or week)
   const datesList = RUN_SCOPE === "week"
     ? (()=>{ // Tue→Mon window
@@ -433,9 +454,7 @@ class BatchWriter {
       })()
     : [ yyyymmddInET(new Date()) ];
 
-  // we keep the first day's full scoreboard object around for calendar/weekly mapping
   let firstDaySB = null;
-
   let events = [];
   for (const d of datesList) {
     const sb = await fetchJson(scoreboardUrl(LEAGUE, d));
@@ -450,7 +469,7 @@ class BatchWriter {
 
   // Pregame append
   for (const ev of events) {
-    const { values: rowVals, dateET, matchup } = await buildPregame(ev, firstDaySB);
+    const { values: rowVals, dateET, matchup } = await buildPregame(ev);
     const k = keyOf(dateET, matchup);
     if (!keyToRowNum.has(k)) appendBatch.push(rowVals);
   }
@@ -531,8 +550,6 @@ class BatchWriter {
       } else {
         log(`(Halftime) live odds not found for ${matchup}`);
       }
-    } else {
-      // keep Status tidy while live (no writes spam — only at halftime/final we persist)
     }
   }
 
