@@ -1,14 +1,14 @@
-name: Halftime (NFL)
+name: NFL Halftime
 
 on:
   schedule:
     # Sunday day games (12–7 PM ET)
     - cron: "*/15 16-23 * * 0"
-    # Sunday Night wrap (7–11 PM ET)
+    # Sunday night wrap (7 – 11 PM ET)
     - cron: "*/15 0-3 * * 1"
-    # Monday Night (7 PM–12 AM ET)
+    # Monday night (7 PM – 12 AM ET)
     - cron: "*/20 0-5 * * 2"
-    # Thursday Night (7–11 PM ET)
+    # Thursday night (7 PM – 11 PM ET)
     - cron: "*/20 0-4 * * 5"
   workflow_dispatch:
 
