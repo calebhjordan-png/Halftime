@@ -1,5 +1,4 @@
-name: Halftime Prefill (NFL)
-
+name: NFL Games (Tues)
 on:
   schedule:
     - cron: "0 13 * * 2"   # Tuesday 9:00am ET
