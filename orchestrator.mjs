@@ -8,7 +8,7 @@ const LEAGUE        = (process.env.LEAGUE || "nfl").toLowerCase();          // "
 const TAB_NAME      = (process.env.TAB_NAME || "NFL").trim();
 const RUN_SCOPE     = (process.env.RUN_SCOPE || "today").toLowerCase();     // "today" | "week"
 
-/** Column names we expect in the sheet (Half Score, not Live Score) */
+/** Column names we expect in the sheet (Half Score header) */
 const COLS = [
   "Date","Week","Status","Matchup","Final Score",
   "Away Spread","Away ML","Home Spread","Home ML","Total",
@@ -80,29 +80,67 @@ function numOrBlank(v) {
   return s.startsWith("+") ? `+${n}` : `${n}`;
 }
 
-/** Clean status labels (no time/tz) */
+/** ===== Status formatting =====
+ * Pre: show scheduled ET time (no TZ string)
+ * Live: show shortDetail (e.g., 'Q2 03:12')
+ * Half: 'Half'
+ * Final: 'Final'
+ */
 function tidyStatus(evt) {
-  const name = (evt.status?.type?.name || evt.competitions?.[0]?.status?.type?.name || "").toUpperCase();
-  const sd = (evt.status?.type?.shortDetail || "").toUpperCase();
-  if (name.includes("FINAL")) return "Final";
-  if (name.includes("HALFTIME") || /HALF/.test(sd)) return "Half";
-  if (name.includes("IN_PROGRESS") || name.includes("LIVE")) return "In Progress";
-  if (name.includes("SCHEDULED") || name.includes("STATUS_SCHEDULED") || name.includes("PRE")) return "Scheduled";
-  return evt.status?.type?.description || "Scheduled";
+  const comp = evt.competitions?.[0] || {};
+  const tName = (evt.status?.type?.name || comp.status?.type?.name || "").toUpperCase();
+  const short = (evt.status?.type?.shortDetail || comp.status?.type?.shortDetail || "").trim();
+  if (tName.includes("FINAL")) return "Final";
+  if (tName.includes("HALFTIME")) return "Half";
+  if (tName.includes("IN_PROGRESS") || tName.includes("LIVE")) {
+    return short || "In Progress";
+  }
+  // scheduled → show start time in ET like '8:15 PM'
+  try {
+    const et = toET(evt.date);
+    const time = et.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit", hour12: true, timeZone: "America/New_York" });
+    return time;
+  } catch { return "Scheduled"; }
 }
 
-/** NFL Week label */
-function nflWeekLabel(weekNum, weekText) {
-  if (Number.isFinite(weekNum)) return `Week ${weekNum}`;
-  if (/Week\s*\d+/i.test(weekText || "")) return weekText;
+/** ===== NFL Week label resolver =====
+ * 1) If week.number exists → 'Week N'
+ * 2) Else use scoreboard calendar (find the week range containing the event date)
+ *    calendar entries typically include: { label: 'Week 5', startDate, endDate }
+ */
+function resolveWeekLabelNFL(sb, eventDateISO) {
+  const wnum = sb?.week?.number;
+  if (Number.isFinite(wnum)) return `Week ${wnum}`;
+  // calendar scan
+  const cal = sb?.leagues?.[0]?.calendar || sb?.calendar || [];
+  const t = new Date(eventDateISO).getTime();
+  for (const item of cal) {
+    // Some calendars nest entries under item.entries
+    const entries = Array.isArray(item?.entries) ? item.entries : [item];
+    for (const e of entries) {
+      const label = e?.label || e?.detail || e?.text || "";
+      const start = e?.startDate || e?.start;
+      const end   = e?.endDate   || e?.end;
+      if (!start || !end) continue;
+      const s = new Date(start).getTime();
+      const ed = new Date(end).getTime();
+      if (Number.isFinite(s) && Number.isFinite(ed) && t >= s && t <= ed) {
+        if (/Week\s*\d+/i.test(label)) {
+          console.log(`[debug] Week via calendar: ${label}`); // <— debug
+          return label;
+        }
+      }
+    }
+  }
+  console.log("[debug] Week fallback → Regular Season"); // <— debug
   return "Regular Season";
 }
 
-/** Extract MLs from many shapes (now includes PickCenter shapes) */
+/** ===== ML extractor (includes PickCenter shapes) ===== */
 function extractMoneylines(o, awayId, homeId, competitors = []) {
   let awayML = "", homeML = "";
 
-  // 0) PickCenter shape: awayTeamOdds/homeTeamOdds.moneyLine
+  // PickCenter: awayTeamOdds/homeTeamOdds.moneyLine
   if (o && (o.awayTeamOdds || o.homeTeamOdds)) {
     const aObj = o.awayTeamOdds || {};
     const hObj = o.homeTeamOdds || {};
@@ -111,7 +149,7 @@ function extractMoneylines(o, awayId, homeId, competitors = []) {
     if (awayML || homeML) return { awayML, homeML };
   }
 
-  // 0b) PickCenter rich "moneyline" field (away/home -> close.odds or open.odds)
+  // PickCenter: moneyline.away/home.close/open.odds
   if (o && o.moneyline && (o.moneyline.away || o.moneyline.home)) {
     const awayClose = numOrBlank(o.moneyline.away?.close?.odds ?? o.moneyline.away?.open?.odds);
     const homeClose = numOrBlank(o.moneyline.home?.close?.odds ?? o.moneyline.home?.open?.odds);
@@ -120,7 +158,7 @@ function extractMoneylines(o, awayId, homeId, competitors = []) {
     if (awayML || homeML) return { awayML, homeML };
   }
 
-  // 1) teamOdds: [{ teamId, moneyLine }]
+  // teamOdds[]
   if (Array.isArray(o?.teamOdds)) {
     for (const t of o.teamOdds) {
       const tid = String(t?.teamId ?? t?.team?.id ?? "");
@@ -132,7 +170,7 @@ function extractMoneylines(o, awayId, homeId, competitors = []) {
     if (awayML || homeML) return { awayML, homeML };
   }
 
-  // 2) nested competitors odds
+  // nested competitors odds
   if (Array.isArray(o?.competitors)) {
     const findML = c => numOrBlank(c?.moneyLine ?? c?.moneyline ?? c?.odds?.moneyLine ?? c?.odds?.moneyline);
     const aML = findML(o.competitors.find(c => String(c?.id ?? c?.teamId) === String(awayId)));
@@ -141,12 +179,12 @@ function extractMoneylines(o, awayId, homeId, competitors = []) {
     if (awayML || homeML) return { awayML, homeML };
   }
 
-  // 3) direct fields
+  // direct away/home fields
   awayML = awayML || numOrBlank(o?.moneyLineAway ?? o?.awayTeamMoneyLine ?? o?.awayMoneyLine ?? o?.awayMl);
   homeML = homeML || numOrBlank(o?.moneyLineHome ?? o?.homeTeamMoneyLine ?? o?.homeMoneyLine ?? o?.homeMl);
   if (awayML || homeML) return { awayML, homeML };
 
-  // 4) favorite/underdog mapping
+  // favorite/underdog mapping
   const favId = String(o?.favorite ?? o?.favoriteId ?? o?.favoriteTeamId ?? "");
   const favML = numOrBlank(o?.favoriteMoneyLine);
   const dogML = numOrBlank(o?.underdogMoneyLine);
@@ -155,7 +193,7 @@ function extractMoneylines(o, awayId, homeId, competitors = []) {
     if (String(homeId) === favId) { homeML = homeML || favML; awayML = awayML || dogML; return { awayML, homeML }; }
   }
 
-  // 5) competitors[] { odds: { moneyLine } } variant
+  // competitors[] odds.moneyLine variant
   if (Array.isArray(competitors)) {
     for (const c of competitors) {
       const ml = numOrBlank(c?.odds?.moneyLine ?? c?.odds?.moneyline ?? c?.odds?.money_line);
@@ -168,7 +206,7 @@ function extractMoneylines(o, awayId, homeId, competitors = []) {
   return { awayML, homeML };
 }
 
-/** ===== ML fallback: if scoreboard lacks MLs, pull from summary ===== */
+/** ML fallback: if scoreboard odds lack MLs, pull from /summary */
 async function extractMLWithFallback(event, baseOdds, away, home) {
   const base = extractMoneylines(baseOdds || {}, away?.team?.id, home?.team?.id, (event.competitions?.[0]?.competitors)||[]);
   if (base.awayML && base.homeML) return base;
@@ -183,9 +221,7 @@ async function extractMLWithFallback(event, baseOdds, away, home) {
     for (const cand of candidates) {
       const ml = extractMoneylines(cand, away?.team?.id, home?.team?.id, (event.competitions?.[0]?.competitors)||[]);
       if (ml.awayML || ml.homeML) {
-        if (!base.awayML && !base.homeML) {
-          console.log(`(ML fallback via summary) ${away?.team?.abbreviation}@${home?.team?.abbreviation}:`, ml);
-        }
+        if (!base.awayML && !base.homeML) console.log(`(ML fallback via summary) ${away?.team?.abbreviation}@${home?.team?.abbreviation}:`, ml);
         return ml;
       }
     }
@@ -193,12 +229,12 @@ async function extractMLWithFallback(event, baseOdds, away, home) {
     warn("Summary fallback failed:", e?.message || e);
   }
 
-  return base; // may be blanks
+  return base;
 }
 
-/** Build pregame row — week label & tidy status */
-function pregameRowFactory(weekTextFromESPN, weekNumFromESPN) {
-  return async function pregameRow(event) {
+/** Build pregame row (uses tidyStatus + week resolver) */
+function pregameRowFactory(weekFromScoreboard) {
+  return async function pregameRow(event, sbForDay) {
     const comp = event.competitions?.[0] || {};
     const away = comp.competitors?.find(c => c.homeAway === "away");
     const home = comp.competitors?.find(c => c.homeAway === "home");
@@ -215,8 +251,6 @@ function pregameRowFactory(weekTextFromESPN, weekNumFromESPN) {
 
     if (o0) {
       total = (o0.overUnder ?? o0.total) ?? "";
-
-      // spreads (favorite + spread or parse details)
       const favId = String(o0.favorite || o0.favoriteTeamId || "");
       const spread = Number.isFinite(o0.spread) ? o0.spread :
                      (typeof o0.spread === "string" ? parseFloat(o0.spread) : NaN);
@@ -236,8 +270,6 @@ function pregameRowFactory(weekTextFromESPN, weekNumFromESPN) {
           homeSpread = line > 0 ? `-${Math.abs(line)}` : `+${Math.abs(line)}`;
         }
       }
-
-      // MLs (robust + /summary fallback)
       const ml = await extractMLWithFallback(event, o0, away, home);
       awayML = ml.awayML || "";
       homeML = ml.homeML || "";
@@ -247,9 +279,10 @@ function pregameRowFactory(weekTextFromESPN, weekNumFromESPN) {
       homeML = ml.homeML || "";
     }
 
-    const weekText = normLeague(LEAGUE) === "nfl"
-      ? nflWeekLabel(weekNumFromESPN, weekTextFromESPN)
-      : (weekTextFromESPN || "Regular Season");
+    const eventDate = event.date;
+    const weekText = (normLeague(LEAGUE) === "nfl")
+      ? resolveWeekLabelNFL(weekFromScoreboard, eventDate)
+      : (weekFromScoreboard?.week?.text || "Regular Season");
 
     const statusClean = tidyStatus(event);
     const dateET = toET(event.date).toLocaleDateString("en-US", { timeZone: "America/New_York" });
@@ -266,12 +299,12 @@ function pregameRowFactory(weekTextFromESPN, weekNumFromESPN) {
         homeSpread || "",       // Home Spread
         String(homeML || ""),   // Home ML
         String(total || ""),    // Total
-        "", "", "", "", "", ""  // Half & live cols (fill later)
+        "", "", "", "", "", ""  // live cols (later)
       ],
       dateET,
       matchup
     };
-  }
+  };
 }
 
 /** Halftime-ish? */
@@ -400,22 +433,24 @@ class BatchWriter {
       })()
     : [ yyyymmddInET(new Date()) ];
 
-  let events = [], weekText = "Regular Season", weekNum = null;
+  // we keep the first day's full scoreboard object around for calendar/weekly mapping
+  let firstDaySB = null;
+
+  let events = [];
   for (const d of datesList) {
     const sb = await fetchJson(scoreboardUrl(LEAGUE, d));
-    if (!weekNum && Number.isFinite(sb?.week?.number)) weekNum = sb.week.number;
-    if (weekText === "Regular Season") weekText = sb?.week?.text || "Regular Season";
+    if (!firstDaySB) firstDaySB = sb;
     events = events.concat(sb?.events || []);
   }
   const seen = new Set(); events = events.filter(e => !seen.has(e.id) && seen.add(e.id));
-  log(`Events found: ${events.length}, Week label: ${weekText}, Week num: ${weekNum}`);
+  log(`Events found: ${events.length}`);
 
-  const buildPregame = pregameRowFactory(weekText, weekNum);
+  const buildPregame = pregameRowFactory(firstDaySB);
   let appendBatch = [];
 
   // Pregame append
   for (const ev of events) {
-    const { values: rowVals, dateET, matchup } = await buildPregame(ev);
+    const { values: rowVals, dateET, matchup } = await buildPregame(ev, firstDaySB);
     const k = keyOf(dateET, matchup);
     if (!keyToRowNum.has(k)) appendBatch.push(rowVals);
   }
@@ -496,6 +531,8 @@ class BatchWriter {
       } else {
         log(`(Halftime) live odds not found for ${matchup}`);
       }
+    } else {
+      // keep Status tidy while live (no writes spam — only at halftime/final we persist)
     }
   }
 
