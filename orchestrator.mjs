@@ -111,7 +111,6 @@ function tidyStatus(evt) {
   if (tName.includes("IN_PROGRESS") || tName.includes("LIVE")) {
     return short || "In Progress";
   }
-  // scheduled → format directly in ET (no TZ suffix)
   return fmtETTime(evt.date);
 }
 
@@ -142,7 +141,6 @@ function resolveWeekLabelNFL(sb, eventDateISO) {
 function extractMoneylines(o, awayId, homeId, competitors = []) {
   let awayML = "", homeML = "";
 
-  // PickCenter: awayTeamOdds/homeTeamOdds.moneyLine
   if (o && (o.awayTeamOdds || o.homeTeamOdds)) {
     const aObj = o.awayTeamOdds || {};
     const hObj = o.homeTeamOdds || {};
@@ -151,7 +149,6 @@ function extractMoneylines(o, awayId, homeId, competitors = []) {
     if (awayML || homeML) return { awayML, homeML };
   }
 
-  // PickCenter: moneyline.away/home.close/open.odds
   if (o && o.moneyline && (o.moneyline.away || o.moneyline.home)) {
     const awayClose = numOrBlank(o.moneyline.away?.close?.odds ?? o.moneyline.away?.open?.odds);
     const homeClose = numOrBlank(o.moneyline.home?.close?.odds ?? o.moneyline.home?.open?.odds);
@@ -160,7 +157,6 @@ function extractMoneylines(o, awayId, homeId, competitors = []) {
     if (awayML || homeML) return { awayML, homeML };
   }
 
-  // teamOdds[]
   if (Array.isArray(o?.teamOdds)) {
     for (const t of o.teamOdds) {
       const tid = String(t?.teamId ?? t?.team?.id ?? "");
@@ -172,7 +168,6 @@ function extractMoneylines(o, awayId, homeId, competitors = []) {
     if (awayML || homeML) return { awayML, homeML };
   }
 
-  // nested competitors odds
   if (Array.isArray(o?.competitors)) {
     const findML = c => numOrBlank(c?.moneyLine ?? c?.moneyline ?? c?.odds?.moneyLine ?? c?.odds?.moneyline);
     const aML = findML(o.competitors.find(c => String(c?.id ?? c?.teamId) === String(awayId)));
@@ -181,12 +176,10 @@ function extractMoneylines(o, awayId, homeId, competitors = []) {
     if (awayML || homeML) return { awayML, homeML };
   }
 
-  // direct away/home fields
   awayML = awayML || numOrBlank(o?.moneyLineAway ?? o?.awayTeamMoneyLine ?? o?.awayMoneyLine ?? o?.awayMl);
   homeML = homeML || numOrBlank(o?.moneyLineHome ?? o?.homeTeamMoneyLine ?? o?.homeMoneyLine ?? o?.homeMl);
   if (awayML || homeML) return { awayML, homeML };
 
-  // favorite/underdog mapping
   const favId = String(o?.favorite ?? o?.favoriteId ?? o?.favoriteTeamId ?? "");
   const favML = numOrBlank(o?.favoriteMoneyLine);
   const dogML = numOrBlank(o?.underdogMoneyLine);
@@ -195,7 +188,6 @@ function extractMoneylines(o, awayId, homeId, competitors = []) {
     if (String(homeId) === favId) { homeML = homeML || favML; awayML = awayML || dogML; return { awayML, homeML }; }
   }
 
-  // competitors[] odds.moneyLine variant
   if (Array.isArray(competitors)) {
     for (const c of competitors) {
       const ml = numOrBlank(c?.odds?.moneyLine ?? c?.odds?.moneyline ?? c?.odds?.money_line);
@@ -239,7 +231,6 @@ function pregameRowFactory(sbForDay) {
     const home = comp.competitors?.find(c => c.homeAway === "home");
 
     const awayName = away?.team?.shortDisplayName || away?.team?.abbreviation || away?.team?.name || "Away";
-    the
     const homeName = home?.team?.shortDisplayName || home?.team?.abbreviation || home?.team?.name || "Home";
     const matchup = `${awayName} @ ${homeName}`;
 
@@ -279,12 +270,10 @@ function pregameRowFactory(sbForDay) {
       homeML = ml.homeML || "";
     }
 
-    // Week label
     const weekText = (normLeague(LEAGUE) === "nfl")
       ? resolveWeekLabelNFL(sbForDay, event.date)
       : (sbForDay?.week?.text || "Regular Season");
 
-    // Status & Date (ET)
     const statusClean = tidyStatus(event);
     const dateET = fmtETDate(event.date);
 
@@ -335,6 +324,7 @@ async function scrapeLiveOddsOnce(league, gameId) {
     const mlMatches = txt.match(/\s[+-]\d{2,4}\b/g) || [];
 
     const liveAwaySpread = spreadMatches[0] || "";
+    the
     const liveHomeSpread = spreadMatches[1] || "";
     const liveTotal = (totalOver && totalOver[1]) || (totalUnder && totalUnder[1]) || "";
     const liveAwayML = (mlMatches[0]||"").trim();
@@ -449,10 +439,7 @@ async function applyCenterFormatting(sheets) {
 
   // Pull events (today or week)
   const datesList = RUN_SCOPE === "week"
-    ? (()=>{ // simple 7-day sweep from today in ET
-        const start = new Date();
-        return Array.from({length:7}, (_,i)=> yyyymmddInET(new Date(start.getTime()+i*86400000)));
-      })()
+    ? (()=>{ const start = new Date(); return Array.from({length:7}, (_,i)=> yyyymmddInET(new Date(start.getTime()+i*86400000))); })()
     : [ yyyymmddInET(new Date()) ];
 
   let firstDaySB = null;
@@ -511,14 +498,12 @@ async function applyCenterFormatting(sheets) {
     const statusName = (ev.status?.type?.name || comp.status?.type?.name || "").toUpperCase();
     const scorePair = `${away?.score ?? ""}-${home?.score ?? ""}`;
 
-    // Final score
     if (statusName.includes("FINAL")) {
       if (hmap["final score"] !== undefined) batch.add(rowNum, hmap["final score"], scorePair);
       if (hmap["status"] !== undefined)      batch.add(rowNum, hmap["status"], "Final");
       continue;
     }
 
-    // Halftime (one-time) live odds
     const currentRow = (values[rowNum-1] || []);
     const halfAlready = (currentRow[hmap["half score"]] || "").toString().trim();
     const liveTotalVal = (currentRow[hmap["live total"]] || "").toString().trim();
