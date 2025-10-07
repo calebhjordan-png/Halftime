@@ -1,0 +1,40 @@
+name: Halftime Bot (CFB)
+
+on:
+  workflow_dispatch:
+  schedule:
+    # CFB: Saturday main window
+    - cron: "*/20 14-23 * * 6"
+    # Late wrap into Sunday (catch finals)
+    - cron: "*/30 0-6 * * 0"
+
+jobs:
+  run-bot:
+    name: CFB collector
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    concurrency:
+      group: halftime-cfb
+      cancel-in-progress: false
+    env:
+      GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+      GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
+      LEAGUE: college-football
+      TAB_NAME: CFB
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install deps
+        run: npm install
+
+      - name: Install Playwright (Chromium)
+        run: npx playwright install --with-deps chromium
+
+      - name: Run collector
+        run: node orchestrator.mjs
