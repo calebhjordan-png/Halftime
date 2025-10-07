@@ -1,0 +1,24 @@
+name: Halftime Prefill (NFL)
+
+on:
+  schedule:
+    - cron: "0 13 * * 2"   # Tuesday 9:00am ET
+  workflow_dispatch:
+
+jobs:
+  prefill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+      GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
+      LEAGUE: nfl
+      TAB_NAME: NFL
+      RUN_SCOPE: week
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
+      - run: npm install
+      - run: npx playwright install --with-deps chromium
+      - run: node orchestrator.mjs
