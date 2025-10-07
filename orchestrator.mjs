@@ -19,6 +19,14 @@ const COLS = [
 const log = (...a)=>console.log(...a);
 const warn = (...a)=>console.warn(...a);
 
+/* parse service account (raw JSON or base64) */
+function parseServiceAccount(raw) {
+  if (!raw) throw new Error("GOOGLE_SERVICE_ACCOUNT is empty");
+  if (raw.trim().startsWith("{")) return JSON.parse(raw); // raw JSON
+  const json = Buffer.from(raw, "base64").toString("utf8"); // Base64
+  return JSON.parse(json);
+}
+
 /* --- ET formatters (no string re-parsing!) --- */
 const ET_TZ = "America/New_York";
 
@@ -231,6 +239,7 @@ function pregameRowFactory(sbForDay) {
     const home = comp.competitors?.find(c => c.homeAway === "home");
 
     const awayName = away?.team?.shortDisplayName || away?.team?.abbreviation || away?.team?.name || "Away";
+    the
     const homeName = home?.team?.shortDisplayName || home?.team?.abbreviation || home?.team?.name || "Home";
     const matchup = `${awayName} @ ${homeName}`;
 
@@ -440,11 +449,8 @@ async function applyCenterFormatting(sheets) {
 
   // Pull events (today or week)
   const datesList = RUN_SCOPE === "week"
-    ? (()=>{ // Tue→Mon window (computed in ET for the yyyymmdd param)
-        const today = new Date();
-        const parts = new Intl.DateTimeFormat("en-US",{timeZone:ET_TZ, weekday:"short"}).formatToParts(today);
-        // We'll just start from today's ET date and go 7 days; scoreboard accepts each ET date fine.
-        const start = new Date(today);
+    ? (()=>{ // simple 7-day sweep from today in ET
+        const start = new Date();
         return Array.from({length:7}, (_,i)=> yyyymmddInET(new Date(start.getTime()+i*86400000)));
       })()
     : [ yyyymmddInET(new Date()) ];
