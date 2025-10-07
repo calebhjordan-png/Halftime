@@ -7,7 +7,7 @@ const CREDS_RAW = (process.env.GOOGLE_SERVICE_ACCOUNT || "").trim();
 const LEAGUE    = (process.env.LEAGUE || "nfl").toLowerCase(); // "nfl" | "college-football"
 const TAB_NAME  = (process.env.TAB_NAME || "NFL").trim();
 
-/** Column names we expect in the sheet */
+/** Column names we expect in the sheet (order matters) */
 const COLS = [
   "Date","Week","Status","Matchup","Final Score",
   "Away Spread","Away ML","Home Spread","Home ML","Total",
@@ -28,23 +28,34 @@ function yyyymmddInET(d=new Date()) {
   return `${y}${m}${day}`;
 }
 async function fetchJson(url) {
-  const res = await fetch(url, { headers: { "User-Agent": "halftime-bot" } });
+  const res = await fetch(url, {
+    headers: {
+      "User-Agent": "halftime-bot",
+      "Accept": "application/json,text/plain;q=0.9,*/*;q=0.8",
+      "Referer": "https://www.espn.com/"
+    }
+  });
   if (!res.ok) throw new Error(`Fetch failed ${res.status} ${url}`);
   return res.json();
 }
+function normLeague(league) {
+  return (league === "ncaaf" || league === "college-football") ? "college-football" : "nfl";
+}
 function scoreboardUrl(league, dates) {
-  const lg = league === "ncaaf" || league === "college-football" ? "college-football" : "nfl";
-  return `https://site.api.espn.com/apis/site/v2/sports/football/${lg}/scoreboard?dates=${dates}`;
+  const lg = normLeague(league);
+  // Add FBS group for CFB (80 = FBS). Keep it free/public.
+  const extra = lg === "college-football" ? "&groups=80&limit=300" : "";
+  return `https://site.api.espn.com/apis/site/v2/sports/football/${lg}/scoreboard?dates=${dates}${extra}`;
 }
 function gameUrl(league, gameId) {
-  const lg = league === "ncaaf" || league === "college-football" ? "college-football" : "nfl";
+  const lg = normLeague(league);
   return `https://www.espn.com/${lg}/game/_/gameId/${gameId}`;
 }
 function pickOdds(oddsArr=[]) {
   if (!Array.isArray(oddsArr) || oddsArr.length === 0) return null;
   const espnBet =
     oddsArr.find(o => /espn\s*bet/i.test(o.provider?.name || "")) ||
-    oddsArr.find(o => /espn bet/i.test(o.provider?.displayName || ""));
+    oddsArr.find(o => /espn\s*bet/i.test(o.provider?.displayName || ""));
   return espnBet || oddsArr[0];
 }
 function mapHeadersToIndex(headerRow) {
@@ -54,61 +65,62 @@ function mapHeadersToIndex(headerRow) {
 }
 function keyOf(dateStr, matchup) { return `${(dateStr||"").trim()}__${(matchup||"").trim()}`; }
 
-/** Normalize numeric-ish value */
+/** Normalize numeric-ish value into string (keeps + sign if present) */
 function numOrBlank(v) {
-  if (v === 0) return 0;
+  if (v === 0) return "0";
   if (v == null) return "";
-  const n = parseFloat(String(v).replace(/[^\d.+-]/g, ""));
-  return Number.isFinite(n) ? (String(v).trim().startsWith("+") ? `+${n}` : `${n}`) : "";
+  const s = String(v).trim();
+  const n = parseFloat(s.replace(/[^\d.+-]/g, ""));
+  if (!Number.isFinite(n)) return "";
+  return s.startsWith("+") ? `+${n}` : `${n}`;
 }
 
-/** Try to pull moneylines for each team from many ESPN shapes */
-function extractMoneylines(o, awayId, homeId) {
+/** ====== Robust Moneyline extraction covering ESPN variants ====== */
+function extractMoneylines(o, awayId, homeId, competitors = []) {
   let awayML = "", homeML = "";
 
-  const trySetByIds = (teamOddsArr) => {
-    if (!Array.isArray(teamOddsArr)) return false;
-    for (const t of teamOddsArr) {
-      const tid = String(t?.teamId ?? t?.team?.id ?? "");
-      const ml  = numOrBlank(t?.moneyLine ?? t?.moneyline ?? t?.money_line);
-      if (!ml) continue;
-      if (tid && tid === String(awayId)) awayML = ml;
-      if (tid && tid === String(homeId)) homeML = ml;
-    }
-    return !!(awayML || homeML);
+  const byId = (tid, ml) => {
+    if (!ml) return;
+    if (String(tid) === String(awayId)) awayML = awayML || ml;
+    if (String(tid) === String(homeId)) homeML = homeML || ml;
   };
 
-  // 1) teamOdds: [{ teamId, moneyLine }]
-  if (trySetByIds(o.teamOdds)) return { awayML, homeML };
-
-  // 2) nested competitors-> odds info (sometimes used)
-  if (Array.isArray(o.competitors)) {
-    const a = o.competitors.find(c => String(c?.id) === String(awayId) || String(c?.teamId) === String(awayId));
-    const h = o.competitors.find(c => String(c?.id) === String(homeId) || String(c?.teamId) === String(homeId));
-    if (a) awayML = awayML || numOrBlank(a.moneyLine ?? a.moneyline);
-    if (h) homeML = homeML || numOrBlank(h.moneyLine ?? h.moneyline);
-    if (awayML || homeML) return { awayML, homeML };
+  // 1) teamOdds[] variants
+  if (Array.isArray(o?.teamOdds)) {
+    for (const t of o.teamOdds) {
+      const tid = String(t?.teamId ?? t?.team?.id ?? "");
+      const ml  = numOrBlank(t?.moneyLine ?? t?.moneyline ?? t?.money_line);
+      byId(tid, ml);
+    }
   }
 
-  // 3) direct fields
-  awayML = awayML || numOrBlank(o.moneyLineAway ?? o.awayTeamMoneyLine ?? o.awayMoneyLine ?? o.awayMl);
-  homeML = homeML || numOrBlank(o.moneyLineHome ?? o.homeTeamMoneyLine ?? o.homeMoneyLine ?? o.homeMl);
-  if (awayML || homeML) return { awayML, homeML };
+  // 2) direct fields on odds object
+  awayML = awayML || numOrBlank(o?.moneyLineAway ?? o?.awayTeamMoneyLine ?? o?.awayMoneyLine ?? o?.awayMl);
+  homeML = homeML || numOrBlank(o?.moneyLineHome ?? o?.homeTeamMoneyLine ?? o?.homeMoneyLine ?? o?.homeMl);
 
-  // 4) favorite/underdog mapping
-  const favId = String(o.favorite || "");
-  const favML = numOrBlank(o.favoriteMoneyLine);
-  const dogML = numOrBlank(o.underdogMoneyLine);
-  if (favId && (favML || dogML)) {
-    if (String(awayId) === favId) {
-      awayML = favML || awayML;
-      homeML = dogML || homeML;
-      return { awayML, homeML };
+  // 3) favorite/underdog paired fields
+  if (!awayML || !homeML) {
+    const favId = String(o?.favorite ?? o?.favoriteId ?? o?.favoriteTeamId ?? "");
+    const favML = numOrBlank(o?.favoriteMoneyLine);
+    const dogML = numOrBlank(o?.underdogMoneyLine);
+    if (favId && (favML || dogML)) {
+      if (String(awayId) === favId) {
+        awayML = awayML || favML;
+        homeML = homeML || dogML;
+      } else if (String(homeId) === favId) {
+        homeML = homeML || favML;
+        awayML = awayML || dogML;
+      }
     }
-    if (String(homeId) === favId) {
-      homeML = favML || homeML;
-      awayML = dogML || awayML;
-      return { awayML, homeML };
+  }
+
+  // 4) rare competitor-level odds
+  if ((!awayML || !homeML) && Array.isArray(competitors)) {
+    for (const c of competitors) {
+      const cand = numOrBlank(c?.odds?.moneyLine ?? c?.odds?.moneyline ?? c?.odds?.money_line);
+      if (!cand) continue;
+      if (c.homeAway === "away") awayML = awayML || cand;
+      if (c.homeAway === "home") homeML = homeML || cand;
     }
   }
 
@@ -120,8 +132,9 @@ function pregameRow(event, weekText) {
   const comp = event.competitions?.[0] || {};
   const status = event.status?.type?.name || comp.status?.type?.name || "";
   const shortStatus = event.status?.type?.shortDetail || comp.status?.type?.shortDetail || "";
-  const away = comp.competitors?.find(c => c.homeAway === "away");
-  const home = comp.competitors?.find(c => c.homeAway === "home");
+  const competitors = comp?.competitors || [];
+  const away = competitors.find(c => c.homeAway === "away");
+  const home = competitors.find(c => c.homeAway === "home");
 
   const awayName = away?.team?.shortDisplayName || away?.team?.abbreviation || away?.team?.name || "Away";
   const homeName = home?.team?.shortDisplayName || home?.team?.abbreviation || home?.team?.name || "Home";
@@ -136,6 +149,7 @@ function pregameRow(event, weekText) {
   let awaySpread = "", homeSpread = "", total = "", awayML = "", homeML = "";
 
   if (o) {
+    // total
     total = (o.overUnder ?? o.total) ?? "";
 
     // spreads
@@ -151,6 +165,7 @@ function pregameRow(event, weekText) {
         awaySpread = `+${Math.abs(spread)}`;
       }
     } else if (o.details) {
+      // fallback parse from text like "Team X -7.5"
       const m = o.details.match(/([+-]?\d+(\.\d+)?)/);
       if (m) {
         const line = parseFloat(m[1]);
@@ -161,7 +176,7 @@ function pregameRow(event, weekText) {
 
     // moneylines (robust)
     const ids = { awayId: away?.team?.id, homeId: home?.team?.id };
-    const ml = extractMoneylines(o, ids.awayId, ids.homeId);
+    const ml = extractMoneylines(o, ids.awayId, ids.homeId, competitors);
     awayML = ml.awayML || "";
     homeML = ml.homeML || "";
   }
@@ -191,31 +206,55 @@ function pregameRow(event, weekText) {
 function isHalftimeLike(evt) {
   const t = (evt.status?.type?.name || evt.competitions?.[0]?.status?.type?.name || "").toUpperCase();
   const short = (evt.status?.type?.shortDetail || "").toUpperCase();
-  return t.includes("HALFTIME") || /Q2.*0:0?0/i.test(short);
+  return t.includes("HALFTIME") || /Q2.*0:0?0/i.test(short) || /HALF\s*TIME/i.test(short);
 }
 
-/** Playwright DOM scrape for LIVE odds at halftime (one-time) */
+/** ====== Resilient Playwright DOM scrape for LIVE odds (one-time) ====== */
 async function scrapeLiveOddsOnce(league, gameId) {
   const url = gameUrl(league, gameId);
   const browser = await playwright.chromium.launch({ headless: true });
   const page = await browser.newPage();
   try {
     await page.goto(url, { timeout: 60000, waitUntil: "domcontentloaded" });
-    const section = page.locator("section:has-text('LIVE ODDS'), div:has(h2:has-text('LIVE ODDS'))").first();
-    await section.waitFor({ timeout: 8000 });
-    const txt = (await section.innerText()).replace(/\u00a0/g," ").replace(/\s+/g," ").trim();
+    await page.waitForLoadState("networkidle", { timeout: 6000 }).catch(() => {});
+    await page.waitForTimeout(750);
 
-    const spreadMatches = txt.match(/([+-]\d+(\.\d+)?)/g) || [];
-    const totalOver = txt.match(/o\s?(\d+(\.\d+)?)/i);
-    const totalUnder = txt.match(/u\s?(\d+(\.\d+)?)/i);
-    const mlMatches = txt.match(/\s[+-]\d{2,4}\b/g) || [];
+    // Anchor by stable footer/labels rather than brittle classnames
+    const primaryFooter = page.getByText(/All Live Odds on ESPN BET Sportsbook/i).first();
+    const altFooter = page.getByText(/^Odds by$/i).first();
 
-    const liveAwaySpread = spreadMatches[0] || "";
-    const liveHomeSpread = spreadMatches[1] || "";
-    const liveTotal = (totalOver && totalOver[1]) || (totalUnder && totalUnder[1]) || "";
-    const liveAwayML = (mlMatches[0]||"").trim();
-    const liveHomeML = (mlMatches[1]||"").trim();
+    const container = await nearestOddsContainer(primaryFooter) || await nearestOddsContainer(altFooter);
+    if (!container) {
+      console.warn("LIVE ODDS container not found:", url);
+      return null;
+    }
 
+    const raw = (await container.innerText()).replace(/\u00a0/g," ").replace(/\s+/g," ").trim();
+
+    // Total: "o/u 45.5" OR "Total 45.5" OR "o45.5 / u45.5"
+    const totalMatch =
+      raw.match(/\b(?:o\/?u|total)\s*([0-9]+(?:\.[0-9])?)/i) ||
+      raw.match(/\bo\s*([0-9]+(?:\.[0-9])?)\b/i) ||
+      raw.match(/\bu\s*([0-9]+(?:\.[0-9])?)\b/i);
+    const liveTotal = totalMatch ? totalMatch[1] : "";
+
+    // Spreads: take first two signed numbers that are likely spreads (<= 40 abs)
+    const spreadNums = [...raw.matchAll(/([+-]\d+(?:\.\d+)?)(?!\s*(?:o|u)\b)/gi)]
+      .map(m => Number(m[1])).filter(n => Number.isFinite(n) && Math.abs(n) <= 40);
+    const liveAwaySpread = (spreadNums[0] != null) ? (spreadNums[0] > 0 ? `+${spreadNums[0]}` : `${spreadNums[0]}`) : "";
+    const liveHomeSpread = (spreadNums[1] != null) ? (spreadNums[1] > 0 ? `+${spreadNums[1]}` : `${spreadNums[1]}`) : "";
+
+    // Moneylines: prefer explicit "ML -120" tokens, fallback to bare +/- near the grid
+    const mlTokens = [...raw.matchAll(/\bML\s*([+-]?\d{2,4})\b/gi)].map(m => m[1]);
+    let liveAwayML = mlTokens[0] || "";
+    let liveHomeML = mlTokens[1] || "";
+    if (!liveAwayML || !liveHomeML) {
+      const bare = [...raw.matchAll(/\s([+-]\d{2,4})\s/g)].map(m => m[1]);
+      liveAwayML = liveAwayML || bare[0] || "";
+      liveHomeML = liveHomeML || bare[1] || "";
+    }
+
+    // Live score: grab from global header text if present
     let liveScore = "";
     try {
       const allTxt = (await page.locator("body").innerText()).replace(/\s+/g," ");
@@ -223,18 +262,43 @@ async function scrapeLiveOddsOnce(league, gameId) {
       if (sc) liveScore = `${sc[1]}-${sc[2]}`;
     } catch {}
 
-    return {
-      liveAwaySpread, liveHomeSpread, liveTotal, liveAwayML, liveHomeML, liveScore
-    };
+    // Only write if we parsed something meaningful
+    const parsedAny = !!(liveTotal || liveAwaySpread || liveHomeSpread || liveAwayML || liveHomeML || liveScore);
+    if (!parsedAny) return null;
+
+    return { liveAwaySpread, liveHomeSpread, liveTotal, liveAwayML, liveHomeML, liveScore };
+
   } catch (err) {
     console.warn("Live DOM scrape failed:", err.message, url);
     return null;
   } finally {
-    await browser.close();
+    await page.close().catch(()=>{});
+    await browser.close().catch(()=>{});
+  }
+
+  async function nearestOddsContainer(locator) {
+    try {
+      await locator.wait({ timeout: 4000 });
+      const el = await locator.elementHandle();
+      if (!el) return null;
+      return await el.evaluateHandle(node => {
+        let cur = node;
+        for (let i = 0; i < 6 && cur && cur.parentElement; i++) {
+          cur = cur.parentElement;
+          if (cur?.querySelector && (cur.querySelector('table') || cur.querySelector('[role="table"]'))) {
+            return cur;
+          }
+        }
+        return node.parentElement || node;
+      });
+    } catch {
+      return null;
+    }
   }
 }
 
 async function updateRow(sheets, rowNumber, colIndex, value) {
+  if (value === "" || value == null) return; // don't overwrite with blank
   const colLetter = String.fromCharCode("A".charCodeAt(0) + colIndex);
   const range = `${TAB_NAME}!${colLetter}${rowNumber}:${colLetter}${rowNumber}`;
   await sheets.spreadsheets.values.update({
@@ -312,6 +376,7 @@ async function updateRow(sheets, rowNumber, colIndex, value) {
       valueInputOption: "RAW",
       requestBody: { values: appendBatch },
     });
+    // refresh map after append
     const re = await sheets.spreadsheets.values.get({
       spreadsheetId: SHEET_ID,
       range: `${TAB_NAME}!A1:Z`,
@@ -354,22 +419,26 @@ async function updateRow(sheets, rowNumber, colIndex, value) {
       continue;
     }
 
-    // Halftime (one-time) live odds
-    const currentRow = (values[rowNum-1] || []);
-    const liveTotalVal = currentRow[hmap["live total"]] || "";
-    if (isHalftimeLike(ev) && !liveTotalVal) {
+    // Halftime (one-time) live odds: we use "Live Total" as the guard
+    const snapshot = (await sheets.spreadsheets.values.get({
+      spreadsheetId: SHEET_ID,
+      range: `${TAB_NAME}!A${rowNum}:Z${rowNum}`,
+    })).data.values?.[0] || [];
+    const liveAlready = (snapshot[hmap["live total"]] || "").toString().trim();
+
+    if (isHalftimeLike(ev) && !liveAlready) {
       const live = await scrapeLiveOddsOnce(LEAGUE, ev.id);
       if (live) {
         const {
           liveAwaySpread, liveHomeSpread, liveTotal, liveAwayML, liveHomeML, liveScore
         } = live;
 
-        if (hmap["live score"] !== undefined && liveScore)       await updateRow(sheets, rowNum, hmap["live score"], liveScore);
-        if (hmap["live away spread"] !== undefined && liveAwaySpread) await updateRow(sheets, rowNum, hmap["live away spread"], liveAwaySpread);
-        if (hmap["live home spread"] !== undefined && liveHomeSpread) await updateRow(sheets, rowNum, hmap["live home spread"], liveHomeSpread);
-        if (hmap["live away ml"] !== undefined && liveAwayML)   await updateRow(sheets, rowNum, hmap["live away ml"], liveAwayML);
-        if (hmap["live home ml"] !== undefined && liveHomeML)   await updateRow(sheets, rowNum, hmap["live home ml"], liveHomeML);
-        if (hmap["live total"] !== undefined && liveTotal)       await updateRow(sheets, rowNum, hmap["live total"], liveTotal);
+        await updateRow(sheets, rowNum, hmap["live score"],        liveScore);
+        await updateRow(sheets, rowNum, hmap["live away spread"],  liveAwaySpread);
+        await updateRow(sheets, rowNum, hmap["live home spread"],  liveHomeSpread);
+        await updateRow(sheets, rowNum, hmap["live away ml"],      liveAwayML);
+        await updateRow(sheets, rowNum, hmap["live home ml"],      liveHomeML);
+        await updateRow(sheets, rowNum, hmap["live total"],        liveTotal);
 
         console.log(`🕐 Halftime LIVE written for ${matchup}`);
       } else {
