@@ -96,12 +96,7 @@ function numOrBlank(v) {
   return s.startsWith("+") ? `+${n}` : `${n}`;
 }
 
-/** ===== Status formatting (fixed to ET) =====
- * Pre: show scheduled New York time like '8:15 PM'
- * Live: show shortDetail (e.g., 'Q2 03:12')
- * Half: 'Half'
- * Final: 'Final'
- */
+/** ===== Status formatting (fixed to ET) ===== */
 function tidyStatus(evt) {
   const comp = evt.competitions?.[0] || {};
   const tName = (evt.status?.type?.name || comp.status?.type?.name || "").toUpperCase();
@@ -111,36 +106,54 @@ function tidyStatus(evt) {
   if (tName.includes("IN_PROGRESS") || tName.includes("LIVE")) {
     return short || "In Progress";
   }
+  // scheduled → format directly in ET (no TZ suffix)
   return fmtETTime(evt.date);
 }
 
-/** NFL Week label via calendar if number missing */
-function resolveWeekLabelNFL(sb, eventDateISO) {
-  const wnum = sb?.week?.number;
-  if (Number.isFinite(wnum)) return `Week ${wnum}`;
+/** ===== Week label resolvers ===== */
+/* Generic calendar-based resolver — works for both NFL + CFB. */
+function resolveWeekLabelFromCalendar(sb, eventDateISO) {
   const cal = sb?.leagues?.[0]?.calendar || sb?.calendar || [];
   const t = new Date(eventDateISO).getTime();
   for (const item of cal) {
     const entries = Array.isArray(item?.entries) ? item.entries : [item];
     for (const e of entries) {
-      const label = e?.label || e?.detail || e?.text || "";
+      const label = (e?.label || e?.detail || e?.text || "").trim();
       const start = e?.startDate || e?.start;
       const end   = e?.endDate   || e?.end;
       if (!start || !end) continue;
       const s = new Date(start).getTime();
       const ed = new Date(end).getTime();
-      if (Number.isFinite(s) && Number.isFinite(ed) && t >= s && t <= ed && /Week\s*\d+/i.test(label)) {
-        return label;
+      if (!Number.isFinite(s) || !Number.isFinite(ed)) continue;
+      if (t >= s && t <= ed) {
+        // Prefer "Week N" if present, but also allow "Bowls", "CFP", etc.
+        if (/Week\s*\d+/i.test(label)) return label;
+        if (label) return label;
       }
     }
   }
-  return "Regular Season";
+  return "";
+}
+
+/* NFL: prefer explicit number; fallback to calendar. */
+function resolveWeekLabelNFL(sb, eventDateISO) {
+  const wnum = sb?.week?.number;
+  if (Number.isFinite(wnum)) return `Week ${wnum}`;
+  return resolveWeekLabelFromCalendar(sb, eventDateISO) || "Regular Season";
+}
+
+/* CFB: first try sb.week.text, else calendar. */
+function resolveWeekLabelCFB(sb, eventDateISO) {
+  const text = (sb?.week?.text || "").trim();
+  if (text) return text; // ESPN often fills this for CFB (“Week 7”, “Bowls”, “CFP”, etc.)
+  return resolveWeekLabelFromCalendar(sb, eventDateISO) || "Regular Season";
 }
 
 /** ===== ML extractor (includes PickCenter shapes) ===== */
 function extractMoneylines(o, awayId, homeId, competitors = []) {
   let awayML = "", homeML = "";
 
+  // PickCenter blocks
   if (o && (o.awayTeamOdds || o.homeTeamOdds)) {
     const aObj = o.awayTeamOdds || {};
     const hObj = o.homeTeamOdds || {};
@@ -148,7 +161,6 @@ function extractMoneylines(o, awayId, homeId, competitors = []) {
     homeML = homeML || numOrBlank(hObj.moneyLine ?? hObj.moneyline ?? hObj.money_line);
     if (awayML || homeML) return { awayML, homeML };
   }
-
   if (o && o.moneyline && (o.moneyline.away || o.moneyline.home)) {
     const awayClose = numOrBlank(o.moneyline.away?.close?.odds ?? o.moneyline.away?.open?.odds);
     const homeClose = numOrBlank(o.moneyline.home?.close?.odds ?? o.moneyline.home?.open?.odds);
@@ -157,6 +169,7 @@ function extractMoneylines(o, awayId, homeId, competitors = []) {
     if (awayML || homeML) return { awayML, homeML };
   }
 
+  // teamOdds[]
   if (Array.isArray(o?.teamOdds)) {
     for (const t of o.teamOdds) {
       const tid = String(t?.teamId ?? t?.team?.id ?? "");
@@ -168,6 +181,7 @@ function extractMoneylines(o, awayId, homeId, competitors = []) {
     if (awayML || homeML) return { awayML, homeML };
   }
 
+  // nested competitors odds
   if (Array.isArray(o?.competitors)) {
     const findML = c => numOrBlank(c?.moneyLine ?? c?.moneyline ?? c?.odds?.moneyLine ?? c?.odds?.moneyline);
     const aML = findML(o.competitors.find(c => String(c?.id ?? c?.teamId) === String(awayId)));
@@ -176,10 +190,12 @@ function extractMoneylines(o, awayId, homeId, competitors = []) {
     if (awayML || homeML) return { awayML, homeML };
   }
 
+  // direct fields
   awayML = awayML || numOrBlank(o?.moneyLineAway ?? o?.awayTeamMoneyLine ?? o?.awayMoneyLine ?? o?.awayMl);
   homeML = homeML || numOrBlank(o?.moneyLineHome ?? o?.homeTeamMoneyLine ?? o?.homeMoneyLine ?? o?.homeMl);
   if (awayML || homeML) return { awayML, homeML };
 
+  // favorite mapping
   const favId = String(o?.favorite ?? o?.favoriteId ?? o?.favoriteTeamId ?? "");
   const favML = numOrBlank(o?.favoriteMoneyLine);
   const dogML = numOrBlank(o?.underdogMoneyLine);
@@ -188,6 +204,7 @@ function extractMoneylines(o, awayId, homeId, competitors = []) {
     if (String(homeId) === favId) { homeML = homeML || favML; awayML = awayML || dogML; return { awayML, homeML }; }
   }
 
+  // competitors[] variant
   if (Array.isArray(competitors)) {
     for (const c of competitors) {
       const ml = numOrBlank(c?.odds?.moneyLine ?? c?.odds?.moneyline ?? c?.odds?.money_line);
@@ -270,10 +287,12 @@ function pregameRowFactory(sbForDay) {
       homeML = ml.homeML || "";
     }
 
+    // Week label: NFL uses numeric if present; CFB uses week.text or calendar.
     const weekText = (normLeague(LEAGUE) === "nfl")
       ? resolveWeekLabelNFL(sbForDay, event.date)
-      : (sbForDay?.week?.text || "Regular Season");
+      : resolveWeekLabelCFB(sbForDay, event.date);
 
+    // Status & Date (ET)
     const statusClean = tidyStatus(event);
     const dateET = fmtETDate(event.date);
 
@@ -324,7 +343,6 @@ async function scrapeLiveOddsOnce(league, gameId) {
     const mlMatches = txt.match(/\s[+-]\d{2,4}\b/g) || [];
 
     const liveAwaySpread = spreadMatches[0] || "";
-    the
     const liveHomeSpread = spreadMatches[1] || "";
     const liveTotal = (totalOver && totalOver[1]) || (totalUnder && totalUnder[1]) || "";
     const liveAwayML = (mlMatches[0]||"").trim();
@@ -498,12 +516,14 @@ async function applyCenterFormatting(sheets) {
     const statusName = (ev.status?.type?.name || comp.status?.type?.name || "").toUpperCase();
     const scorePair = `${away?.score ?? ""}-${home?.score ?? ""}`;
 
+    // Final score
     if (statusName.includes("FINAL")) {
       if (hmap["final score"] !== undefined) batch.add(rowNum, hmap["final score"], scorePair);
       if (hmap["status"] !== undefined)      batch.add(rowNum, hmap["status"], "Final");
       continue;
     }
 
+    // Halftime (one-time) live odds
     const currentRow = (values[rowNum-1] || []);
     const halfAlready = (currentRow[hmap["half score"]] || "").toString().trim();
     const liveTotalVal = (currentRow[hmap["live total"]] || "").toString().trim();
