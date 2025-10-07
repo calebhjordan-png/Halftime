@@ -1,114 +1,69 @@
-// ml-debug.mjs
-// Usage locally: `node ml-debug.mjs`
-// Or set GAME_ID / LEAGUE via env (defaults below)
+function extractMoneylines(o, awayId, homeId, competitors = []) {
+  let awayML = "", homeML = "";
 
-const GAME_ID = process.env.GAME_ID || "401772940"; // Eagles @ Giants (Oct 9, 2025)
-const LEAGUE  = (process.env.LEAGUE || "nfl").toLowerCase();
+  const numOrBlank = v => {
+    if (v === 0) return "0";
+    if (v == null) return "";
+    const s = String(v).trim();
+    const n = parseFloat(s.replace(/[^\d.+-]/g, ""));
+    if (!Number.isFinite(n)) return "";
+    return s.startsWith("+") ? `+${n}` : `${n}`;
+  };
 
-const HEADERS = {
-  "User-Agent": "halftime-ml-debug",
-  "Accept": "application/json,text/plain;q=0.9,*/*;q=0.8",
-  "Referer": "https://www.espn.com/"
-};
+  // 0) PickCenter shape: awayTeamOdds/homeTeamOdds
+  //    e.g. { awayTeamOdds: { moneyLine: -380 }, homeTeamOdds: { moneyLine: +290 } }
+  if (o && (o.awayTeamOdds || o.homeTeamOdds)) {
+    const aObj = o.awayTeamOdds || {};
+    const hObj = o.homeTeamOdds || {};
+    awayML = awayML || numOrBlank(aObj.moneyLine ?? aObj.moneyline ?? aObj.money_line);
+    homeML = homeML || numOrBlank(hObj.moneyLine ?? hObj.moneyline ?? hObj.money_line);
+    if (awayML || homeML) return { awayML, homeML };
+  }
 
-function normLeague(league) {
-  return (league === "ncaaf" || league === "college-football") ? "college-football" : "nfl";
-}
-function summaryUrl(league, id) {
-  const lg = normLeague(league);
-  return `https://site.api.espn.com/apis/site/v2/sports/football/${lg}/summary?event=${id}`;
-}
-function contentUrl(league, id) {
-  const lg = normLeague(league);
-  return `https://site.api.espn.com/apis/site/v2/sports/football/${lg}/playbyplay?event=${id}`; // extra context; sometimes carries odds refs
-}
-function numOrBlank(v){
-  if (v===0) return "0";
-  if (v==null) return "";
-  const s=String(v).trim();
-  const n=parseFloat(s.replace(/[^\d.+-]/g,""));
-  if (!Number.isFinite(n)) return "";
-  return s.startsWith("+")?`+${n}`:`${n}`;
-}
-
-function extractMoneylines(oddsObj, awayId, homeId, competitors=[]) {
-  let awayML="", homeML="";
-
-  // teamOdds[]
-  if (Array.isArray(oddsObj?.teamOdds)) {
-    for (const t of oddsObj.teamOdds) {
+  // 1) teamOdds: [{ teamId, moneyLine }]
+  if (Array.isArray(o?.teamOdds)) {
+    for (const t of o.teamOdds) {
       const tid = String(t?.teamId ?? t?.team?.id ?? "");
       const ml  = numOrBlank(t?.moneyLine ?? t?.moneyline ?? t?.money_line);
       if (!ml) continue;
       if (tid === String(awayId)) awayML = awayML || ml;
       if (tid === String(homeId)) homeML = homeML || ml;
     }
+    if (awayML || homeML) return { awayML, homeML };
   }
 
-  // direct away/home
-  awayML = awayML || numOrBlank(oddsObj?.moneyLineAway ?? oddsObj?.awayMoneyLine ?? oddsObj?.awayMl);
-  homeML = homeML || numOrBlank(oddsObj?.moneyLineHome ?? oddsObj?.homeMoneyLine ?? oddsObj?.homeMl);
-
-  // favorite/underdog map
-  const favId = String(oddsObj?.favorite ?? oddsObj?.favoriteId ?? "");
-  const favML = numOrBlank(oddsObj?.favoriteMoneyLine);
-  const dogML = numOrBlank(oddsObj?.underdogMoneyLine);
-  if ((!awayML || !homeML) && favId && (favML || dogML)) {
-    if (String(awayId)===favId) { awayML = awayML||favML; homeML = homeML||dogML; }
-    else if (String(homeId)===favId) { homeML=homeML||favML; awayML=awayML||dogML; }
+  // 2) nested competitors odds
+  if (Array.isArray(o?.competitors)) {
+    const findML = c => numOrBlank(c?.moneyLine ?? c?.moneyline ?? c?.odds?.moneyLine ?? c?.odds?.moneyline);
+    const aML = findML(o.competitors.find(c => String(c?.id ?? c?.teamId) === String(awayId)));
+    const hML = findML(o.competitors.find(c => String(c?.id ?? c?.teamId) === String(homeId)));
+    awayML = awayML || aML; homeML = homeML || hML;
+    if (awayML || homeML) return { awayML, homeML };
   }
 
-  // competitors odds
-  if ((!awayML || !homeML) && Array.isArray(competitors)) {
+  // 3) direct fields
+  awayML = awayML || numOrBlank(o?.moneyLineAway ?? o?.awayTeamMoneyLine ?? o?.awayMoneyLine ?? o?.awayMl);
+  homeML = homeML || numOrBlank(o?.moneyLineHome ?? o?.homeTeamMoneyLine ?? o?.homeMoneyLine ?? o?.homeMl);
+  if (awayML || homeML) return { awayML, homeML };
+
+  // 4) favorite/underdog mapping
+  const favId = String(o?.favorite ?? o?.favoriteId ?? o?.favoriteTeamId ?? "");
+  const favML = numOrBlank(o?.favoriteMoneyLine);
+  const dogML = numOrBlank(o?.underdogMoneyLine);
+  if (favId && (favML || dogML)) {
+    if (String(awayId) === favId) { awayML = awayML || favML; homeML = homeML || dogML; return { awayML, homeML }; }
+    if (String(homeId) === favId) { homeML = homeML || favML; awayML = awayML || dogML; return { awayML, homeML }; }
+  }
+
+  // 5) competitors[] { odds: { moneyLine } } variant
+  if (Array.isArray(competitors)) {
     for (const c of competitors) {
       const ml = numOrBlank(c?.odds?.moneyLine ?? c?.odds?.moneyline ?? c?.odds?.money_line);
       if (!ml) continue;
-      if (c.homeAway==="away") awayML = awayML || ml;
-      if (c.homeAway==="home") homeML = homeML || ml;
+      if (c.homeAway === "away") awayML = awayML || ml;
+      if (c.homeAway === "home") homeML = homeML || ml;
     }
   }
 
   return { awayML, homeML };
 }
-
-async function fetchJson(url){
-  const res = await fetch(url, { headers: HEADERS });
-  if (!res.ok) throw new Error(`${res.status} ${url}`);
-  return res.json();
-}
-
-(async () => {
-  const sum = await fetchJson(summaryUrl(LEAGUE, GAME_ID));
-
-  const comp = sum?.header?.competitions?.[0];
-  if (!comp) throw new Error("No competition found in summary");
-
-  const competitors = comp?.competitors || [];
-  const away = competitors.find(c=>c.homeAway==="away");
-  const home = competitors.find(c=>c.homeAway==="home");
-
-  console.log("Matchup:", away?.team?.displayName, "at", home?.team?.displayName);
-  console.log("Provider candidates & raw odds shapes found:");
-
-  const buckets = [];
-  if (Array.isArray(comp?.odds)) buckets.push(["header.competitions[0].odds", comp.odds]);
-  if (Array.isArray(sum?.odds)) buckets.push(["summary.odds", sum.odds]);
-  if (Array.isArray(sum?.pickcenter)) buckets.push(["summary.pickcenter", sum.pickcenter]);
-
-  let resolved = { awayML:"", homeML:"" };
-  for (const [label, arr] of buckets) {
-    for (const o of arr) {
-      const provider = o?.provider?.displayName || o?.provider?.name || "(unknown)";
-      const ml = extractMoneylines(o, away?.team?.id, home?.team?.id, competitors);
-      console.log(`  - ${label} | provider=${provider} | keys=${Object.keys(o||{}).slice(0,12).join(", ")}`);
-      if (ml.awayML || ml.homeML) resolved = ml; // prefer first filled
-    }
-  }
-
-  console.log("\nResolved ML:");
-  console.log(`  Away (${away?.team?.abbreviation}):`, resolved.awayML || "(none)");
-  console.log(`  Home (${home?.team?.abbreviation}):`, resolved.homeML || "(none)");
-})().catch(e => {
-  console.error("ML debug failed:", e);
-  process.exit(1);
-});
