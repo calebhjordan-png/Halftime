@@ -46,7 +46,6 @@ function normLeague(league) {
 }
 function scoreboardUrl(league, { dates, week }) {
   const lg = normLeague(league);
-  // Include FBS group for college to avoid Top-25-only view
   const extra = lg === "college-football" ? "&groups=80&limit=300" : "";
   if (week != null && Number.isFinite(week)) {
     return `https://site.api.espn.com/apis/site/v2/sports/football/${lg}/scoreboard?week=${week}${extra}`;
@@ -86,26 +85,24 @@ function numOrBlank(v) {
 }
 
 /** ====== Week math (ET) ====== */
-/** We’ll treat the “league week” as Tue 00:00 ET → Mon 23:59 ET to align with ESPN tabs */
 function startOfLeagueWeekET(d=new Date()) {
   const et = new Date(d.toLocaleString("en-US", { timeZone: "America/New_York" }));
   const dow = et.getDay(); // 0=Sun ... 6=Sat
-  // Find most recent Tuesday (2)
-  const offsetToTue = ((dow - 2) + 7) % 7; // days since Tuesday
+  const offsetToTue = ((dow - 2) + 7) % 7;
   const start = new Date(et);
   start.setDate(et.getDate() - offsetToTue);
   start.setHours(0,0,0,0);
   return start;
 }
 function datesForWeekET(ref=new Date()) {
-  const start = startOfLeagueWeekET(ref); // Tue
+  const start = startOfLeagueWeekET(ref);
   const out = [];
   for (let i=0;i<7;i++){
     const d = new Date(start);
     d.setDate(start.getDate()+i);
     out.push(yyyymmddInET(d));
   }
-  return out; // Tue..Mon (ET)
+  return out;
 }
 function uniqueById(events) {
   const seen = new Set();
@@ -129,7 +126,6 @@ function extractMoneylines(o, awayId, homeId, competitors = []) {
     if (String(tid) === String(homeId)) homeML = homeML || ml;
   };
 
-  // 1) teamOdds[] variants
   if (Array.isArray(o?.teamOdds)) {
     for (const t of o.teamOdds) {
       const tid = String(t?.teamId ?? t?.team?.id ?? "");
@@ -137,12 +133,9 @@ function extractMoneylines(o, awayId, homeId, competitors = []) {
       byId(tid, ml);
     }
   }
-
-  // 2) direct fields on odds object
   awayML = awayML || numOrBlank(o?.moneyLineAway ?? o?.awayTeamMoneyLine ?? o?.awayMoneyLine ?? o?.awayMl);
   homeML = homeML || numOrBlank(o?.moneyLineHome ?? o?.homeTeamMoneyLine ?? o?.homeMoneyLine ?? o?.homeMl);
 
-  // 3) favorite/underdog paired fields
   if (!awayML || !homeML) {
     const favId = String(o?.favorite ?? o?.favoriteId ?? o?.favoriteTeamId ?? "");
     const favML = numOrBlank(o?.favoriteMoneyLine);
@@ -157,8 +150,6 @@ function extractMoneylines(o, awayId, homeId, competitors = []) {
       }
     }
   }
-
-  // 4) rare competitor-level odds
   if ((!awayML || !homeML) && Array.isArray(competitors)) {
     for (const c of competitors) {
       const cand = numOrBlank(c?.odds?.moneyLine ?? c?.odds?.moneyline ?? c?.odds?.money_line);
@@ -193,7 +184,6 @@ function pregameRow(event, weekText) {
 
   if (o) {
     total = (o.overUnder ?? o.total) ?? "";
-
     const favId = String(o.favorite || "");
     const spread = Number.isFinite(o.spread) ? o.spread :
                    (typeof o.spread === "string" ? parseFloat(o.spread) : NaN);
@@ -213,7 +203,6 @@ function pregameRow(event, weekText) {
         homeSpread = line > 0 ? `-${Math.abs(line)}` : `+${Math.abs(line)}`;
       }
     }
-
     const ids = { awayId: away?.team?.id, homeId: home?.team?.id };
     const ml = extractMoneylines(o, ids.awayId, ids.homeId, competitors);
     awayML = ml.awayML || "";
@@ -226,7 +215,7 @@ function pregameRow(event, weekText) {
     values: [
       dateET,                 // Date
       weekText || "",         // Week
-      shortStatus || status,  // Status
+      shortStatus || status,  // Status (this shows scheduled kickoff time pregame)
       matchup,                // Matchup
       finalScore,             // Final Score
       awaySpread || "",       // Away Spread
@@ -248,12 +237,12 @@ function isHalftimeLike(evtOrSnap) {
   return t.includes("HALFTIME") || /HALF\s*TIME/i.test(short);
 }
 
-/** Return a compact snapshot of status + scores from summary endpoint */
+/** Summary for status + scores */
 async function getEventSnapshot(league, eventId) {
   try {
     const sum = await fetchJson(summaryUrl(league, eventId));
     const comp = sum?.header?.competitions?.[0] || {};
-    const status = comp?.status || sum?.header?.competitions?.[0]?.status || {};
+    const status = comp?.status || {};
     const competitors = comp?.competitors || [];
     const away = competitors.find(c => c.homeAway === "away");
     const home = competitors.find(c => c.homeAway === "home");
@@ -268,7 +257,11 @@ async function getEventSnapshot(league, eventId) {
   }
 }
 
-/** Resilient Playwright DOM scrape for LIVE odds (one-time, at halftime only) */
+/** ====== Halftime odds scraping ======
+ * Strategy:
+ *  - Prefer semantic table parse (headers: Spread / ML / Total).
+ *  - Fallback to text regex if headers absent.
+ */
 async function scrapeLiveOddsOnce(league, gameId) {
   const url = gameUrl(league, gameId);
   const browser = await playwright.chromium.launch({ headless: true });
@@ -278,13 +271,36 @@ async function scrapeLiveOddsOnce(league, gameId) {
     await page.waitForLoadState("networkidle", { timeout: 6000 }).catch(() => {});
     await page.waitForTimeout(750);
 
+    // Find a table with ML/Total headers
+    const table = page.locator('table:has-text("ML"):has-text("Total")').first();
+    if (await table.count()) {
+      const txt = (await table.innerText()).replace(/\u00a0/g," ").replace(/\s+/g," ").trim();
+
+      // Try to map rows: Away row first, then Home row
+      // Pull Spread, ML, Total by header tokens near row values
+      const rowMatches = txt.split(/\n| {2,}/g).filter(Boolean);
+      // Heuristic parse:
+      const ml = [...txt.matchAll(/\bML\s*([+-]?\d{2,4})\b/gi)].map(m => m[1]);
+      const totals = [...txt.matchAll(/\bTotal\s*([0-9]+(?:\.[0-9])?)\b/gi)].map(m => m[1]);
+      const spreads = [...txt.matchAll(/(^|\s)([+-]\d+(?:\.\d+)?)(?!\s*(?:o|u)\b)/gi)].map(m => m[2]).map(Number).filter(n => Math.abs(n)<=40);
+
+      return {
+        liveAwaySpread: spreads[0] != null ? (spreads[0] > 0 ? `+${spreads[0]}` : `${spreads[0]}`) : "",
+        liveHomeSpread:  spreads[1] != null ? (spreads[1] > 0 ? `+${spreads[1]}` : `${spreads[1]}`) : "",
+        liveAwayML: ml[0] || "",
+        liveHomeML: ml[1] || "",
+        liveTotal: totals[0] || ""
+      };
+    }
+
+    // Fallback: anchor by footer/labels and regex
     const primaryFooter = page.getByText(/All Live Odds on ESPN BET Sportsbook/i).first();
     const altFooter = page.getByText(/^Odds by$/i).first();
 
     const container = await nearestOddsContainer(primaryFooter) || await nearestOddsContainer(altFooter);
     if (!container) {
       console.warn("LIVE ODDS container not found:", url);
-      return null;
+      return { liveAwaySpread:"", liveHomeSpread:"", liveAwayML:"", liveHomeML:"", liveTotal:"" };
     }
 
     const raw = (await container.innerText()).replace(/\u00a0/g," ").replace(/\s+/g," ").trim();
@@ -309,14 +325,11 @@ async function scrapeLiveOddsOnce(league, gameId) {
       liveHomeML = liveHomeML || bare[1] || "";
     }
 
-    const parsedAny = !!(liveTotal || liveAwaySpread || liveHomeSpread || liveAwayML || liveHomeML);
-    if (!parsedAny) return null;
-
-    return { liveAwaySpread, liveHomeSpread, liveTotal, liveAwayML, liveHomeML };
+    return { liveAwaySpread, liveHomeSpread, liveAwayML, liveHomeML, liveTotal };
 
   } catch (err) {
     console.warn("Live DOM scrape failed:", err.message, url);
-    return null;
+    return { liveAwaySpread:"", liveHomeSpread:"", liveAwayML:"", liveHomeML:"", liveTotal:"" };
   } finally {
     await page.close().catch(()=>{});
     await browser.close().catch(()=>{});
@@ -345,8 +358,8 @@ async function scrapeLiveOddsOnce(league, gameId) {
 
 async function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
+/** Allow writing any value, including "-" placeholders */
 async function updateRow(sheets, rowNumber, colIndex, value) {
-  if (value === "" || value == null) return; // don't overwrite with blank
   const colLetter = String.fromCharCode("A".charCodeAt(0) + colIndex);
   const range = `${TAB_NAME}!${colLetter}${rowNumber}:${colLetter}${rowNumber}`;
   await sheets.spreadsheets.values.update({
@@ -477,7 +490,7 @@ async function updateRow(sheets, rowNumber, colIndex, value) {
     const rowNum = keyToRowNum.get(k);
     if (!rowNum) continue;
 
-    // Final score updates (unchanged)
+    // Update Final when done
     const statusName = (ev.status?.type?.name || comp.status?.type?.name || "").toUpperCase();
     const scorePairFinal = `${away?.score ?? ""}-${home?.score ?? ""}`;
     if (statusName.includes("FINAL")) {
@@ -491,7 +504,7 @@ async function updateRow(sheets, rowNumber, colIndex, value) {
       continue;
     }
 
-    // Guard: only write once, using either "Live Total" or "Half Score"
+    // One-time guard
     const snapshotRow = (await sheets.spreadsheets.values.get({
       spreadsheetId: SHEET_ID,
       range: `${TAB_NAME}!A${rowNum}:Z${rowNum}`,
@@ -500,28 +513,22 @@ async function updateRow(sheets, rowNumber, colIndex, value) {
     const liveTotalAlready = (snapshotRow[hmap["live total"]] || "").toString().trim();
     if (halfAlready || liveTotalAlready) continue;
 
-    // If it's halftime *right now* per scoreboard, do it
+    // If it's halftime right now per scoreboard, do it
     if (isHalftimeLike(ev)) {
-      await writeHalftime(sheets, rowNum, ev.id, hmap);
-      console.log(`🕐 Halftime LIVE written for ${matchup}`);
+      await writeHalftime(sheets, rowNum, ev.id, hmap, matchup);
       continue;
     }
 
-    // Otherwise enter the Halftime Watch Window based on scheduled start
-    // ESPN event.date is scheduled kickoff; we treat 55–95 mins post-kickoff as watch window.
+    // Watch Window (55–95 mins post scheduled kickoff)
     const kickET = new Date(new Date(ev.date).toLocaleString("en-US", { timeZone: "America/New_York" }));
     const minsSinceKick = (nowET - kickET) / 60000;
-
     if (minsSinceKick >= 55 && minsSinceKick <= 95) {
-      // Poll summary a few times (up to ~10 minutes total) for HALFTIME flip
-      const attempts = 7;       // 7 * ~90s ≈ 10–11 minutes
-      const waitMs = 90 * 1000; // 90 seconds
+      const attempts = 7;          // ~10–11 minutes
+      const waitMs = 90 * 1000;
       for (let i=0; i<attempts; i++) {
         const snap = await getEventSnapshot(LEAGUE, ev.id);
         if (snap && isHalftimeLike(snap)) {
-          // write half score + odds once
-          await writeHalftime(sheets, rowNum, ev.id, hmap, snap?.scores?.half);
-          console.log(`🕐 Halftime LIVE written (watch window) for ${matchup}`);
+          await writeHalftime(sheets, rowNum, ev.id, hmap, matchup, snap?.scores?.half);
           break;
         }
         await sleep(waitMs);
@@ -535,25 +542,49 @@ async function updateRow(sheets, rowNumber, colIndex, value) {
   process.exit(1);
 });
 
-/** ===== Helpers for halftime write ===== */
-async function writeHalftime(sheets, rowNum, eventId, hmap, halfScoreFromSnap = "") {
-  // Half score string "Away-Home"
+/** ===== Halftime write (always sets Status to 'Half') ===== */
+async function writeHalftime(sheets, rowNum, eventId, hmap, matchup = "", halfScoreFromSnap = "") {
+  // Set Status to 'Half'
+  if (hmap["status"] !== undefined) {
+    await updateRow(sheets, rowNum, hmap["status"], "Half");
+  }
+
+  // Half score from summary
   let halfScore = halfScoreFromSnap;
   if (!halfScore) {
     const snap = await getEventSnapshot(LEAGUE, eventId);
     if (snap) halfScore = snap?.scores?.half || "";
   }
-
-  const live = await scrapeLiveOddsOnce(LEAGUE, eventId);
   if (hmap["half score"] !== undefined && halfScore) {
     await updateRow(sheets, rowNum, hmap["half score"], halfScore);
   }
-  if (live) {
-    const { liveAwaySpread, liveHomeSpread, liveTotal, liveAwayML, liveHomeML } = live;
-    if (hmap["live away spread"] !== undefined) await updateRow(sheets, rowNum, hmap["live away spread"],  liveAwaySpread);
-    if (hmap["live home spread"] !== undefined) await updateRow(sheets, rowNum, hmap["live home spread"],  liveHomeSpread);
-    if (hmap["live away ml"]     !== undefined) await updateRow(sheets, rowNum, hmap["live away ml"],      liveAwayML);
-    if (hmap["live home ml"]     !== undefined) await updateRow(sheets, rowNum, hmap["live home ml"],      liveHomeML);
-    if (hmap["live total"]       !== undefined) await updateRow(sheets, rowNum, hmap["live total"],        liveTotal);
+
+  // Odds: retry a few times to avoid DOM timing gaps
+  let live = null;
+  for (let i=0; i<4; i++) {             // up to ~30s total
+    live = await scrapeLiveOddsOnce(LEAGUE, eventId);
+    const gotAny = !!(live.liveTotal || live.liveAwaySpread || live.liveHomeSpread || live.liveAwayML || live.liveHomeML);
+    if (gotAny) break;
+    await sleep(7500);
   }
+
+  // If still nothing, write placeholders so the row is clearly 'done'
+  if (!live) {
+    live = { liveAwaySpread:"", liveHomeSpread:"", liveAwayML:"", liveHomeML:"", liveTotal:"" };
+  }
+  const { liveAwaySpread, liveHomeSpread, liveTotal, liveAwayML, liveHomeML } = live;
+
+  const awaySpreadVal = liveAwaySpread || "-";
+  const homeSpreadVal = liveHomeSpread || "-";
+  const awayMLVal     = liveAwayML     || "-";
+  const homeMLVal     = liveHomeML     || "-";
+  const totalVal      = liveTotal      || "-";
+
+  if (hmap["live away spread"] !== undefined) await updateRow(sheets, rowNum, hmap["live away spread"],  awaySpreadVal);
+  if (hmap["live home spread"] !== undefined) await updateRow(sheets, rowNum, hmap["live home spread"],  homeSpreadVal);
+  if (hmap["live away ml"]     !== undefined) await updateRow(sheets, rowNum, hmap["live away ml"],      awayMLVal);
+  if (hmap["live home ml"]     !== undefined) await updateRow(sheets, rowNum, hmap["live home ml"],      homeMLVal);
+  if (hmap["live total"]       !== undefined) await updateRow(sheets, rowNum, hmap["live total"],        totalVal);
+
+  console.log(`🕐 Halftime LIVE written for ${matchup || eventId}`);
 }
