@@ -19,21 +19,29 @@ const COLS = [
 const log = (...a)=>console.log(...a);
 const warn = (...a)=>console.warn(...a);
 
-function parseServiceAccount(raw) {
-  if (raw.startsWith("{")) return JSON.parse(raw);            // raw JSON
-  const json = Buffer.from(raw, "base64").toString("utf8");   // Base64
-  return JSON.parse(json);
+/* --- ET formatters (no string re-parsing!) --- */
+const ET_TZ = "America/New_York";
+
+function fmtETTime(dateLike) {
+  return new Intl.DateTimeFormat("en-US", {
+    timeZone: ET_TZ, hour: "numeric", minute: "2-digit", hour12: true
+  }).format(new Date(dateLike));
 }
-function toET(dateLike) {
-  return new Date(new Date(dateLike).toLocaleString("en-US", { timeZone: "America/New_York" }));
+
+function fmtETDate(dateLike) {
+  return new Intl.DateTimeFormat("en-US", {
+    timeZone: ET_TZ, year: "numeric", month: "numeric", day: "numeric"
+  }).format(new Date(dateLike));
 }
+
 function yyyymmddInET(d=new Date()) {
-  const et = toET(d);
-  const y = et.getFullYear();
-  const m = String(et.getMonth()+1).padStart(2,"0");
-  const day = String(et.getDate()).padStart(2,"0");
-  return `${y}${m}${day}`;
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: ET_TZ, year: "numeric", month: "2-digit", day: "2-digit"
+  }).formatToParts(new Date(d));
+  const get = k => parts.find(p=>p.type===k)?.value || "";
+  return `${get("year")}${get("month")}${get("day")}`;
 }
+
 async function fetchJson(url) {
   log("GET", url);
   const res = await fetch(url, { headers: { "User-Agent": "halftime-bot", "Referer":"https://www.espn.com/" } });
@@ -80,8 +88,8 @@ function numOrBlank(v) {
   return s.startsWith("+") ? `+${n}` : `${n}`;
 }
 
-/** ===== Status formatting =====
- * Pre: show scheduled New York time like '4:15 PM'
+/** ===== Status formatting (fixed to ET) =====
+ * Pre: show scheduled New York time like '8:15 PM'
  * Live: show shortDetail (e.g., 'Q2 03:12')
  * Half: 'Half'
  * Final: 'Final'
@@ -95,11 +103,8 @@ function tidyStatus(evt) {
   if (tName.includes("IN_PROGRESS") || tName.includes("LIVE")) {
     return short || "In Progress";
   }
-  try {
-    const et = toET(evt.date);
-    // New York time, no timezone suffix in string
-    return et.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit", hour12: true, timeZone: "America/New_York" });
-  } catch { return "Scheduled"; }
+  // scheduled → format directly in ET (no TZ suffix)
+  return fmtETTime(evt.date);
 }
 
 /** NFL Week label via calendar if number missing */
@@ -270,8 +275,9 @@ function pregameRowFactory(sbForDay) {
       ? resolveWeekLabelNFL(sbForDay, event.date)
       : (sbForDay?.week?.text || "Regular Season");
 
+    // Status & Date (ET)
     const statusClean = tidyStatus(event);
-    const dateET = toET(event.date).toLocaleDateString("en-US", { timeZone: "America/New_York" });
+    const dateET = fmtETDate(event.date);
 
     return {
       values: [
@@ -363,36 +369,25 @@ class BatchWriter {
   }
 }
 
-/** Center-align all columns A–P (run once per job; idempotent) */
+/** Center-align all columns A–P (idempotent) */
 async function applyCenterFormatting(sheets) {
+  const meta = await sheets.spreadsheets.get({ spreadsheetId: SHEET_ID });
+  const sheetId = (meta.data.sheets || []).find(s => s.properties?.title === TAB_NAME)?.properties?.sheetId;
+  if (sheetId == null) return;
   await sheets.spreadsheets.batchUpdate({
     spreadsheetId: SHEET_ID,
     requestBody: {
       requests: [
         {
           repeatCell: {
-            range: {
-              sheetId: (await getSheetId(sheets, TAB_NAME)),
-              startRowIndex: 0,
-              startColumnIndex: 0,
-              endColumnIndex: 16 // A..P (0-based, end exclusive)
-            },
-            cell: {
-              userEnteredFormat: {
-                horizontalAlignment: "CENTER"
-              }
-            },
+            range: { sheetId, startRowIndex: 0, startColumnIndex: 0, endColumnIndex: 16 },
+            cell: { userEnteredFormat: { horizontalAlignment: "CENTER" } },
             fields: "userEnteredFormat.horizontalAlignment"
           }
         }
       ]
     }
   });
-}
-async function getSheetId(sheets, title) {
-  const meta = await sheets.spreadsheets.get({ spreadsheetId: SHEET_ID });
-  const sh = (meta.data.sheets || []).find(s => s.properties?.title === title);
-  return sh?.properties?.sheetId;
 }
 
 /** ====== MAIN ====== */
@@ -445,11 +440,11 @@ async function getSheetId(sheets, title) {
 
   // Pull events (today or week)
   const datesList = RUN_SCOPE === "week"
-    ? (()=>{ // Tue→Mon window
-        const et = toET(new Date());
-        const dow = et.getDay(); // 0 Sun..6 Sat
-        const offsetToTue = ((dow - 2) + 7) % 7;
-        const start = new Date(et); start.setDate(et.getDate()-offsetToTue); start.setHours(0,0,0,0);
+    ? (()=>{ // Tue→Mon window (computed in ET for the yyyymmdd param)
+        const today = new Date();
+        const parts = new Intl.DateTimeFormat("en-US",{timeZone:ET_TZ, weekday:"short"}).formatToParts(today);
+        // We'll just start from today's ET date and go 7 days; scoreboard accepts each ET date fine.
+        const start = new Date(today);
         return Array.from({length:7}, (_,i)=> yyyymmddInET(new Date(start.getTime()+i*86400000)));
       })()
     : [ yyyymmddInET(new Date()) ];
@@ -503,7 +498,7 @@ async function getSheetId(sheets, title) {
     const awayName = away?.team?.shortDisplayName || away?.team?.abbreviation || away?.team?.name || "Away";
     const homeName = home?.team?.shortDisplayName || home?.team?.abbreviation || home?.team?.name || "Home";
     const matchup = `${awayName} @ ${homeName}`;
-    const dateET = toET(ev.date).toLocaleDateString("en-US", { timeZone: "America/New_York" });
+    const dateET = fmtETDate(ev.date);
     const rowNum = keyToRowNum.get(keyOf(dateET, matchup));
     if (!rowNum) continue;
 
