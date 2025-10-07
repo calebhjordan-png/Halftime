@@ -1,13 +1,15 @@
-name: CFB Games (Sat - Halftime)
+name: NFL Halftime
 
 on:
   schedule:
-    # Saturday early games (10 AM–6 PM ET)
-    - cron: "*/20 14-22 * * 6"
-    # Saturday night games (10 PM–11 PM ET)
-    - cron: "*/20 22-23 * * 6"
-    # Spillover after midnight into Sunday (12 AM–2 AM ET)
-    - cron: "*/20 0-2 * * 0"
+    # Sunday day games (12–7 PM ET)
+    - cron: "*/15 16-23 * * 0"
+    # Sunday night wrap (7 – 11 PM ET)
+    - cron: "*/15 0-3 * * 1"
+    # Monday night (7 PM – 12 AM ET)
+    - cron: "*/20 0-5 * * 2"
+    # Thursday night (7 PM – 11 PM ET)
+    - cron: "*/20 0-4 * * 5"
   workflow_dispatch:
 
 jobs:
@@ -17,8 +19,8 @@ jobs:
     env:
       GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
       GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
-      LEAGUE: college-football
-      TAB_NAME: CFB
+      LEAGUE: nfl
+      TAB_NAME: NFL
       RUN_SCOPE: today
     steps:
       - uses: actions/checkout@v4
