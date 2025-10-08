@@ -6,9 +6,9 @@ on:
     # Thu/Fri night CFB windows
     - cron: "*/20 22-23 * * 4,5"   # 6–7:59 PM ET (22–23 UTC)
     - cron: "*/20 0-5 * * 5,6"     # 8 PM–1:59 AM ET
-    # Saturday all-day
-    - cron: "*/20 14-23 * * 6"     # 10 AM–7:59 PM ET
-    - cron: "*/20 0-4 * * 0"       # late Sat into Sun 8 PM–12:59 AM ET
+    # Saturday all-day + late spillover
+    - cron: "*/20 14-23 * * 6"     # Sat 10 AM–7:59 PM ET
+    - cron: "*/20 0-4 * * 0"       # Sat late into Sun 8 PM–12:59 AM ET
 
 jobs:
   run:
@@ -28,12 +28,12 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 22
-          cache: npm
+          cache: "npm"
 
-      - name: Install npm deps (includes playwright)
+      - name: Install npm deps
         run: npm ci || npm install
 
-      - name: Install Playwright browser (Chromium)
+      - name: Install Playwright (Chromium)
         run: npx playwright install --with-deps chromium
 
       - name: Run halftime checker
