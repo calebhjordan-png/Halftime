@@ -1,24 +1,26 @@
-name: NFL Games (Tues)
+name: NFL Games (Prefill)
 
 on:
-  schedule:
-    - cron: "0 13 * * 2"   # Tuesday 09:00 ET (13:00 UTC)
   workflow_dispatch:
+  schedule:
+    - cron: "0 15 * * 2"  # Tuesdays 11:00 AM ET (15:00 UTC)
 
 jobs:
   prefill:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
     env:
       GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
       GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
       LEAGUE: nfl
       TAB_NAME: NFL
       RUN_SCOPE: week
+      ADAPTIVE_HALFTIME: "0"     # <— disable adaptive sleep
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
-        with: { node-version: 22 }
+        with:
+          node-version: 22
+          cache: npm
       - run: npm install
-      - run: npx playwright install --with-deps chromium
+      # No Playwright here
       - run: node orchestrator.mjs
