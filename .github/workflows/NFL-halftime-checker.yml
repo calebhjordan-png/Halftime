@@ -3,12 +3,17 @@ name: NFL Halftime Checker
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/15 16-23 * * 0,1,4"  # Sun/Mon/Thu 12–7:59 PM ET (16–23 UTC)
-    - cron: "*/15 0-3 * * 1,2,5"    # late windows spill into next UTC day
+    - cron: "*/15 16-23 * * 0,1,4"  # Sun/Mon/Thu prime windows
+    - cron: "*/15 0-3 * * 1,2,5"    # late spillover into next day
+
+concurrency:
+  group: nfl-halftime-checker
+  cancel-in-progress: true
 
 jobs:
   run:
     runs-on: ubuntu-latest
+    timeout-minutes: 6
     env:
       GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
       GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
@@ -20,17 +25,14 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Setup Node
+      - name: Setup Node (with cache)
         uses: actions/setup-node@v4
         with:
           node-version: 22
-          cache: "npm"
+          cache: npm
 
-      - name: Install npm deps
-        run: npm ci || npm install
-
-      - name: Install Playwright (Chromium)
-        run: npx playwright install --with-deps chromium
+      - name: Install deps
+        run: npm ci --omit=dev
 
       - name: Run halftime checker
         run: node halftime-checker.mjs
