@@ -14,15 +14,11 @@ jobs:
       LEAGUE: nfl
       TAB_NAME: NFL
       RUN_SCOPE: today
-      ADAPTIVE_HALFTIME: "1"
-      HALFTIME_EARLY_MIN: "60"
-      HALFTIME_LATE_MIN: "92"
+      MAX_RUNTIME_MIN: "120"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: npm
+        with: { node-version: 22, cache: "npm" }
       - run: npm install
       - run: npx playwright install --with-deps chromium
-      - run: node orchestrator.mjs
+      - run: node halftime-checker.mjs
