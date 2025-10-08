@@ -1,31 +1,28 @@
 name: NFL Halftime
 
 on:
-  schedule:
-    # Sunday day games (12–7 PM ET)
-    - cron: "*/15 16-23 * * 0"
-    # Sunday night wrap (7 – 11 PM ET)
-    - cron: "*/15 0-3 * * 1"
-    # Monday night (7 PM – 12 AM ET)
-    - cron: "*/20 0-5 * * 2"
-    # Thursday night (7 PM – 11 PM ET)
-    - cron: "*/20 0-4 * * 5"
   workflow_dispatch:
+  schedule:
+    - cron: "*/15 16-23 * * 0,1,4"  # Sun/Mon/Thu, every 15 min, 12:00–19:59 ET (16–23 UTC)
 
 jobs:
-  run-bot:
+  halftime:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
     env:
       GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
       GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
       LEAGUE: nfl
       TAB_NAME: NFL
       RUN_SCOPE: today
+      ADAPTIVE_HALFTIME: "1"
+      HALFTIME_EARLY_MIN: "60"
+      HALFTIME_LATE_MIN: "92"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
-        with: { node-version: 22 }
+        with:
+          node-version: 22
+          cache: npm
       - run: npm install
       - run: npx playwright install --with-deps chromium
       - run: node orchestrator.mjs
