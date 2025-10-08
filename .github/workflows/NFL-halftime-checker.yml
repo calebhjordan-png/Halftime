@@ -1,14 +1,19 @@
 name: NFL Halftime Checker
 
 on:
-  schedule:
-    # Runs every day at 10 AM ET to wake up and check games
-    - cron: "0 14 * * *"   # 10:00 AM ET (14 UTC)
   workflow_dispatch:
+  schedule:
+    - cron: "0 12 * * *" # Runs every day at 8 AM ET
 
 jobs:
   run:
     runs-on: ubuntu-latest
+
+    env:
+      GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+      GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
+      SHEET_ID: ${{ secrets.SHEET_ID }}
+      GCP_SA_JSON: ${{ secrets.GCP_SA_JSON }}
 
     steps:
       - name: Checkout repo
@@ -23,22 +28,13 @@ jobs:
         run: npm ci
 
       - name: Run halftime checker
-        id: halftime
         run: |
           echo "Running halftime-checker.mjs..."
-          node halftime-checker.mjs > output.log
-          cat output.log
-
-          # Detect halftime flag (you can modify this logic as needed)
-          if grep -q "adaptive candidates" output.log; then
-            echo "halftime_found=true" >> $GITHUB_OUTPUT
-          else
-            echo "halftime_found=false" >> $GITHUB_OUTPUT
-          fi
+          node halftime-checker.mjs
 
       - name: Trigger EPA writer
-        if: steps.halftime.outputs.halftime_found == 'true'
-        uses: ./.github/workflows/NFL_epa.yml
+        if: success()
+        uses: ./.github/workflows/NFL-epa.yml
         with:
           league: "nfl"
           seasons: "2025"
