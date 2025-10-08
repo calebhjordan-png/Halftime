@@ -1,35 +1,40 @@
 name: NFL Halftime Checker
 
 on:
+  # Manual run button
   workflow_dispatch:
+
+  # Daily morning wakeup (09:00 ET / 13:00 UTC).
+  # Add more wake times if you want extra safety (e.g., 15:00 UTC).
   schedule:
-    # --- Morning pre-check every day (9–10 AM ET). Use both 13:00/14:00 UTC to straddle DST ---
     - cron: "0 13 * * *"
-    - cron: "0 14 * * *"
-
-    # --- Daily evening/night windows (covers TNF/MNF/SNF & any odd nights) ---
-    - cron: "*/20 22-23 * * *"   # 6–7:59 PM ET
-    - cron: "*/20 0-6 * * *"     # 8 PM–2:59 AM ET
-
-    # --- Sunday daytime + SNF spill into early Monday ---
-    - cron: "*/20 14-23 * * 0"   # Sun 10 AM–7:59 PM ET
-    - cron: "*/20 0-4 * * 1"     # SNF late spill -> Mon 12:59 AM ET
 
 jobs:
   run:
     runs-on: ubuntu-latest
+
+    # 👇 we’ll surface whether halftime was found for a follow-up job
+    outputs:
+      halftime_found: ${{ steps.detect.outputs.halftime_found }}
+
     env:
+      # === your existing secrets / env ===
       GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
       GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
       LEAGUE: nfl
       TAB_NAME: NFL
+
+      # === halftime checker behavior ===
+      # Use "today" so the script only looks at the current ET day.
       RUN_SCOPE: today
+      # Let a single run do at most ~90 minutes of adaptive waiting.
       MAX_RUNTIME_MIN: "90"
 
     steps:
-      - name: Checkout
+      - name: Checkout repo
         uses: actions/checkout@v4
 
+      # If you committed package-lock.json (you did), this is fast & deterministic
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
@@ -39,5 +44,39 @@ jobs:
       - name: Install deps (from lockfile)
         run: npm ci
 
-      - name: Run halftime checker
-        run: node halftime-checker.mjs
+      - name: Install Playwright (Chromium)
+        run: npx playwright install --with-deps chromium
+
+      # --- Run your adaptive halftime checker for TODAY ---
+      # We tee the output and infer a "halftime candidate found" signal.
+      - id: detect
+        name: Run halftime checker
+        shell: bash
+        run: |
+          set -e
+          echo "Starting NFL halftime checker (scope=$RUN_SCOPE, cap=${MAX_RUNTIME_MIN}m)…"
+          node halftime-checker.mjs 2>&1 | tee checker.log
+
+          # Heuristic: your checker prints this line when there were NO candidates.
+          if grep -q "No adaptive candidates — end of this run." checker.log; then
+            echo "halftime_found=false" >> "$GITHUB_OUTPUT"
+            echo "No halftime candidates found in this run."
+          else
+            echo "halftime_found=true" >> "$GITHUB_OUTPUT"
+            echo "Halftime candidate(s) found — EPA writer will be triggered."
+          fi
+
+  # If the checker saw a halftime candidate, call the reusable EPA workflow
+  run_epa:
+    needs: run
+    if: needs.run.outputs.halftime_found == 'true'
+    uses: ./.github/workflows/NFL_epa.yml
+    with:
+      script_path: "NFL_EPA.py"     # adjust if your file path differs
+      python_version: "3.11"
+      league: "nfl"
+      seasons: "2025"               # or "2024,2025" etc., according to your script
+    secrets:
+      SHEET_ID: ${{ secrets.SHEET_ID }}
+      GCP_SA_JSON: ${{ secrets.GCP_SA_JSON }}
+      # add any other secrets your Python needs here (e.g. API_KEY, etc.)
