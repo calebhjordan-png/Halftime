@@ -3,7 +3,7 @@ name: CFB Halftime
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/10 14-23 * * 6"  # Saturdays, every 10 min, 10:00–20:59 ET (14–23 UTC)
+    - cron: "*/10 14-23 * * 6"   # Saturdays, every 10 min, 10:00–19:59 ET (14–23 UTC)
 
 jobs:
   halftime:
@@ -14,15 +14,11 @@ jobs:
       LEAGUE: college-football
       TAB_NAME: CFB
       RUN_SCOPE: today
-      ADAPTIVE_HALFTIME: "1"     # <— enable adaptive sleep
-      HALFTIME_EARLY_MIN: "60"   # kickoff+60..90 window still supported
-      HALFTIME_LATE_MIN: "92"
+      MAX_RUNTIME_MIN: "120"     # hard stop for a single run (tweakable)
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: npm
+        with: { node-version: 22, cache: "npm" }
       - run: npm install
-      - run: npx playwright install --with-deps chromium   # needed for the LIVE ODDS scrape
-      - run: node orchestrator.mjs
+      - run: npx playwright install --with-deps chromium
+      - run: node halftime-checker.mjs
