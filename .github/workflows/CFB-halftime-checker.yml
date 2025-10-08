@@ -3,11 +3,12 @@ name: CFB Halftime Checker
 on:
   workflow_dispatch:
   schedule:
-    # Thu & Fri nights often have CFB; Saturdays all day
-    - cron: "*/20 22-23 * * 4,5"   # Thu/Fri 6–7:59 PM ET (22–23 UTC)
-    - cron: "*/20 0-5 * * 5,6"     # Thu/Fri 8 PM–1:59 AM ET (overnight windows)
-    - cron: "*/20 14-23 * * 6"     # Sat 10 AM–7:59 PM ET
-    - cron: "*/20 0-4 * * 0"       # Sat late games spill into Sun 8 PM–12:59 AM ET
+    # Thu/Fri night CFB windows
+    - cron: "*/20 22-23 * * 4,5"   # 6–7:59 PM ET (22–23 UTC)
+    - cron: "*/20 0-5 * * 5,6"     # 8 PM–1:59 AM ET
+    # Saturday all-day
+    - cron: "*/20 14-23 * * 6"     # 10 AM–7:59 PM ET
+    - cron: "*/20 0-4 * * 0"       # late Sat into Sun 8 PM–12:59 AM ET
 
 jobs:
   run:
@@ -18,11 +19,22 @@ jobs:
       LEAGUE: college-football
       TAB_NAME: CFB
       RUN_SCOPE: today
-      MAX_RUNTIME_MIN: "90"       # each wake may sleep once, up to this cap
+      MAX_RUNTIME_MIN: "90"
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with: { node-version: 22, cache: npm }
-      - run: npm ci || npm install
-      - run: npx playwright install --with-deps chromium
-      - run: node halftime-checker.mjs
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install npm deps (includes playwright)
+        run: npm ci || npm install
+
+      - name: Install Playwright browser (Chromium)
+        run: npx playwright install --with-deps chromium
+
+      - name: Run halftime checker
+        run: node halftime-checker.mjs
