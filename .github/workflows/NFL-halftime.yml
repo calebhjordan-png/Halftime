@@ -1,12 +1,13 @@
-name: NFL Halftime
+name: NFL Halftime Checker
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/15 16-23 * * 0,1,4"  # Sun/Mon/Thu, every 15 min, 12:00–19:59 ET (16–23 UTC)
+    - cron: "*/15 16-23 * * 0,1,4"
+    - cron: "*/15 0-3 * * 1,2,5"
 
 jobs:
-  halftime:
+  run:
     runs-on: ubuntu-latest
     env:
       GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
@@ -14,11 +15,21 @@ jobs:
       LEAGUE: nfl
       TAB_NAME: NFL
       RUN_SCOPE: today
-      MAX_RUNTIME_MIN: "120"
+      MAX_RUNTIME_MIN: "90"
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with: { node-version: 22, cache: "npm" }
-      - run: npm install
-      - run: npx playwright install --with-deps chromium
-      - run: node halftime-checker.mjs
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install deps
+        run: npm install
+
+      - name: Install Playwright (Chromium)
+        run: npx playwright install --with-deps chromium
+
+      - name: Run halftime checker
+        run: node halftime-checker.mjs
