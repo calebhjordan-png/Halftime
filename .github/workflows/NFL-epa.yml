@@ -1,0 +1,74 @@
+name: NFL EPA (Reusable)
+
+on:
+  workflow_call:
+    inputs:
+      script_path:
+        description: "Path to NFL_EPA.py inside the repo"
+        required: false
+        type: string
+        default: "NFL_EPA.py"     # change if your file lives elsewhere
+      python_version:
+        description: "Python version"
+        required: false
+        type: string
+        default: "3.11"
+      league:
+        description: "LEAGUE env passed to the script"
+        required: false
+        type: string
+        default: "nfl"
+      seasons:
+        description: "SEASONS env passed to the script (e.g., 2024,2025)"
+        required: false
+        type: string
+        default: "2025"
+    secrets:
+      SHEET_ID:
+        required: true
+      GCP_SA_JSON:
+        required: true
+      # Add more required secrets here if your script expects them:
+      # API_KEY:
+      # etc.
+
+jobs:
+  run-epa:
+    runs-on: ubuntu-latest
+    env:
+      # Your script reads these from os.environ
+      SHEET_ID: ${{ secrets.SHEET_ID }}
+      LEAGUE: ${{ inputs.league }}
+      SEASONS: ${{ inputs.seasons }}
+      GCP_SA_JSON: ${{ secrets.GCP_SA_JSON }}
+      # Add any other env your script expects:
+      # API_KEY: ${{ secrets.API_KEY }}
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python_version }}
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ runner.os }}-${{ inputs.python_version }}-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            pip-${{ runner.os }}-${{ inputs.python_version }}-
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          python -m pip install -U pip wheel
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+      - name: Run EPA writer
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Running: ${{ inputs.script_path }}"
+          python "${{ inputs.script_path }}"
