@@ -1,0 +1,28 @@
+name: Halftime Checker
+
+on:
+  workflow_dispatch:   # allows manual runs
+  schedule:
+    # every 20 minutes on Saturday (14–23 UTC ≈ 10 AM–7 PM ET)
+    - cron: "*/20 14-23 * * 6"
+
+jobs:
+  check-halftime:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install deps
+        run: npm install
+
+      - name: Run halftime checker
+        run: node halftime-checker.mjs
+        env:
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+          GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
