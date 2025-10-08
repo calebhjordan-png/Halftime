@@ -7,6 +7,13 @@ const CREDS_RAW     = (process.env.GOOGLE_SERVICE_ACCOUNT || "").trim();
 const LEAGUE        = (process.env.LEAGUE || "nfl").toLowerCase();          // "nfl" | "college-football"
 const TAB_NAME      = (process.env.TAB_NAME || "NFL").trim();
 const RUN_SCOPE     = (process.env.RUN_SCOPE || "today").toLowerCase();     // "today" | "week"
+const ADAPTIVE_HALFTIME = String(process.env.ADAPTIVE_HALFTIME ?? "1") !== "0";
+
+/** Kickoff window and adaptive bounds */
+const HALF_EARLY_MIN = Number(process.env.HALFTIME_EARLY_MIN ?? 60);
+const HALF_LATE_MIN  = Number(process.env.HALFTIME_LATE_MIN  ?? 90);
+const MIN_RECHECK_MIN = 2;     // never less than 2 minutes
+const MAX_RECHECK_MIN = 20;    // your requested max cap
 
 /** Column names (Half Score header) */
 const COLS = [
@@ -111,7 +118,6 @@ function tidyStatus(evt) {
 }
 
 /** ===== Week label resolvers ===== */
-/* Generic calendar-based resolver — works for both NFL + CFB. */
 function resolveWeekLabelFromCalendar(sb, eventDateISO) {
   const cal = sb?.leagues?.[0]?.calendar || sb?.calendar || [];
   const t = new Date(eventDateISO).getTime();
@@ -126,26 +132,21 @@ function resolveWeekLabelFromCalendar(sb, eventDateISO) {
       const ed = new Date(end).getTime();
       if (!Number.isFinite(s) || !Number.isFinite(ed)) continue;
       if (t >= s && t <= ed) {
-        // Prefer "Week N" if present, but also allow "Bowls", "CFP", etc.
         if (/Week\s*\d+/i.test(label)) return label;
-        if (label) return label;
+        if (label) return label; // Bowls/CFP too
       }
     }
   }
   return "";
 }
-
-/* NFL: prefer explicit number; fallback to calendar. */
 function resolveWeekLabelNFL(sb, eventDateISO) {
   const wnum = sb?.week?.number;
   if (Number.isFinite(wnum)) return `Week ${wnum}`;
   return resolveWeekLabelFromCalendar(sb, eventDateISO) || "Regular Season";
 }
-
-/* CFB: first try sb.week.text, else calendar. */
 function resolveWeekLabelCFB(sb, eventDateISO) {
   const text = (sb?.week?.text || "").trim();
-  if (text) return text; // ESPN often fills this for CFB (“Week 7”, “Bowls”, “CFP”, etc.)
+  if (text) return text;
   return resolveWeekLabelFromCalendar(sb, eventDateISO) || "Regular Season";
 }
 
@@ -240,7 +241,7 @@ async function extractMLWithFallback(event, baseOdds, away, home) {
   return base;
 }
 
-/** Build pregame row */
+/** ===== Pregame row builder ===== */
 function pregameRowFactory(sbForDay) {
   return async function pregameRow(event) {
     const comp = event.competitions?.[0] || {};
@@ -287,12 +288,10 @@ function pregameRowFactory(sbForDay) {
       homeML = ml.homeML || "";
     }
 
-    // Week label: NFL uses numeric if present; CFB uses week.text or calendar.
     const weekText = (normLeague(LEAGUE) === "nfl")
       ? resolveWeekLabelNFL(sbForDay, event.date)
       : resolveWeekLabelCFB(sbForDay, event.date);
 
-    // Status & Date (ET)
     const statusClean = tidyStatus(event);
     const dateET = fmtETDate(event.date);
 
@@ -316,14 +315,49 @@ function pregameRowFactory(sbForDay) {
   };
 }
 
-/** Halftime-ish? */
+/** ===== Halftime-ish? ===== */
 function isHalftimeLike(evt) {
   const t = (evt.status?.type?.name || evt.competitions?.[0]?.status?.type?.name || "").toUpperCase();
   const short = (evt.status?.type?.shortDetail || "").toUpperCase();
-  return t.includes("HALFTIME") || /Q2.*0:0?0/i.test(short) || /HALF/.test(short);
+  return t.includes("HALFTIME") || /Q2.*0:0?0/.test(short) || /HALF/.test(short);
 }
 
-/** Playwright DOM scrape for LIVE odds at halftime (one-time) */
+/** ===== Parse clock / candidates / master delay ===== */
+function parseShortDetailClock(shortDetail="") {
+  const s = String(shortDetail).trim().toUpperCase();
+  if (/HALF/.test(s) || /HALFTIME/.test(s)) return { quarter: 2, min: 0, sec: 0, halftime: true };
+  if (/FINAL/.test(s)) return { final: true };
+  const m = s.match(/Q?(\d)\D+(\d{1,2}):(\d{2})/);
+  if (!m) return null;
+  return { quarter: Number(m[1]), min: Number(m[2]), sec: Number(m[3]) };
+}
+function minutesAfterKickoff(evt) {
+  const kickoff = new Date(evt.date).getTime();
+  const now = Date.now();
+  return (now - kickoff) / 60000;
+}
+function clampRecheck(mins) {
+  return Math.max(MIN_RECHECK_MIN, Math.min(MAX_RECHECK_MIN, Math.ceil(mins)));
+}
+function kickoff65CandidateMinutes(evt, rowValues, hmap) {
+  const halfScore = (rowValues?.[hmap["half score"]] || "").toString().trim();
+  if (halfScore) return null; // halftime already captured
+  const mins = minutesAfterKickoff(evt);
+  if (mins < 60 || mins > 80) return null;
+  const remaining = 65 - mins;
+  return clampRecheck(remaining <= 0 ? MIN_RECHECK_MIN : remaining);
+}
+function q2AdaptiveCandidateMinutes(evt) {
+  const short = (evt.status?.type?.shortDetail || "").trim();
+  const parsed = parseShortDetailClock(short);
+  if (!parsed || parsed.final || parsed.halftime) return null;
+  if (parsed.quarter !== 2) return null;
+  const minutesLeft = parsed.min + parsed.sec / 60;
+  if (minutesLeft >= 10) return null;
+  return clampRecheck(2 * minutesLeft);
+}
+
+/** ===== Playwright DOM scrape for LIVE odds at halftime (one-time) ===== */
 async function scrapeLiveOddsOnce(league, gameId) {
   const url = gameUrl(league, gameId);
   const browser = await playwright.chromium.launch({ headless: true });
@@ -355,9 +389,7 @@ async function scrapeLiveOddsOnce(league, gameId) {
       if (sc) halfScore = `${sc[1]}-${sc[2]}`;
     } catch {}
 
-    return {
-      liveAwaySpread, liveHomeSpread, liveTotal, liveAwayML, liveHomeML, halfScore
-    };
+    return { liveAwaySpread, liveHomeSpread, liveTotal, liveAwayML, liveHomeML, halfScore };
   } catch (err) {
     warn("Live DOM scrape failed:", err.message, url);
     return null;
@@ -498,8 +530,9 @@ async function applyCenterFormatting(sheets) {
     log(`✅ Appended ${appendBatch.length} pregame row(s).`);
   }
 
-  // Halftime / Final updates (batched finals)
+  // ===== Pass 1: finals/halftime writes (no sleeps yet) + collect candidate delays
   const batch = new BatchWriter(TAB_NAME);
+  let masterDelayMin = null; // in minutes
 
   for (const ev of events) {
     const comp = ev.competitions?.[0] || {};
@@ -516,22 +549,22 @@ async function applyCenterFormatting(sheets) {
     const statusName = (ev.status?.type?.name || comp.status?.type?.name || "").toUpperCase();
     const scorePair = `${away?.score ?? ""}-${home?.score ?? ""}`;
 
-    // Final score
+    // Final score (batched)
     if (statusName.includes("FINAL")) {
       if (hmap["final score"] !== undefined) batch.add(rowNum, hmap["final score"], scorePair);
       if (hmap["status"] !== undefined)      batch.add(rowNum, hmap["status"], "Final");
       continue;
     }
 
-    // Halftime (one-time) live odds
+    // Halftime write (one-time)
     const currentRow = (values[rowNum-1] || []);
     const halfAlready = (currentRow[hmap["half score"]] || "").toString().trim();
     const liveTotalVal = (currentRow[hmap["live total"]] || "").toString().trim();
+
     if (isHalftimeLike(ev) && !liveTotalVal && !halfAlready) {
       const live = await scrapeLiveOddsOnce(LEAGUE, ev.id);
       if (live) {
         const { liveAwaySpread, liveHomeSpread, liveTotal, liveAwayML, liveHomeML, halfScore } = live;
-
         const payload = [];
         const add = (name,val) => {
           const idx = hmap[name]; if (idx===undefined || !val) return;
@@ -553,13 +586,91 @@ async function applyCenterFormatting(sheets) {
           });
         }
         log(`🕐 Halftime LIVE written for ${matchup}`);
-      } else {
-        log(`(Halftime) live odds not found for ${matchup}`);
+        continue;
       }
+    }
+
+    // Collect adaptive candidate delays (for a single master sleep later)
+    if (ADAPTIVE_HALFTIME) {
+      // kickoff + ~65 min (if we haven't captured halftime yet)
+      const kickCand = kickoff65CandidateMinutes(ev, currentRow, hmap);
+      if (kickCand != null) masterDelayMin = masterDelayMin == null ? kickCand : Math.min(masterDelayMin, kickCand);
+
+      // Q2 under 10:00 → 2x minutes remaining
+      const q2Cand = q2AdaptiveCandidateMinutes(ev);
+      if (q2Cand != null) masterDelayMin = masterDelayMin == null ? q2Cand : Math.min(masterDelayMin, q2Cand);
     }
   }
 
   await batch.flush(sheets);
+
+  // ===== Single master sleep (if any) and one more halftime pass
+  if (ADAPTIVE_HALFTIME && masterDelayMin != null) {
+    const ms = Math.ceil(masterDelayMin * 60 * 1000);
+    log(`⏳ Adaptive master wait: ${masterDelayMin} minute(s).`);
+    await new Promise(r => setTimeout(r, ms));
+
+    // Re-fetch today's/this week’s events quickly and do one halftime pass
+    let events2 = [];
+    for (const d of datesList) {
+      const sb2 = await fetchJson(scoreboardUrl(LEAGUE, d));
+      events2 = events2.concat(sb2?.events || []);
+    }
+    const seen2 = new Set(); events2 = events2.filter(e => !seen2.has(e.id) && seen2.add(e.id));
+
+    for (const ev of events2) {
+      const comp = ev.competitions?.[0] || {};
+      const away = comp.competitors?.find(c => c.homeAway === "away");
+      const home = comp.competitors?.find(c => c.homeAway === "home");
+
+      const awayName = away?.team?.shortDisplayName || away?.team?.abbreviation || away?.team?.name || "Away";
+      const homeName = home?.team?.shortDisplayName || home?.team?.abbreviation || home?.team?.name || "Home";
+      const matchup = `${awayName} @ ${homeName}`;
+      const dateET = fmtETDate(ev.date);
+      const rowNum = keyToRowNum.get(keyOf(dateET, matchup));
+      if (!rowNum) continue;
+
+      const statusName = (ev.status?.type?.name || comp.status?.type?.name || "").toUpperCase();
+      if (!statusName.includes("HALFTIME")) continue;
+
+      // read current row snapshot again to avoid double write
+      const snap = await sheets.spreadsheets.values.get({ spreadsheetId: SHEET_ID, range: `${TAB_NAME}!A1:Z` });
+      const rowsNow = (snap.data.values || []).slice(1);
+      const headerNow = (snap.data.values || [])[0] || header;
+      const hmapNow = mapHeadersToIndex(headerNow);
+      const currentRow = rowsNow[rowNum - 2] || [];
+      const halfAlready = (currentRow[hmapNow["half score"]] || "").toString().trim();
+      const liveTotalVal = (currentRow[hmapNow["live total"]] || "").toString().trim();
+      if (halfAlready || liveTotalVal) continue;
+
+      const live = await scrapeLiveOddsOnce(LEAGUE, ev.id);
+      if (live) {
+        const { liveAwaySpread, liveHomeSpread, liveTotal, liveAwayML, liveHomeML, halfScore } = live;
+        const payload = [];
+        const add = (name,val) => {
+          const idx = hmapNow[name]; if (idx===undefined || !val) return;
+          const range = `${TAB_NAME}!${colLetter(idx)}${rowNum}:${colLetter(idx)}${rowNum}`;
+          payload.push({ range, values: [[val]] });
+        };
+        add("status", "Half");
+        if (halfScore) add("half score", halfScore);
+        add("live away spread", liveAwaySpread);
+        add("live home spread", liveHomeSpread);
+        add("live away ml", liveAwayML);
+        add("live home ml", liveHomeML);
+        add("live total", liveTotal);
+
+        if (payload.length) {
+          await sheets.spreadsheets.values.batchUpdate({
+            spreadsheetId: SHEET_ID,
+            requestBody: { valueInputOption: "RAW", data: payload }
+          });
+        }
+        log(`🕐 (Adaptive) Halftime LIVE written for ${matchup}`);
+      }
+    }
+  }
+
   log("✅ Run complete.");
 })().catch(err => {
   console.error("❌ Error:", err);
