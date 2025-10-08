@@ -1,4 +1,4 @@
-name: NFL Halftime Checker
+name: NFL Halftime
 
 on:
   workflow_dispatch:
