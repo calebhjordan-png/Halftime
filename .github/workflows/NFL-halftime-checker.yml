@@ -3,8 +3,8 @@ name: NFL Halftime Checker
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/15 16-23 * * 0,1,4"  # Sun/Mon/Thu 12–7:59 PM ET
-    - cron: "*/15 0-3 * * 1,2,5"    # Sun/Mon/Thu 8 PM–10:59 PM ET spill into next UTC day
+    - cron: "*/15 16-23 * * 0,1,4"  # Sun/Mon/Thu 12–7:59 PM ET (16–23 UTC)
+    - cron: "*/15 0-3 * * 1,2,5"    # late windows spill into next UTC day
 
 jobs:
   run:
@@ -17,9 +17,20 @@ jobs:
       RUN_SCOPE: today
       MAX_RUNTIME_MIN: "90"
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with: { node-version: 22, cache: npm }
-      - run: npm ci || npm install
-      - run: npx playwright install --with-deps chromium
-      - run: node halftime-checker.mjs
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install npm deps (includes playwright)
+        run: npm ci || npm install
+
+      - name: Install Playwright browser (Chromium)
+        run: npx playwright install --with-deps chromium
+
+      - name: Run halftime checker
+        run: node halftime-checker.mjs
