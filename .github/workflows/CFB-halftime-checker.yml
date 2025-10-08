@@ -3,14 +3,19 @@ name: CFB Halftime Checker
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/20 22-23 * * 4,5"
-    - cron: "*/20 0-5 * * 5,6"
-    - cron: "*/20 14-23 * * 6"
-    - cron: "*/20 0-4 * * 0"
+    - cron: "*/20 22-23 * * 4,5"  # Thu/Fri 6–7:59 PM ET
+    - cron: "*/20 0-5 * * 5,6"    # Fri/Sat overnight
+    - cron: "*/20 14-23 * * 6"    # Sat 10 AM–7:59 PM ET
+    - cron: "*/20 0-4 * * 0"      # Late Sat -> early Sun
+
+concurrency:
+  group: cfb-halftime-checker
+  cancel-in-progress: true
 
 jobs:
   run:
     runs-on: ubuntu-latest
+    timeout-minutes: 6
     env:
       GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
       GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
@@ -22,16 +27,14 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Setup Node
+      - name: Setup Node (with cache)
         uses: actions/setup-node@v4
         with:
           node-version: 22
+          cache: npm
 
       - name: Install deps
-        run: npm install
-
-      - name: Install Playwright (Chromium)
-        run: npx playwright install --with-deps chromium
+        run: npm ci --omit=dev
 
       - name: Run halftime checker
         run: node halftime-checker.mjs
