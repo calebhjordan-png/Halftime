@@ -1,38 +1,34 @@
-name: NFL EPA Writer
+name: Run NFL EPA Script
 
 on:
-  workflow_call:
-    inputs:
-      league:
-        required: true
-        type: string
-      seasons:
-        required: true
-        type: string
-      python_version:
-        required: false
-        type: string
-        default: '3.11'
+  workflow_dispatch:    # allows manual run
+  schedule:
+    - cron: "0 * * * *" # runs every hour (UTC) — adjust later when linked to halftime detector
 
 jobs:
-  run:
+  run-epa:
     runs-on: ubuntu-latest
-    env:
-      SHEET_ID: ${{ secrets.SHEET_ID }}
-      LEAGUE: ${{ inputs.league }}
-      SEASONS: ${{ inputs.seasons }}
-      GCP_SA_JSON: ${{ secrets.GCP_SA_JSON }}
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repo
+        uses: actions/checkout@v4
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: ${{ inputs.python_version }}
+          python-version: "3.11"
 
-      - name: Install deps
-        run: pip install -r requirements.txt
+      - name: Install dependencies
+        run: |
+          pip install -r nfl-epa-sheets/requirements.txt
 
-      - name: Run Python script
-        run: python C:\Users\kaylu\OneDrive\Desktop\Coding\nfl-epa-sheets\NFL_EPA.py
+      - name: Run NFL EPA
+        env:
+          SHEET_ID: ${{ secrets.SHEET_ID }}
+          GCP_SA_JSON: ${{ secrets.GCP_SA_JSON }}
+          SEASONS: "2025"
+          LEAGUE: "NFL"
+          START_CELL: "Q2"
+          SHEET_TAB_NFL: "NFL"
+        run: |
+          python nfl-epa-sheets/NFL_EPA.py
