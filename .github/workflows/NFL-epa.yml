@@ -1,17 +1,19 @@
 name: Run NFL EPA Script
 
 on:
-  workflow_dispatch:    # allows manual run
+  workflow_dispatch:
   schedule:
-    - cron: "0 * * * *" # runs every hour (UTC) — adjust later when linked to halftime detector
+    - cron: "0 * * * *"   # hourly (UTC). Adjust later.
 
 jobs:
   run-epa:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
+
+      - name: Show repo tree (debug)
+        run: ls -R
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -20,7 +22,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install -r nfl-epa-sheets/requirements.txt
+          pip install -r requirements.txt
 
       - name: Run NFL EPA
         env:
@@ -31,4 +33,4 @@ jobs:
           START_CELL: "Q2"
           SHEET_TAB_NFL: "NFL"
         run: |
-          python nfl-epa-sheets/NFL_EPA.py
+          python NFL_EPA.py
