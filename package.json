@@ -7,6 +7,7 @@
     "start": "node orchestrator.mjs"
   },
   "dependencies": {
+    "dotenv": "^17.2.3",
     "googleapis": "^126.0.1",
     "playwright": "^1.48.2"
   }
