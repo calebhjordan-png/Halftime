@@ -3,68 +3,88 @@ name: CFB Halftime (Daily Morning Schedule)
 on:
   workflow_dispatch:
   schedule:
-    # Runs every morning 9:00 AM ET (13:00 UTC)
-    - cron: "0 13 * * *"
+    # 10:00 AM ET during Daylight Time (14:00 UTC) — adjust if you prefer
+    - cron: "0 14 * * *"
 
 jobs:
   build-matrix:
+    name: Build today's game schedule
     runs-on: ubuntu-latest
     outputs:
-      games: ${{ steps.collect.outputs.games }}
+      games_json: ${{ steps.collect.outputs.games_json }}
     steps:
-      - name: Collect today’s (and tomorrow’s) CFB games
+      - name: Collect today’s (and optional tomorrow’s) CFB games, compute kickoff+60
         id: collect
+        shell: bash
         run: |
           set -euo pipefail
-          ET_TZ="America/New_York"
-          today_et="$(TZ=$ET_TZ date +%Y%m%d)"
-          tomorrow_et="$(TZ=$ET_TZ date -d '+1 day' +%Y%m%d)"
 
-          fetch() { curl -sS "https://site.api.espn.com/apis/site/v2/sports/football/college-football/scoreboard?dates=$1&groups=80&limit=300"; }
+          ET_TZ="America/New_York"
+          # Query *today in ET*. Add "+1 day" if you also want early-AM games after midnight.
+          today_et="$(TZ=$ET_TZ date +%Y%m%d)"
+          # tomorrow_et="$(TZ=$ET_TZ date -d '+1 day' +%Y%m%d)"   # uncomment to include tomorrow as well
+
+          fetch() {
+            curl -sS "https://site.api.espn.com/apis/site/v2/sports/football/college-football/scoreboard?dates=$1&groups=80&limit=300"
+          }
 
           tmp="$(mktemp)"
-          { fetch "$today_et"; fetch "$tomorrow_et"; } | jq -s '[.[].events[]?] | unique_by(.id)' > "$tmp"
+          { fetch "$today_et"; \
+            # fetch "$tomorrow_et";                                   # uncomment if using tomorrow_et
+          } | jq -s '
+              [.[].events[]?] | unique_by(.id)
+            ' > "$tmp"
 
           now_ts=$(date -u +%s)
-          jq -r --argjson now "$now_ts" '
-            [ .[]
-              | { id: .id
-                , kickoff: .date
-                , run_at: ( ((.date | fromdateiso8601) + (60*60)) | todateiso8601 )
-                , delay:   ( ((.date | fromdateiso8601) + (60*60)) - $now )
-              }
-              | select(.delay >= 0 and .delay <= (20*60*60))  # within next ~20 h
-            ]
-          ' "$tmp" | jq -c '.' | sed '1!b;s/^/games=/' >> "$GITHUB_OUTPUT"
+
+          games_json="$(
+            jq --argjson now "$now_ts" '
+              [ .[]
+                | { id: .id
+                  , kickoff: .date
+                  , run_at: ( ((.date | fromdateiso8601) + (60*60)) | todateiso8601 )     # kickoff + 60m (UTC)
+                  , delay:   ( ((.date | fromdateiso8601) + (60*60)) - $now )
+                }
+                # Only keep games whose kickoff+60 is in the next ~20 hours
+                | select(.delay >= 0 and .delay <= (20*60*60))
+              ]
+            ' "$tmp"
+          )"
+
+          echo "Found $(jq -r 'length' <<<"$games_json") games to schedule."
+          echo "games_json=$(jq -c '.' <<<"$games_json")" >> "$GITHUB_OUTPUT"
 
   per-game:
+    name: Per-game halftime capture
     needs: build-matrix
-    if: ${{ needs.build-matrix.outputs.games != '' }}
+    if: ${{ needs.build-matrix.outputs.games_json != '' && fromJSON(needs.build-matrix.outputs.games_json) != null && (fromJSON(needs.build-matrix.outputs.games_json) | length) > 0 }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        include: ${{ fromJSON(needs.build-matrix.outputs.games) }}
+        game: ${{ fromJSON(needs.build-matrix.outputs.games_json) }}
     concurrency:
-      group: cfb-halftime-${{ matrix.include.id }}
+      group: cfb-halftime-${{ matrix.game.id }}
       cancel-in-progress: false
     env:
       GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
       GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
       TAB_NAME: CFB
-      TARGET_GAME_ID: ${{ matrix.include.id }}
-      MAX_TOTAL_MIN: "200"
+      TARGET_GAME_ID: ${{ matrix.game.id }}
+      MAX_TOTAL_MIN: "200"     # safety cap; watcher exits if exceeded
     steps:
       - uses: actions/checkout@v4
 
-      - name: Sleep until kickoff + 60 min
+      - name: Sleep until kickoff+60 for this game
+        shell: bash
         run: |
-          target_iso='${{ matrix.include.run_at }}'
+          set -euo pipefail
+          target_iso='${{ matrix.game.run_at }}'
           target_ts=$(date -u -d "$target_iso" +%s)
           now_ts=$(date -u +%s)
           wait=$(( target_ts - now_ts ))
           if [ $wait -le 0 ]; then
-            echo "Already past halftime window; running now."
+            echo "kickoff+60 already passed; continuing immediately."
           else
             echo "Sleeping $wait seconds until $target_iso (UTC)…"
             sleep $wait
@@ -80,5 +100,5 @@ jobs:
           if [ -f package-lock.json ]; then npm ci; else npm install; fi
           npx playwright install --with-deps chromium
 
-      - name: Run halftime watcher for this game
-        run: node ./cfb-halftime-single.mjs
+      - name: Run single-game halftime watcher
+        run: node ./CFB-halftime-check.mjs
