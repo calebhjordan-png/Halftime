@@ -1,4 +1,4 @@
-// cfb-halftime-watcher.mjs
+// cfb-halftime.mjs
 // Purpose: For today's CFB games, detect HALFTIME and, for each game that just hit half,
 // fetch Half Score (API) + Live Odds (DOM + API fallbacks) and write them ONCE to your sheet.
 //
