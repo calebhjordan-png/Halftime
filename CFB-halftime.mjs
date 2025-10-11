@@ -15,7 +15,6 @@
 
 import 'dotenv/config';
 import { google } from 'googleapis';
-import { fetch } from 'undici';
 import { chromium } from 'playwright';
 
 const SHEET_ID  = need('GOOGLE_SHEET_ID');
