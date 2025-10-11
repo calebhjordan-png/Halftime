@@ -3,12 +3,10 @@ name: CFB Halftime
 on:
   workflow_dispatch:
   schedule:
-    # Saturday main windows (Eastern Time)
-    - cron: "*/10 14-23 * * 6"
-    - cron: "*/10 0-3 * * 0"
-    # Optional: weeknight games
-    - cron: "*/15 22-23 * * 2,4"
-    - cron: "*/15 0-2 * * 3,5"
+    - cron: "*/10 14-23 * * 6"   # Sat 10:00–19:59 ET
+    - cron: "*/10 0-3 * * 0"     # Sat late spill to Sun
+    - cron: "*/15 22-23 * * 2,4" # Tue/Thu evenings (optional)
+    - cron: "*/15 0-2 * * 3,5"   # Tue/Thu late (optional)
 
 jobs:
   run:
@@ -21,12 +19,28 @@ jobs:
       GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
       TAB_NAME: CFB
       MAX_RUNTIME_MIN: "90"
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Verify secrets
+        run: |
+          test -n "${GOOGLE_SHEET_ID}" || (echo "GOOGLE_SHEET_ID missing" && exit 1)
+          test -n "${GOOGLE_SERVICE_ACCOUNT}" || (echo "GOOGLE_SERVICE_ACCOUNT missing" && exit 1)
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
         with:
           node-version: 22
-          cache: "npm"
-      - run: npm ci
-      - run: npx playwright install --with-deps chromium
-      - run: node cfb-halftime-watcher.mjs
+          cache: 'npm'
+
+      - name: Install deps
+        run: |
+          if [ -f package-lock.json ] || [ -f npm-shrinkwrap.json ]; then npm ci; else npm install; fi
+
+      - name: Install Playwright (Chromium)
+        run: npx playwright install --with-deps chromium
+
+      - name: Run CFB halftime script
+        run: node ./CFB-halftime.mjs
