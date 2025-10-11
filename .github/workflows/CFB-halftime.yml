@@ -1,18 +1,21 @@
-name: CFB Halftime Watcher
+name: CFB Halftime
 
 on:
   workflow_dispatch:
   schedule:
-    # Saturday day + late spill (ET)
+    # Saturday main windows (Eastern Time)
     - cron: "*/10 14-23 * * 6"
     - cron: "*/10 0-3 * * 0"
-    # Weeknights (light coverage for weekday CFB)
-    - cron: "*/15 22-23 * * 2,4"   # Tue/Thu 6–7:59 PM ET
-    - cron: "*/15 0-2 * * 3,5"     # Tue/Thu 8–9:59 PM ET
+    # Optional: weeknight games
+    - cron: "*/15 22-23 * * 2,4"
+    - cron: "*/15 0-2 * * 3,5"
 
 jobs:
   run:
     runs-on: ubuntu-latest
+    concurrency:
+      group: cfb-halftime
+      cancel-in-progress: false
     env:
       GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
       GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
@@ -21,7 +24,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
-        with: { node-version: 22, cache: 'npm' }
+        with:
+          node-version: 22
+          cache: "npm"
       - run: npm ci
       - run: npx playwright install --with-deps chromium
       - run: node cfb-halftime-watcher.mjs
