@@ -1,7 +1,6 @@
 @'
 import { google } from "googleapis";
 
-// ----- ENV -----
 const SHEET_ID = process.env.GOOGLE_SHEET_ID;
 const SA_JSON  = process.env.GOOGLE_SERVICE_ACCOUNT;
 const TAB_NAME = process.env.TAB_NAME || "CFB";
@@ -14,7 +13,6 @@ if (!SHEET_ID || !SA_JSON || !EVENT_ID) {
   process.exit(1);
 }
 
-// ----- utils -----
 async function fetchJson(url) {
   const r = await fetch(url, { headers: { "User-Agent": "cfb-halftime-check/1.0" } });
   if (!r.ok) throw new Error(`HTTP ${r.status} ${url}`);
@@ -22,7 +20,6 @@ async function fetchJson(url) {
 }
 const pick=(o,p)=>p.replace(/\[(\d+)\]/g,'.$1').split('.').reduce((a,k)=>a?.[k],o);
 
-// ESPN status (supports both shapes)
 function parseStatus(sum){
   const a = pick(sum,"header.competitions.0.status") || {};
   const b = pick(sum,"competitions.0.status") || {};
@@ -36,22 +33,15 @@ function parseStatus(sum){
   };
 }
 
-// Try multiple places for teams: header/competitions, competitions, boxscore.teams
 function getTeams(sum){
   let away, home;
 
-  // 1) header.competitions[0].competitors
   let cps = pick(sum,"header.competitions.0.competitors");
-  if (!Array.isArray(cps) || cps.length<2) {
-    // 2) competitions[0].competitors
-    cps = pick(sum,"competitions.0.competitors");
-  }
+  if (!Array.isArray(cps) || cps.length<2) cps = pick(sum,"competitions.0.competitors");
   if (Array.isArray(cps) && cps.length>=2) {
     away = cps.find(c=>c.homeAway==="away");
     home = cps.find(c=>c.homeAway==="home");
   }
-
-  // 3) fallback: boxscore.teams
   if ((!away || !home) && Array.isArray(pick(sum,"boxscore.teams"))) {
     const bs = pick(sum,"boxscore.teams");
     away = bs.find(t=>t.homeAway==="away") || away;
@@ -86,7 +76,6 @@ function decideSleep(p,clock){
   return mins;
 }
 
-// ----- Sheets -----
 async function sheetsClient(){
   const creds=JSON.parse(SA_JSON);
   const jwt=new google.auth.JWT(creds.client_email,null,creds.private_key,["https://www.googleapis.com/auth/spreadsheets"]);
@@ -118,7 +107,6 @@ async function writeHalftime(sheets,rowIdx,vals){
     "Live Home Spread": vals.liveHomeSpread,
     "Live Home ML": vals.liveHomeMl,
     "Live Total": vals.liveTotal,
-    // fallbacks:
     "Away Spread": vals.liveAwaySpread,
     "Away ML": vals.liveAwayMl,
     "Home Spread": vals.liveHomeSpread,
@@ -140,7 +128,6 @@ async function writeHalftime(sheets,rowIdx,vals){
   return updates.length;
 }
 
-// ----- main -----
 (async()=>{
   const sheets=await sheetsClient();
   let total=0;
