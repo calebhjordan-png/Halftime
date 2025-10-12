@@ -1,0 +1,28 @@
+name: CFB Halftime Manual Check
+on:
+  workflow_dispatch:
+    inputs:
+      game_id:
+        description: "ESPN Game ID (e.g., 401530820)"
+        required: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    env:
+      GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+      GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
+      TAB_NAME: CFB
+      TARGET_GAME_ID: ${{ github.event.inputs.game_id }}
+      MAX_TOTAL_MIN: 200
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install dependencies
+        run: |
+          npm ci
+          npx playwright install --with-deps chromium
+      - name: Run checker
+        run: node ./cfb-halftime-check.mjs
