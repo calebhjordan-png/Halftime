@@ -1,3 +1,18 @@
+name: CFB Halftime (Daily Morning Schedule)
+
+on:
+  workflow_dispatch:
+  schedule:
+    # 10:00 AM ET during Daylight Time (14:00 UTC). Adjust if you prefer.
+    - cron: "0 14 * * *"
+
+jobs:
+  build-matrix:
+    name: Build today's game schedule
+    runs-on: ubuntu-latest
+    outputs:
+      games_json: ${{ steps.collect.outputs.games_json }}
+    steps:
       - name: Collect today’s CFB games and compute kickoff+60
         id: collect
         shell: bash
@@ -5,7 +20,7 @@
           set -euo pipefail
 
           ET_TZ="America/New_York"
-          # Query “today” in ET. (Uncomment tomorrow if you want 2-day lookahead)
+          # Query “today” in ET. (Uncomment tomorrow if you want 2-day lookahead.)
           today_et="$(TZ=$ET_TZ date +%Y%m%d)"
           # tomorrow_et="$(TZ=$ET_TZ date -d '+1 day' +%Y%m%d)"
 
@@ -21,17 +36,19 @@
           now_ts=$(date -u +%s)
           out='[]'
 
-          # Build array in bash so we can parse flexible ISO strings
+          # Build array in bash to tolerate ESPN times with/without seconds (e.g. 2025-10-11T23:30Z).
           while IFS=$'\t' read -r id kickoff; do
-            # Parse kickoff (handles YYYY-MM-DDTHH:MMZ and with seconds too)
+            # Parse kickoff to epoch (UTC)
             ts=$(date -u -d "$kickoff" +%s 2>/dev/null || true)
-            if [ -z "$ts" ]; then
+            if [ -z "${ts:-}" ]; then
               echo "Skipping unparsable kickoff: id=$id kickoff=$kickoff"
               continue
             fi
-            run_ts=$(( ts + 60*60 ))                # +60 minutes
+
+            run_ts=$(( ts + 60*60 ))       # kickoff + 60 minutes
             delay=$(( run_ts - now_ts ))
-            # Keep games whose (kickoff+60) is within the next ~20 hours
+
+            # Keep only games whose (kickoff+60) is within the next ~20 hours
             if [ $delay -ge 0 ] && [ $delay -le $((20*60*60)) ]; then
               run_iso=$(date -u -d "@$run_ts" +"%Y-%m-%dT%H:%M:%SZ")
               out=$(jq -c --arg id "$id" --arg kickoff "$kickoff" --arg run_iso "$run_iso" --argjson delay "$delay" \
@@ -41,3 +58,52 @@
 
           echo "Found $(jq -r 'length' <<<"$out") games to schedule."
           echo "games_json=$(jq -c '.' <<<"$out")" >> "$GITHUB_OUTPUT"
+
+  per-game:
+    name: Per-game halftime capture
+    needs: build-matrix
+    if: ${{ needs.build-matrix.outputs.games_json != '' && fromJSON(needs.build-matrix.outputs.games_json).length > 0 }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        game: ${{ fromJSON(needs.build-matrix.outputs.games_json) }}
+    concurrency:
+      group: cfb-halftime-${{ matrix.game.id }}
+      cancel-in-progress: false
+    env:
+      GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+      GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
+      TAB_NAME: CFB
+      TARGET_GAME_ID: ${{ matrix.game.id }}
+      MAX_TOTAL_MIN: "200"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Sleep until kickoff+60 for this game
+        shell: bash
+        run: |
+          set -euo pipefail
+          target_iso='${{ matrix.game.run_at }}'
+          target_ts=$(date -u -d "$target_iso" +%s)
+          now_ts=$(date -u +%s)
+          wait=$(( target_ts - now_ts ))
+          if [ $wait -le 0 ]; then
+            echo "kickoff+60 already passed; continuing immediately."
+          else
+            echo "Sleeping $wait seconds until $target_iso (UTC)…"
+            sleep $wait
+          fi
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: |
+          if [ -f package-lock.json ]; then npm ci; else npm install; fi
+          npx playwright install --with-deps chromium
+
+      - name: Run single-game halftime watcher
+        run: node ./CFB-halftime-check.mjs
