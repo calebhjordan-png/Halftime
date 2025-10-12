@@ -57,7 +57,50 @@ jobs:
           done < <(jq -r '.[] | [.id, .kickoff] | @tsv' "$tmp")
 
           echo "Found $(jq -r 'length' <<<"$out") games to schedule."
+          # Save for later debug/summary steps
+          echo "$out" > games.json
           echo "games_json=$(jq -c '.' <<<"$out")" >> "$GITHUB_OUTPUT"
+
+      - name: Debug / Summary — show scheduled games table
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          ET_TZ="America/New_York"
+          if [ ! -s games.json ]; then
+            echo "No games.json to display." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          echo "### CFB games scheduled (kickoff + 60 min)" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          printf "| ID | Kickoff (UTC) | Kickoff (ET) | Run At (UTC) | Run At (ET) | Delay (min) |\n" >> "$GITHUB_STEP_SUMMARY"
+          printf "|---|---|---|---|---|---|\n" >> "$GITHUB_STEP_SUMMARY"
+
+          while IFS= read -r row; do
+            id=$(jq -r '.id' <<<"$row")
+            ko=$(jq -r '.kickoff' <<<"$row")
+            ra=$(jq -r '.run_at' <<<"$row")
+            delay=$(jq -r '.delay' <<<"$row")
+
+            ko_utc_disp=$(date -u -d "$ko" +"%Y-%m-%d %H:%M %Z" 2>/dev/null || echo "$ko")
+            ko_et_disp=$(TZ=$ET_TZ date -d "$ko" +"%Y-%m-%d %I:%M %p %Z" 2>/dev/null || echo "$ko")
+
+            ra_utc_disp=$(date -u -d "$ra" +"%Y-%m-%d %H:%M %Z" 2>/dev/null || echo "$ra")
+            ra_et_disp=$(TZ=$ET_TZ date -d "$ra" +"%Y-%m-%d %I:%M %p %Z" 2>/dev/null || echo "$ra")
+
+            delay_min=$(( (delay + 59) / 60 ))  # round up to next minute
+            printf "| %s | %s | %s | %s | %s | %s |\n" \
+              "$id" "$ko_utc_disp" "$ko_et_disp" "$ra_utc_disp" "$ra_et_disp" "$delay_min" >> "$GITHUB_STEP_SUMMARY"
+          done < <(jq -c '.[]' games.json)
+
+      - name: Upload scheduled games JSON (debug)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cfb-games-scheduled
+          path: games.json
+          if-no-files-found: ignore
 
   per-game:
     name: Per-game halftime capture
