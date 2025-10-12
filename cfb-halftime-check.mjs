@@ -1,4 +1,4 @@
-// cfb-halftime-check.mjs
+@'
 import { google } from "googleapis";
 
 // ----- ENV -----
@@ -14,40 +14,60 @@ if (!SHEET_ID || !SA_JSON || !EVENT_ID) {
   process.exit(1);
 }
 
-// ----- Utils -----
+// ----- utils -----
 async function fetchJson(url) {
   const r = await fetch(url, { headers: { "User-Agent": "cfb-halftime-check/1.0" } });
   if (!r.ok) throw new Error(`HTTP ${r.status} ${url}`);
   return r.json();
 }
-const pick = (o,p)=>p.replace(/\[(\d+)\]/g,'.$1').split('.').reduce((a,k)=>a?.[k],o);
+const pick=(o,p)=>p.replace(/\[(\d+)\]/g,'.$1').split('.').reduce((a,k)=>a?.[k],o);
 
-function parseStatus(sum) {
+// ESPN status (supports both shapes)
+function parseStatus(sum){
   const a = pick(sum,"header.competitions.0.status") || {};
   const b = pick(sum,"competitions.0.status") || {};
   const s = a?.type?.shortDetail ? a : b;
   const type = s.type || {};
   return {
     shortDetail: type.shortDetail || "",
-    state: type.state || "",           // "pre" | "in" | "post"
+    state: type.state || "",
     period: Number(s.period ?? 0),
     displayClock: s.displayClock ?? "0:00",
   };
 }
-function getTeams(sum) {
-  const comp = pick(sum,"header.competitions.0")?.competitors ? pick(sum,"header.competitions.0")
-             : pick(sum,"competitions.0") || {};
-  const cps = comp.competitors || [];
-  const away = cps.find(c=>c.homeAway==="away") || {};
-  const home = cps.find(c=>c.homeAway==="home") || {};
-  const awayName = away.team?.shortDisplayName || away.team?.displayName || "Away";
-  const homeName = home.team?.shortDisplayName || home.team?.displayName || "Home";
-  const awayScore = Number(away.score ?? 0);
-  const homeScore = Number(home.score ?? 0);
+
+// Try multiple places for teams: header/competitions, competitions, boxscore.teams
+function getTeams(sum){
+  let away, home;
+
+  // 1) header.competitions[0].competitors
+  let cps = pick(sum,"header.competitions.0.competitors");
+  if (!Array.isArray(cps) || cps.length<2) {
+    // 2) competitions[0].competitors
+    cps = pick(sum,"competitions.0.competitors");
+  }
+  if (Array.isArray(cps) && cps.length>=2) {
+    away = cps.find(c=>c.homeAway==="away");
+    home = cps.find(c=>c.homeAway==="home");
+  }
+
+  // 3) fallback: boxscore.teams
+  if ((!away || !home) && Array.isArray(pick(sum,"boxscore.teams"))) {
+    const bs = pick(sum,"boxscore.teams");
+    away = bs.find(t=>t.homeAway==="away") || away;
+    home = bs.find(t=>t.homeAway==="home") || home;
+  }
+
+  const tn = (t)=> t?.team?.shortDisplayName || t?.team?.abbreviation || t?.team?.displayName || "Team";
+  const ts = (t)=> Number(t?.score ?? t?.statistics?.find?.(s=>s.name==="points")?.value ?? 0);
+
+  const awayName = tn(away), homeName = tn(home);
+  const awayScore = ts(away),  homeScore = ts(home);
   return { awayName, homeName, awayScore, homeScore };
 }
-const normalize = n=>String(n).trim().replace(/\./g,"").replace(/\bState\b/gi,"St").replace(/\s+/g," ");
-const matchup = (a,h)=>`${normalize(a)} @ ${normalize(h)}`;
+
+const normalize=n=>String(n).trim().replace(/\./g,"").replace(/\bState\b/gi,"St").replace(/\s+/g," ");
+const matchup=(a,h)=>`${normalize(a)} @ ${normalize(h)}`;
 function kickoffISO(sum){ return pick(sum,"header.competitions.0.date") || pick(sum,"competitions.0.date") || null; }
 function etDateStr(iso){
   if(!iso) return "";
@@ -56,21 +76,20 @@ function etDateStr(iso){
   const fx=t=>parts.find(x=>x.type===t)?.value||"";
   return `${fx("month")}/${fx("day")}/${fx("year")}`;
 }
-const ms = m => Math.max(60_000, Math.round(m*60_000));
-function decideSleep(period, clock){
+const ms=m=>Math.max(60_000,Math.round(m*60_000));
+function decideSleep(p,clock){
   let mins=20;
-  if (Number(period)===2) {
-    const m=/(\d{1,2}):(\d{2})/.exec(clock||"");
-    if(m){ const left=Number(m[1])+Number(m[2])/60; if(left<=10) mins=Math.max(1, Math.ceil(left*2)); }
+  if(Number(p)===2){
+    const m=/(\d{1,2}):(\d{2})/.exec(clock||""); if(m){ const left=+m[1]+(+m[2])/60; if(left<=10) mins=Math.max(1,Math.ceil(left*2)); }
   }
-  if (DEBUG_MODE) mins = Math.min(mins, 0.2); // ~12s
+  if (DEBUG_MODE) mins=Math.min(mins,0.2); // ~12s
   return mins;
 }
 
 // ----- Sheets -----
 async function sheetsClient(){
-  const creds = JSON.parse(SA_JSON);
-  const jwt = new google.auth.JWT(creds.client_email,null,creds.private_key,["https://www.googleapis.com/auth/spreadsheets"]);
+  const creds=JSON.parse(SA_JSON);
+  const jwt=new google.auth.JWT(creds.client_email,null,creds.private_key,["https://www.googleapis.com/auth/spreadsheets"]);
   await jwt.authorize();
   return google.sheets({version:"v4",auth:jwt});
 }
@@ -79,9 +98,9 @@ async function findRowIndex(sheets, dateET, mu){
   const res=await sheets.spreadsheets.values.get({spreadsheetId:SHEET_ID,range});
   const rows=res.data.values||[];
   if(!rows.length) return -1;
-  const header=rows[0].map(h=>h.toLowerCase());
-  const iDate=header.findIndex(h=>h.startsWith("date"));
-  const iMu=header.findIndex(h=>h==="matchup");
+  const hdr=rows[0].map(h=>h.toLowerCase());
+  const iDate=hdr.findIndex(h=>h.startsWith("date"));
+  const iMu=hdr.findIndex(h=>h==="matchup");
   if(iDate<0||iMu<0) return -1;
   for(let i=1;i<rows.length;i++){
     const r=rows[i]||[], d=(r[iDate]||"").trim(), m=(r[iMu]||"").trim();
@@ -89,7 +108,7 @@ async function findRowIndex(sheets, dateET, mu){
   }
   return -1;
 }
-async function writeHalftime(sheets, rowIndex, vals){
+async function writeHalftime(sheets,rowIdx,vals){
   const hdr=(await sheets.spreadsheets.values.get({spreadsheetId:SHEET_ID,range:`${TAB_NAME}!A1:Z1`})).data.values?.[0]||[];
   const map={
     "Status": vals.status,
@@ -99,7 +118,7 @@ async function writeHalftime(sheets, rowIndex, vals){
     "Live Home Spread": vals.liveHomeSpread,
     "Live Home ML": vals.liveHomeMl,
     "Live Total": vals.liveTotal,
-    // fallbacks if sheet lacks "Live ..." headers:
+    // fallbacks:
     "Away Spread": vals.liveAwaySpread,
     "Away ML": vals.liveAwayMl,
     "Home Spread": vals.liveHomeSpread,
@@ -112,51 +131,45 @@ async function writeHalftime(sheets, rowIndex, vals){
     const j=hdr.findIndex(h=>h.trim().toLowerCase()===k.toLowerCase());
     if(j>=0){
       const col=String.fromCharCode("A".charCodeAt(0)+j);
-      const row=rowIndex+2; // header + 1-based
+      const row=rowIdx+2;
       updates.push({range:`${TAB_NAME}!${col}${row}`, values:[[v]]});
     }
   });
-  if(!updates.length){ console.log("No writable columns found or nothing to write."); return 0; }
-  await sheets.spreadsheets.values.batchUpdate({
-    spreadsheetId:SHEET_ID,
-    requestBody:{ valueInputOption:"USER_ENTERED", data:updates }
-  });
+  if(!updates.length){ console.log("No writable columns or nothing to write."); return 0; }
+  await sheets.spreadsheets.values.batchUpdate({ spreadsheetId:SHEET_ID, requestBody:{ valueInputOption:"USER_ENTERED", data:updates }});
   return updates.length;
 }
 
-// ----- MAIN -----
-(async () => {
-  const sheets = await sheetsClient();
+// ----- main -----
+(async()=>{
+  const sheets=await sheetsClient();
   let total=0;
   for(;;){
-    const sum = await fetchJson(`https://site.api.espn.com/apis/site/v2/sports/football/college-football/summary?event=${EVENT_ID}`);
-    const st = parseStatus(sum);
-    const tm = getTeams(sum);
-    const dateET = etDateStr(kickoffISO(sum));
-    const mu = matchup(tm.awayName, tm.homeName);
+    const sum=await fetchJson(`https://site.api.espn.com/apis/site/v2/sports/football/college-football/summary?event=${EVENT_ID}`);
+    const st=parseStatus(sum);
+    const tm=getTeams(sum);
+    const dateET=etDateStr(kickoffISO(sum));
+    const mu=matchup(tm.awayName, tm.homeName);
 
-    // Always log real details for debugging
-    console.log(
-      `[${st.shortDetail || st.state || "unknown"}] ${mu}  Q${st.period || 0}  (clock ${st.displayClock})`
-    );
+    console.log(`[${st.shortDetail || st.state || "unknown"}] ${mu}  Q${st.period||0}  (clock ${st.displayClock})`);
 
     const isHalftime = /halftime/i.test(st.shortDetail)
       || (st.state==="in" && Number(st.period)===2 && /^0?:?0{1,2}\b/.test(st.displayClock||""));
 
     if (isHalftime) {
       const halfScore = `${tm.awayScore}-${tm.homeScore}`;
-      const vals = { status:"Halftime", halfScore };
       const rowIdx = await findRowIndex(sheets, dateET, mu);
-      if (rowIdx<0) { console.log(`No matching row for Date=${dateET} & Matchup="${mu}".`); return; }
-      const wrote = await writeHalftime(sheets, rowIdx, vals);
+      if (rowIdx<0){ console.log(`No matching row for Date=${dateET} & Matchup="${mu}".`); return; }
+      const wrote = await writeHalftime(sheets,rowIdx,{status:"Halftime",halfScore});
       console.log(`✅ wrote ${wrote} cell(s).`);
       return;
     }
 
-    const sleepM = decideSleep(st.period, st.displayClock);
+    const sleepM=decideSleep(st.period, st.displayClock);
     console.log(`Sleeping ${sleepM}m (${sleepM*60}s)…`);
-    await new Promise(r=>setTimeout(r, ms(sleepM)));
+    await new Promise(r=>setTimeout(r, Math.max(60_000, Math.round(sleepM*60_000))));
     total+=sleepM;
     if(total>=MAX_TOTAL_MIN){ console.log("⏹ Reached MAX_TOTAL_MIN, exiting."); return; }
   }
-})().catch(e=>{ console.error("Fatal:", e); process.exit(1); });
+})().catch(e=>{ console.error("Fatal:",e); process.exit(1); });
+'@ | Set-Content -Encoding UTF8 .\cfb-halftime-check.mjs
