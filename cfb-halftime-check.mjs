@@ -33,6 +33,7 @@ function parseStatus(sum){
   };
 }
 
+// Try multiple places for teams: header/competitions, competitions, boxscore.teams
 function getTeams(sum){
   let away, home;
 
@@ -107,6 +108,7 @@ async function writeHalftime(sheets,rowIdx,vals){
     "Live Home Spread": vals.liveHomeSpread,
     "Live Home ML": vals.liveHomeMl,
     "Live Total": vals.liveTotal,
+    // fallbacks:
     "Away Spread": vals.liveAwaySpread,
     "Away ML": vals.liveAwayMl,
     "Home Spread": vals.liveHomeSpread,
