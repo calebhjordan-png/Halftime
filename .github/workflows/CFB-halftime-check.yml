@@ -3,7 +3,7 @@ on:
   workflow_dispatch:
     inputs:
       game_id:
-        description: "ESPN Game ID (e.g., 401530820)"
+        description: "ESPN Game ID (e.g., 401530881)"
         required: true
 
 jobs:
