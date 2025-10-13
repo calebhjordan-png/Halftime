@@ -91,16 +91,27 @@ async function applyCenterFormatting(sheets){
   vlog("Applied center alignment A–P");
 }
 
-/** 🔥 Wipe ALL conditional-format rules on the sheet, then add clean H rules */
+/** 🔥 SAFE reset of ALL conditional-format rules, then add clean H rules */
 async function resetAndApplyHFormatting(sheets){
   const sid = await sheetIdByTitle(sheets, SHEET_ID, TAB_NAME);
   if (!sid) return;
 
-  // Brutally delete the first 60 rules (Google silently ignores out-of-range)
-  const deletions = Array.from({length:60}, (_,i)=>({ deleteConditionalFormatRule: { index: 0, sheetId: sid } }));
+  // Get current conditional-format rules to know how many to delete
+  const meta = await sheets.spreadsheets.get({
+    spreadsheetId: SHEET_ID,
+    fields: "sheets(properties(sheetId,title),conditionalFormats)",
+  });
+  const sheet = (meta.data.sheets || []).find(s => s.properties?.sheetId === sid);
+  const cf = sheet?.conditionalFormats || [];
+  const count = cf.length || 0;
+
+  const deleteReqs = [];
+  for (let idx = count - 1; idx >= 0; idx--) {
+    deleteReqs.push({ deleteConditionalFormatRule: { sheetId: sid, index: idx } });
+  }
 
   const range = { sheetId: sid, startColumnIndex: 7, endColumnIndex: 8, startRowIndex: 1 }; // H2:H
-  const rules = [
+  const addReqs = [
     // Push -> yellow
     {
       addConditionalFormatRule: {
@@ -167,27 +178,26 @@ async function resetAndApplyHFormatting(sheets){
     }
   ];
 
-  await sheets.spreadsheets.batchUpdate({
-    spreadsheetId: SHEET_ID,
-    requestBody: { requests: [...deletions, ...rules] }
-  });
-  log("🎨 Reset all conditional formats and reapplied H rules.");
+  const requests = [...deleteReqs, ...addReqs];
+  if (requests.length) {
+    await sheets.spreadsheets.batchUpdate({
+      spreadsheetId: SHEET_ID,
+      requestBody: { requests }
+    });
+  }
+  log(`🎨 Reset ${count} existing CF rules; applied fresh H rules.`);
 }
 
 /** Underline favorite inside D (Matchup) using textFormatRuns */
 async function underlineFavoriteInMatchup(sheets, rowNum, matchup, fav){ // fav: 'away'|'home'|null
-  if (!fav) return; // nothing to do
+  if (!fav) return;
   const sid = await sheetIdByTitle(sheets, SHEET_ID, TAB_NAME);
   if (!sid) return;
 
   const parts = matchup.split(" @ ");
   if (parts.length !== 2) return;
-  const awayTxt = parts[0];
-  const homeTxt = parts[1];
-  const sep = " @ ";
-  const full = `${awayTxt}${sep}${homeTxt}`;
+  const awayTxt = parts[0], homeTxt = parts[1], sep = " @ ", full = `${awayTxt}${sep}${homeTxt}`;
 
-  // underline only the favorite
   const runs = [];
   if (fav === "away"){
     runs.push({ startIndex: 0, format: { underline: true }});
@@ -203,11 +213,8 @@ async function underlineFavoriteInMatchup(sheets, rowNum, matchup, fav){ // fav:
     requestBody: {
       requests: [{
         updateCells: {
-          range: { sheetId: sid, startRowIndex: rowNum-1, endRowIndex: rowNum, startColumnIndex: 3, endColumnIndex: 4 }, // D
-          rows: [{ values: [{
-            userEnteredValue: { stringValue: full },
-            textFormatRuns: runs
-          }]}],
+          range: { sheetId: sid, startRowIndex: rowNum-1, endRowIndex: rowNum, startColumnIndex: 3, endColumnIndex: 4 },
+          rows: [{ values: [{ userEnteredValue: { stringValue: full }, textFormatRuns: runs }]}],
           fields: "userEnteredValue,textFormatRuns"
         }
       }]
@@ -255,7 +262,6 @@ async function scrapeLiveOdds(league, gameId){
         const liveAwayML     = (mlMatches[0]||"").trim();
         const liveHomeML     = (mlMatches[1]||"").trim();
 
-        // crude half score fallback
         let halfScore = "";
         try {
           const bodyTxt = (await page.locator("body").innerText()).replace(/\s+/g," ");
@@ -289,10 +295,10 @@ async function scrapeLiveOdds(league, gameId){
   await applyCenterFormatting(sheets);
   await resetAndApplyHFormatting(sheets);
 
-  // Dates to fetch: today (+ yesterday if daily / week scope)
+  // Dates to fetch: today (+ yesterday if daily/week scope)
   const today = new Date();
   const dates = RUN_SCOPE === "week"
-    ? [ yyyymmddET(addDays(today,-1)), yyyymmddET(today) ] // yesterday + today covers late games
+    ? [ yyyymmddET(addDays(today,-1)), yyyymmddET(today) ]
     : [ yyyymmddET(today) ];
 
   // Load sheet header + body once
@@ -338,7 +344,7 @@ async function scrapeLiveOdds(league, gameId){
       if (!rowNum && matchRows.length === 1){ rowNum = matchRows[0]; }
       if (!rowNum){ continue; }
 
-      // Favorite underline calc (use current sheet spreads if present, else ESPN odds later)
+      // Favorite underline calc from current sheet spreads
       const rowVals = list[rowNum-1] || [];
       const awaySpread = Number.parseFloat((rowVals[iAwaySp] ?? "").toString().replace("+",""));
       const homeSpread = Number.parseFloat((rowVals[iHomeSp] ?? "").toString().replace("+",""));
@@ -357,7 +363,7 @@ async function scrapeLiveOdds(league, gameId){
         });
       };
 
-      // 🔒 Always write finals when present
+      // Always write finals when present
       if (isFinal){
         const awayScore = Number(awayC?.score ?? "");
         const homeScore = Number(homeC?.score ?? "");
@@ -387,7 +393,6 @@ async function scrapeLiveOdds(league, gameId){
           spreadsheetId: SHEET_ID,
           requestBody: { valueInputOption: "USER_ENTERED", data: updates }
         });
-        // apply favorite underline (after we might have updated spreads next time)
         await underlineFavoriteInMatchup(sheets, rowNum, matchup, fav);
       }
     }
