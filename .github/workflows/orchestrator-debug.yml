@@ -1,4 +1,4 @@
-name: 🧪 Orchestrator Debug (on-demand)
+name: 🧪 Orchestrator Debug (Matchup + Live Lines)
 
 on:
   workflow_dispatch:
@@ -8,17 +8,25 @@ on:
         required: true
         default: "nfl"
       tab:
-        description: "Sheet tab name (NFL or CFB)"
+        description: "Sheet tab name"
         required: true
         default: "NFL"
+      matchup:
+        description: "Exact matchup text (example: 49ers @ Buccaneers)"
+        required: true
+        default: ""
       run_scope:
         description: "today | week"
         required: true
         default: "today"
+      force_live:
+        description: "Force write live lines even if not halftime? (true/false)"
+        required: true
+        default: "true"
       debug_level:
         description: "0=normal, 1=verbose, 2=trace"
         required: true
-        default: "1"
+        default: "2"
 
 jobs:
   debug:
@@ -45,12 +53,14 @@ jobs:
           GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
           LEAGUE: ${{ github.event.inputs.league }}
           TAB_NAME: ${{ github.event.inputs.tab }}
+          MATCHUP_FILTER: ${{ github.event.inputs.matchup }}
           RUN_SCOPE: ${{ github.event.inputs.run_scope }}
-          DEBUG_LEVEL: ${{ github.event.inputs.debug_level }}   # 0/1/2
+          FORCE_LIVE: ${{ github.event.inputs.force_live }}
+          DEBUG_LEVEL: ${{ github.event.inputs.debug_level }}
         run: |
           node orchestrator.mjs | tee orchestrator.log
 
-      - name: Upload debug logs
+      - name: Upload debug artifacts
         uses: actions/upload-artifact@v4
         with:
           name: orchestrator-debug
