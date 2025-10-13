@@ -1,0 +1,60 @@
+name: 🧪 Orchestrator Debug (on-demand)
+
+on:
+  workflow_dispatch:
+    inputs:
+      league:
+        description: "nfl or college-football"
+        required: true
+        default: "nfl"
+      tab:
+        description: "Sheet tab name (NFL or CFB)"
+        required: true
+        default: "NFL"
+      run_scope:
+        description: "today | week"
+        required: true
+        default: "today"
+      debug_level:
+        description: "0=normal, 1=verbose, 2=trace"
+        required: true
+        default: "1"
+
+jobs:
+  debug:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install deps
+        run: npm ci
+
+      - name: Install Playwright browsers
+        run: npx playwright install --with-deps chromium
+
+      - name: Run orchestrator (debug)
+        env:
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+          GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
+          LEAGUE: ${{ github.event.inputs.league }}
+          TAB_NAME: ${{ github.event.inputs.tab }}
+          RUN_SCOPE: ${{ github.event.inputs.run_scope }}
+          DEBUG_LEVEL: ${{ github.event.inputs.debug_level }}   # 0/1/2
+        run: |
+          node orchestrator.mjs | tee orchestrator.log
+
+      - name: Upload debug logs
+        uses: actions/upload-artifact@v4
+        with:
+          name: orchestrator-debug
+          path: |
+            orchestrator.log
+            trace.zip
+            live-*.json
