@@ -88,45 +88,99 @@ async function applyCenterFormatting(sheets){
   vlog("Applied center alignment A–P");
 }
 
-/** Conditional formatting for column H (Home Spread) */
+/** Conditional formatting for column H (Home Spread)
+ *  Rules (in order of priority):
+ *   1) Final + pushes -> yellow
+ *   2) Final + home covers -> green
+ *   3) Final + home doesn't cover -> red
+ *   4) Not final -> sign tint (H<0 green, H>0 red)
+ */
 async function applyHomeSpreadFormatting(sheets){
   const sid = await sheetIdByTitle(sheets, SHEET_ID, TAB_NAME);
   if (!sid) return;
 
-  // Clear a few top rules slots then add ours (robust even if none exist)
-  const requests = [
+  // wipe a few slots to avoid duplicates; harmless if none exist
+  const wipe = [
     { deleteConditionalFormatRule: { index: 0, sheetId: sid } },
     { deleteConditionalFormatRule: { index: 0, sheetId: sid } },
     { deleteConditionalFormatRule: { index: 0, sheetId: sid } },
-    // H>0 red
+    { deleteConditionalFormatRule: { index: 0, sheetId: sid } }
+  ];
+
+  const range = { sheetId: sid, startColumnIndex: 7, endColumnIndex: 8, startRowIndex: 1 }; // H2:H
+
+  const rules = [
+    // Push = 0 -> yellow
     {
       addConditionalFormatRule: {
         rule: {
-          ranges: [{ sheetId: sid, startColumnIndex: 7, endColumnIndex: 8, startRowIndex: 1 }], // H2:H
+          ranges: [range],
           booleanRule: {
-            condition: { type: "CUSTOM_FORMULA", values: [{ userEnteredValue: "=H2>0" }] },
+            condition: { type: "CUSTOM_FORMULA", values: [{ userEnteredValue: "=AND($C2=\"Final\", (VALUE(INDEX(SPLIT($E2,\"-\"),2)) - VALUE(INDEX(SPLIT($E2,\"-\"),1)) + VALUE($H2))=0)" }] },
+            format: { backgroundColor: { red: 1, green: 1, blue: 0.7 } }
+          }
+        },
+        index: 0
+      }
+    },
+    // Final + home covers -> green
+    {
+      addConditionalFormatRule: {
+        rule: {
+          ranges: [range],
+          booleanRule: {
+            condition: { type: "CUSTOM_FORMULA", values: [{ userEnteredValue: "=AND($C2=\"Final\", (VALUE(INDEX(SPLIT($E2,\"-\"),2)) - VALUE(INDEX(SPLIT($E2,\"-\"),1)) + VALUE($H2))>0)" }] },
+            format: { backgroundColor: { red: 0.85, green: 1, blue: 0.85 } }
+          }
+        },
+        index: 0
+      }
+    },
+    // Final + home doesn't cover -> red
+    {
+      addConditionalFormatRule: {
+        rule: {
+          ranges: [range],
+          booleanRule: {
+            condition: { type: "CUSTOM_FORMULA", values: [{ userEnteredValue: "=AND($C2=\"Final\", (VALUE(INDEX(SPLIT($E2,\"-\"),2)) - VALUE(INDEX(SPLIT($E2,\"-\"),1)) + VALUE($H2))<0)" }] },
             format: { backgroundColor: { red: 1, green: 0.85, blue: 0.85 } }
           }
         },
         index: 0
       }
     },
-    // H<0 green
+    // Not Final: sign-based tint (soft)
     {
       addConditionalFormatRule: {
         rule: {
-          ranges: [{ sheetId: sid, startColumnIndex: 7, endColumnIndex: 8, startRowIndex: 1 }],
+          ranges: [range],
           booleanRule: {
-            condition: { type: "CUSTOM_FORMULA", values: [{ userEnteredValue: "=H2<0" }] },
-            format: { backgroundColor: { red: 0.85, green: 1, blue: 0.85 } }
+            condition: { type: "CUSTOM_FORMULA", values: [{ userEnteredValue: "=AND($C2<>\"Final\", $H2<0)" }] },
+            format: { backgroundColor: { red: 0.9, green: 1, blue: 0.9 } }
           }
         },
-        index: 0
+        index: 1
+      }
+    },
+    {
+      addConditionalFormatRule: {
+        rule: {
+          ranges: [range],
+          booleanRule: {
+            condition: { type: "CUSTOM_FORMULA", values: [{ userEnteredValue: "=AND($C2<>\"Final\", $H2>0)" }] },
+            format: { backgroundColor: { red: 1, green: 0.9, blue: 0.9 } }
+          }
+        },
+        index: 1
       }
     }
   ];
-  await sheets.spreadsheets.batchUpdate({ spreadsheetId: SHEET_ID, requestBody: { requests } });
-  log("🎨 Applied conditional formatting to H (Home Spread)");
+
+  await sheets.spreadsheets.batchUpdate({
+    spreadsheetId: SHEET_ID,
+    requestBody: { requests: [...wipe, ...rules] }
+  });
+  log("🎨 Applied conditional formatting to H (Home Spread) with Final logic");
 }
 
 /** ===== HTTP ===== */
@@ -171,7 +225,7 @@ async function scrapeLiveOdds(league, gameId){
         const liveAwayML     = (mlMatches[0]||"").trim();
         const liveHomeML     = (mlMatches[1]||"").trim();
 
-        // crude half score fallback from body
+        // crude half score fallback
         let halfScore = "";
         try {
           const bodyTxt = (await page.locator("body").innerText()).replace(/\s+/g," ");
@@ -209,39 +263,36 @@ async function scrapeLiveOdds(league, gameId){
   await applyCenterFormatting(sheets);
   await applyHomeSpreadFormatting(sheets);
 
-  // Get scoreboard
+  // Scoreboard
   const dateKey = RUN_SCOPE === "week" ? yyyymmddET(new Date()) : yyyymmddET(new Date());
   const url = scoreboardUrl(LEAGUE, dateKey);
   const data = await fetchJson(url);
   const events = data.events || [];
   log(`Found ${events.length} ${LEAGUE.toUpperCase()} events`);
 
-  // Get header/rows
+  // Sheet data
   const header = (await sheets.spreadsheets.values.get({ spreadsheetId:SHEET_ID, range:`${TAB_NAME}!A1:Z1` })).data.values?.[0] || [];
   const hmap = headerMap(header);
-  const list = (await sheets.spreadsheets.values.get({ spreadsheetId:SHEET_ID, range:`${TAB_NAME}!A1:P4000` })).data.values || [];
+  const list = (await sheets.spreadsheets.values.get({ spreadsheetId:SHEET_ID, range:`${TAB_NAME}!A1:P5000` })).data.values || [];
   const iDate = hmap["date"], iMu = hmap["matchup"];
 
   for (const ev of events){
     const comp = ev.competitions?.[0] || {};
-    const awayTeam = comp.competitors?.find(c=>c.homeAway==="away")?.team?.shortDisplayName || "Away";
-    const homeTeam = comp.competitors?.find(c=>c.homeAway==="home")?.team?.shortDisplayName || "Home";
+    const awayC = comp.competitors?.find(c=>c.homeAway==="away");
+    const homeC = comp.competitors?.find(c=>c.homeAway==="home");
+    const awayTeam = awayC?.team?.shortDisplayName || "Away";
+    const homeTeam = homeC?.team?.shortDisplayName || "Home";
     const matchup  = `${awayTeam} @ ${homeTeam}`;
-    const status   = (ev.status?.type?.name || "").toUpperCase();
+    const statusObj = ev.status?.type || comp.status?.type || {};
+    const statusName = (statusObj.name || "").toUpperCase();
+    const isFinal = Boolean(statusObj.completed) || statusName.includes("STATUS_FINAL") || statusName.includes("FINAL");
+    const isHalftime = statusName.includes("HALF");
+    const isInProg = statusName.includes("STATUS_IN_PROGRESS") || statusName.includes("INPROGRESS") || statusName.includes("ENDOFHALF") || isHalftime;
     const dateET   = fmtETDate(ev.date);
 
-    const isHalftime = status.includes("HALF");
-    const isInProg = status.includes("STATUS_IN_PROGRESS") || status.includes("INPROGRESS") || status.includes("ENDOFHALF") || isHalftime;
-
-    // Filter by chosen matchup if provided
+    // filter to one matchup if asked
     if (MATCHUP_FILTER && matchup.toLowerCase() !== MATCHUP_FILTER.toLowerCase()){
       vlog(`Skip ${matchup} (filter=${MATCHUP_FILTER})`);
-      continue;
-    }
-
-    // Only skip if not in-play/halftime and NOT forcing live
-    if (!isInProg && !isHalftime && !FORCE_LIVE){
-      vlog(`Skip ${matchup} (not in progress/halftime)`);
       continue;
     }
 
@@ -253,14 +304,6 @@ async function scrapeLiveOdds(league, gameId){
     }
     if (!rowNum){ wlog("No sheet row for", dateET, matchup); continue; }
 
-    // Scrape LIVE odds
-    const live = await scrapeLiveOdds(LEAGUE, ev.id);
-    if (!live){ continue; }
-
-    // Persist debug JSON per game
-    try { fs.writeFileSync(`live-${ev.id}.json`, JSON.stringify({ matchup, status, ...live }, null, 2)); } catch {}
-
-    // Prepare updates
     const updates = [];
     const put = (name, val)=>{
       const idx = hmap[name];
@@ -271,24 +314,39 @@ async function scrapeLiveOdds(league, gameId){
       });
     };
 
-    // Always set status to "Half" when writing halftime; otherwise preserve current?
-    // For debugging we keep it explicit if forcing live
-    put("status", isHalftime ? "Half" : (FORCE_LIVE ? "Live" : "Half"));
-    put("half score", live.halfScore);
-    put("live away spread", live.liveAwaySpread);
-    put("live away ml", live.liveAwayML);
-    put("live home spread", live.liveHomeSpread);
-    put("live home ml", live.liveHomeML);
-    put("live total", live.liveTotal);
+    // If final, write final status & score first
+    if (isFinal){
+      const awayScore = Number(awayC?.score ?? "");
+      const homeScore = Number(homeC?.score ?? "");
+      if (!Number.isNaN(awayScore) && !Number.isNaN(homeScore)){
+        put("final score", `${awayScore}-${homeScore}`);  // E
+      }
+      put("status", "Final"); // C
+    }
+
+    // Live odds: write when in-progress/halftime or if forcing live in debug
+    if (isInProg || isHalftime || FORCE_LIVE){
+      const live = await scrapeLiveOdds(LEAGUE, ev.id);
+      if (live){
+        try { fs.writeFileSync(`live-${ev.id}.json`, JSON.stringify({ matchup, isFinal, ...live }, null, 2)); } catch {}
+        put("half score", live.halfScore);
+        put("live away spread", live.liveAwaySpread);
+        put("live away ml", live.liveAwayML);
+        put("live home spread", live.liveHomeSpread);
+        put("live home ml", live.liveHomeML);
+        put("live total", live.liveTotal);
+        if (!isFinal) put("status", isHalftime ? "Half" : "Live");
+      }
+    }
 
     if (updates.length){
       await sheets.spreadsheets.values.batchUpdate({
         spreadsheetId: SHEET_ID,
         requestBody: { valueInputOption: "USER_ENTERED", data: updates }
       });
-      log(`✅ Wrote live lines for ${matchup} (row ${rowNum})`);
+      log(`✅ Updated ${matchup} (row ${rowNum})`);
     } else {
-      vlog("No updates for", matchup);
+      vlog("No changes for", matchup);
     }
   }
 
