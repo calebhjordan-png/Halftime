@@ -1,49 +1,37 @@
-name: 🏈 NFL Halftime Automation
+name: 🏈 NFL Halftime (Daily Morning Schedule)
 
 on:
-  workflow_dispatch:
   schedule:
-    # Runs every 15 minutes on gamedays; adjust as needed
-    - cron: "*/15 * * * *"
+    # 9:00 AM Eastern (13:00 UTC) daily
+    - cron: "0 13 * * *"
+  workflow_dispatch:  # optional manual trigger
 
 jobs:
-  halftime:
+  nfl-halftime-daily:
     runs-on: ubuntu-latest
-
     steps:
-      # --- CHECKOUT REPO ---
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # --- SETUP NODE ---
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: 20
 
-      # --- INSTALL DEPENDENCIES ---
       - name: Install dependencies
-        run: |
-          npm ci
+        run: npm ci
 
-      # --- INSTALL PLAYWRIGHT (BROWSERS + SYSTEM LIBS) ---
       - name: Install Playwright browsers
-        run: |
-          npx playwright install --with-deps chromium
+        run: npx playwright install --with-deps chromium
 
-      # --- RUN ORCHESTRATOR ---
-      - name: Run Orchestrator (Live + Halftime Updates)
+      - name: Run Orchestrator (Pregame + Halftime + Live odds write)
         env:
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
           GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
           LEAGUE: nfl
           TAB_NAME: NFL
-          RUN_SCOPE: today
+          RUN_SCOPE: week
           ADAPTIVE_HALFTIME: "1"
           HALFTIME_EARLY_MIN: "60"
           HALFTIME_LATE_MIN: "90"
         run: node orchestrator.mjs
-
-      # --- VERIFY SHEET UPDATE (optional logging) ---
-      - name: Confirm completion
-        run: echo "✅ Halftime run complete — data written to Google Sheet."
