@@ -1,0 +1,25 @@
+name: Live Manual Check
+
+on:
+  workflow_dispatch:
+    inputs:
+      league: { description: "nfl | college-football", required: true, default: "nfl" }
+      game_id: { description: "ESPN gameId", required: true }
+      tab: { description: "Sheet tab", required: false, default: "NFL" }
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20 }
+      - run: npm i googleapis
+      - env:
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+          GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
+          LEAGUE: ${{ github.event.inputs.league }}
+          TAB_NAME: ${{ github.event.inputs.tab }}
+          TARGET_GAME_ID: ${{ github.event.inputs.game_id }}
+          MAX_TOTAL_MIN: 200
+        run: node live-game.mjs
