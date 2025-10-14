@@ -1,4 +1,4 @@
-name: 🏈 NFL Live (Daily Planner)
+name: 🎓 NFL Live (Daily Planner)
 
 on:
   schedule: [ { cron: "0 6 * * *" } ]  # ~02:00 ET
