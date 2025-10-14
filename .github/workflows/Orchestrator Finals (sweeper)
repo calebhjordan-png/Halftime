@@ -1,0 +1,30 @@
+name: Orchestrator Finals (sweeper)
+
+on:
+  schedule:
+    - cron: "*/15 17-6 * * *"  # every 15m ~1pm–2am UTC (tune as needed)
+  workflow_dispatch:
+
+jobs:
+  sweep:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        league: [nfl, college-football]
+        include:
+          - league: nfl
+            tab: NFL
+          - league: college-football
+            tab: CFB
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20 }
+      - run: npm i googleapis
+      - env:
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+          GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
+          LEAGUE: ${{ matrix.league }}
+          TAB_NAME: ${{ matrix.tab }}
+          RUN_SCOPE: today
+        run: node orchestrator.mjs
