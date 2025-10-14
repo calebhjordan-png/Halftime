@@ -2,7 +2,8 @@ name: Orchestrator Finals (sweeper)
 
 on:
   schedule:
-    - cron: "*/15 17-6 * * *"  # every 15m ~1pm–2am UTC (tune as needed)
+    - cron: '*/15 17-23 * * *'  # 1 PM–11 PM UTC (9 AM–7 PM ET)
+    - cron: '*/15 0-2 * * *'    # 12 AM–2 AM UTC (8 PM–10 PM ET)
   workflow_dispatch:
 
 jobs:
@@ -16,12 +17,21 @@ jobs:
             tab: NFL
           - league: college-football
             tab: CFB
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with: { node-version: 20 }
-      - run: npm i googleapis
-      - env:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install deps
+        run: npm i googleapis
+
+      - name: Run orchestrator finals sweep
+        env:
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
           GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
           LEAGUE: ${{ matrix.league }}
