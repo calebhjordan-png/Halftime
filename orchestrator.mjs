@@ -1,260 +1,316 @@
-// orchestrator.mjs
 import { google } from "googleapis";
-import * as fs from "node:fs";
-import * as playwright from "playwright";
 
-/* ========= ENV ========= */
-const SHEET_ID   = (process.env.GOOGLE_SHEET_ID || "").trim();
-const CREDS_RAW  = (process.env.GOOGLE_SERVICE_ACCOUNT || "").trim();
-const LEAGUE     = (process.env.LEAGUE || "nfl").toLowerCase();             // nfl | college-football
-const TAB_NAME   = (process.env.TAB_NAME || (LEAGUE==="college-football"?"CFB":"NFL")).trim();
-const RUN_SCOPE  = (process.env.RUN_SCOPE || "today").toLowerCase();        // today | week
-const MATCHUP_FILTER = (process.env.MATCHUP_FILTER || "").trim();
-const FORCE_LIVE     = String(process.env.FORCE_LIVE || "false").toLowerCase()==="true";
-const DEBUG_LEVEL    = Number(process.env.DEBUG_LEVEL ?? 0);
+/** ====== CONFIG ====== */
+const SHEET_ID  = (process.env.GOOGLE_SHEET_ID || "").trim();
+const CREDS_RAW = (process.env.GOOGLE_SERVICE_ACCOUNT || "").trim();
+const LEAGUE    = (process.env.LEAGUE || "nfl").toLowerCase(); // "nfl" | "college-football"
+const TAB_NAME  = (process.env.TAB_NAME || (LEAGUE==="college-football"?"CFB":"NFL")).trim();
+const RUN_SCOPE = (process.env.RUN_SCOPE || "today").toLowerCase(); // "today" | "week"
 
-/* ========= Utils ========= */
-const log=(...a)=>console.log(...a);
-const wlog=(...a)=>console.warn("[warn]",...a);
-const num=v=>Number.parseFloat(String(v).replace("+",""));
-const ET_TZ="America/New_York";
-const fmtETDate=d=>new Intl.DateTimeFormat("en-US",{timeZone:ET_TZ,year:"numeric",month:"numeric",day:"numeric"}).format(new Date(d));
-function yyyymmddET(d=new Date()){
-  const p=new Intl.DateTimeFormat("en-US",{timeZone:ET_TZ,year:"numeric",month:"2-digit",day:"2-digit"}).formatToParts(new Date(d));
-  const g=k=>p.find(x=>x.type===k)?.value||""; return `${g("year")}${g("month")}${g("day")}`;
+/** ====== Helpers ====== */
+function parseServiceAccount(raw) {
+  if (!raw) throw new Error("GOOGLE_SERVICE_ACCOUNT is empty");
+  if (raw.trim().startsWith("{")) return JSON.parse(raw);
+  return JSON.parse(Buffer.from(raw, "base64").toString("utf8"));
 }
-const addDays=(d,n)=>{const t=new Date(d);t.setDate(t.getDate()+n);return t;};
-const colLetter=i=>String.fromCharCode(65+i);
-const headerMap=h=>{const m={}; (h||[]).forEach((v,i)=>m[(v||"").toLowerCase()]=i); return m;};
+const ET_TZ = "America/New_York";
+const log = (...a)=>console.log(...a);
 
-/* ========= Sheets ========= */
-function sheetsClient(){
-  const creds = CREDS_RAW.trim().startsWith("{") ? JSON.parse(CREDS_RAW) : JSON.parse(Buffer.from(CREDS_RAW,"base64").toString("utf8"));
-  const auth = new google.auth.GoogleAuth({
-    credentials:{client_email:creds.client_email, private_key:creds.private_key},
-    scopes:["https://www.googleapis.com/auth/spreadsheets"]
-  });
-  return google.sheets({version:"v4", auth});
+function fmtETTime(dateLike) {
+  return new Intl.DateTimeFormat("en-US", {
+    timeZone: ET_TZ, hour: "numeric", minute: "2-digit", hour12: true
+  }).format(new Date(dateLike));
 }
-async function sheetIdByTitle(sheets, spreadsheetId, title){
-  const meta = await sheets.spreadsheets.get({ spreadsheetId });
-  return meta.data.sheets?.find(s=>s.properties?.title===title)?.properties?.sheetId ?? null;
+function fmtETDate(dateLike) {
+  return new Intl.DateTimeFormat("en-US", {
+    timeZone: ET_TZ, year: "numeric", month: "numeric", day: "numeric"
+  }).format(new Date(dateLike));
 }
-
-/* ========= Conditional Formatting (Final-aware) =========
-   F (Away Spread): Final -> cover/push/no-cover vs final score; else no color
-   G (Away ML):     Final -> green if away won; red if lost
-   H (Home Spread): Final -> cover/push/no-cover; Not Final -> soft sign tint
-   I (Home ML):     Final -> green if home won; red if lost
-   J (Total):       Final -> Over green / Under red / Push yellow
-   All formulas use VALUE() so +2.5 etc. work as numbers.
-*/
-async function resetAndApplyFormatting(sheets){
-  const sid = await sheetIdByTitle(sheets, SHEET_ID, TAB_NAME);
-  if (!sid) return;
-
-  const meta = await sheets.spreadsheets.get({
-    spreadsheetId: SHEET_ID,
-    fields: "sheets(properties(sheetId,title),conditionalFormats)"
-  });
-  const sheet = (meta.data.sheets || []).find(s => s.properties?.sheetId === sid);
-  const count = sheet?.conditionalFormats?.length || 0;
-
-  const deleteReqs = [];
-  for(let i=count-1;i>=0;i--) deleteReqs.push({ deleteConditionalFormatRule:{ sheetId:sid, index:i } });
-
-  const rng = (c0)=>({ sheetId:sid, startColumnIndex:c0, endColumnIndex:c0+1, startRowIndex:1 });
-  const add = (c0, formula, bg)=>({ addConditionalFormatRule:{ rule:{ ranges:[rng(c0)], booleanRule:{ condition:{ type:"CUSTOM_FORMULA", values:[{userEnteredValue:formula}] }, format:{ backgroundColor:bg } } }, index:0 } });
-  const color=(r,g,b)=>({red:r,green:g,blue:b});
-  const green=color(0.85,1,0.85), red=color(1,0.85,0.85), yellow=color(1,1,0.7), softG=color(0.92,1,0.92), softR=color(1,0.92,0.92);
-
-  // helpers in formulas
-  // margin = home - away; sum = home + away
-  const MARGIN = "(VALUE(INDEX(SPLIT($E2,\"-\"),2)) - VALUE(INDEX(SPLIT($E2,\"-\"),1)))";
-  const SUM    = "(VALUE(INDEX(SPLIT($E2,\"-\"),2)) + VALUE(INDEX(SPLIT($E2,\"-\"),1)))";
-
-  const reqs = [
-    ...deleteReqs,
-
-    // ----- H (Home Spread): Final cover/push/no-cover + not-final sign tint
-    add(7, `=AND($C2="Final", ${MARGIN} + VALUE($H2)=0)`, yellow),
-    add(7, `=AND($C2="Final", ${MARGIN} + VALUE($H2)>0)`, green),
-    add(7, `=AND($C2="Final", ${MARGIN} + VALUE($H2)<0)`, red),
-    add(7, `=AND($C2<>"Final", VALUE($H2)<0)`, softG),
-    add(7, `=AND($C2<>"Final", VALUE($H2)>0)`, softR),
-
-    // ----- F (Away Spread): Final cover/push/no-cover against away side
-    // away cover test: (away - home + F) > 0  -> (-margin + F) > 0
-    add(5, `=AND($C2="Final", -${MARGIN} + VALUE($F2)=0)`, yellow),
-    add(5, `=AND($C2="Final", -${MARGIN} + VALUE($F2)>0)`, green),
-    add(5, `=AND($C2="Final", -${MARGIN} + VALUE($F2)<0)`, red),
-
-    // ----- G (Away ML): Final -> green if away won; red otherwise
-    add(6, `=AND($C2="Final", VALUE(INDEX(SPLIT($E2,"-"),1)) > VALUE(INDEX(SPLIT($E2,"-"),2)))`, green),
-    add(6, `=AND($C2="Final", VALUE(INDEX(SPLIT($E2,"-"),1)) < VALUE(INDEX(SPLIT($E2,"-"),2)))`, red),
-
-    // ----- I (Home ML): Final -> green if home won; red otherwise
-    add(8, `=AND($C2="Final", VALUE(INDEX(SPLIT($E2,"-"),2)) > VALUE(INDEX(SPLIT($E2,"-"),1)))`, green),
-    add(8, `=AND($C2="Final", VALUE(INDEX(SPLIT($E2,"-"),2)) < VALUE(INDEX(SPLIT($E2,"-"),1)))`, red),
-
-    // ----- J (Total): Final Over/Under/Push
-    add(9, `=AND($C2="Final", ${SUM} - VALUE($J2)>0)`, green),
-    add(9, `=AND($C2="Final", ${SUM} - VALUE($J2)<0)`, red),
-    add(9, `=AND($C2="Final", ${SUM} - VALUE($J2)=0)`, yellow),
-  ];
-
-  await sheets.spreadsheets.batchUpdate({ spreadsheetId:SHEET_ID, requestBody:{ requests:reqs }});
-  log("🎨 Rebuilt CF: Final-aware F,G,H,I,J (and soft tints for H when not final).");
+function yyyymmddInET(d=new Date()) {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: ET_TZ, year: "numeric", month: "2-digit", day: "2-digit"
+  }).formatToParts(new Date(d));
+  const g = t => parts.find(p=>p.type===t)?.value || "";
+  return `${g("year")}${g("month")}${g("day")}`;
+}
+async function fetchJson(url) {
+  const res = await fetch(url, { headers: { "User-Agent": "orchestrator/trimmed", "Referer":"https://www.espn.com/" } });
+  if (!res.ok) throw new Error(`Fetch failed ${res.status} ${url}`);
+  return res.json();
+}
+function normLeague(league) {
+  return (league === "ncaaf" || league === "college-football") ? "college-football" : "nfl";
+}
+function scoreboardUrl(league, dates) {
+  const lg = normLeague(league);
+  const extra = lg === "college-football" ? "&groups=80&limit=300" : "";
+  return `https://site.api.espn.com/apis/site/v2/sports/football/${lg}/scoreboard?dates=${dates}${extra}`;
+}
+function mapHeadersToIndex(headerRow) {
+  const map = {}; headerRow.forEach((h,i)=> map[(h||"").trim().toLowerCase()] = i);
+  return map;
+}
+function keyOf(dateStr, matchup) { return `${(dateStr||"").trim()}__${(matchup||"").trim()}`; }
+function pickOdds(oddsArr=[]) {
+  if (!Array.isArray(oddsArr) || oddsArr.length === 0) return null;
+  const espnBet =
+    oddsArr.find(o => /espn\s*bet/i.test(o.provider?.name || "")) ||
+    oddsArr.find(o => /espn bet/i.test(o.provider?.displayName || ""));
+  return espnBet || oddsArr[0];
+}
+function numOrBlank(v) {
+  if (v === 0) return "0";
+  if (v == null) return "";
+  const s = String(v).trim();
+  const n = parseFloat(s.replace(/[^\d.+-]/g, ""));
+  if (!Number.isFinite(n)) return "";
+  return s.startsWith("+") ? `+${n}` : `${n}`;
 }
 
-/* ========= Matchup styling (favorite underline + winner bold) ========= */
-function favoriteBySpreads(awaySpread, homeSpread){
-  const a=num(awaySpread), h=num(homeSpread);
-  if (Number.isNaN(a) || Number.isNaN(h)) return null;
-  if (a===h) return null;
-  // team with the MORE NEGATIVE spread is favorite
-  return (a < h) ? "away" : "home";
-}
-function matchupTextRuns(matchup, fav, winner){
-  const parts = matchup.split(" @ ");
-  if (parts.length!==2) return null;
-  const away=parts[0], home=parts[1], sep=" @ ", full=`${away}${sep}${home}`;
-  const fmtAway = { underline: fav==="away" || undefined, bold: winner==="away" || undefined };
-  const fmtHome = { underline: fav==="home" || undefined, bold: winner==="home" || undefined };
-  return { full, runs:[ {startIndex:0, format:fmtAway}, {startIndex:away.length+sep.length, format:fmtHome} ] };
-}
-async function styleMatchupCell(sheets, rowNum, matchup, fav, winner){
-  const sid = await sheetIdByTitle(sheets, SHEET_ID, TAB_NAME);
-  if (!sid) return;
-  const mr = matchupTextRuns(matchup, fav, winner);
-  if (!mr) return;
-  await sheets.spreadsheets.batchUpdate({
-    spreadsheetId:SHEET_ID,
-    requestBody:{ requests:[{
-      updateCells:{
-        range:{ sheetId:sid, startRowIndex:rowNum-1, endRowIndex:rowNum, startColumnIndex:3, endColumnIndex:4 },
-        rows:[{ values:[{ userEnteredValue:{ stringValue:mr.full }, textFormatRuns:mr.runs }]}],
-        fields:"userEnteredValue,textFormatRuns"
-      }
-    }]}
-  });
+/** ===== Headers we own ===== */
+const COLS = [
+  "Date","Week","Status","Matchup","Final Score",
+  "Away Spread","Away ML","Home Spread","Home ML","Total",
+  "Half Score","Live Away Spread","Live Away ML","Live Home Spread","Live Home ML","Live Total",
+  "Game ID","Last Pre-Half Status"
+];
+
+/** ===== Status formatting (ET) ===== */
+function tidyStatus(evt) {
+  const comp = evt.competitions?.[0] || {};
+  const tName = (evt.status?.type?.name || comp.status?.type?.name || "").toUpperCase();
+  const short = (evt.status?.type?.shortDetail || comp.status?.type?.shortDetail || "").trim();
+  if (tName.includes("FINAL")) return "Final";
+  if (tName.includes("HALFTIME")) return "Half";
+  if (tName.includes("IN_PROGRESS") || tName.includes("LIVE")) return short || "In Progress";
+  return fmtETTime(evt.date); // Scheduled time in ET
 }
 
-/* ========= ESPN + Live ========= */
-const scoreboardUrl=(league,date)=>{
-  const lg = league==="college-football" ? "college-football" : "nfl";
-  const extra = lg==="college-football" ? "&groups=80&limit=300" : "";
-  return `https://site.api.espn.com/apis/site/v2/sports/football/${lg}/scoreboard?dates=${date}${extra}`;
-};
-const gameUrl=(league,id)=>`https://www.espn.com/${league==="college-football"?"college-football":"nfl"}/game/_/gameId/${id}`;
-
-async function scrapeLiveOdds(league, gameId){
-  const url = gameUrl(league, gameId);
-  const browser = await playwright.chromium.launch({ headless:true });
-  const ctx = await browser.newContext();
-  if (DEBUG_LEVEL>=2) await ctx.tracing.start({ screenshots:true, snapshots:true });
-  const page = await ctx.newPage();
-  try{
-    await page.goto(url,{waitUntil:"domcontentloaded",timeout:60000});
-    await page.waitForTimeout(1500);
-    const txt=(await page.locator("body").innerText()).replace(/\s+/g," ");
-
-    const spreadMatches = txt.match(/(^|\s)([+-]\d+(?:\.\d+)?)(?=\s)/g) || [];
-    const totalAny      = txt.match(/\b(?:o|u)\s?(\d+(?:\.\d+)?)/i);
-    const mlMatches     = txt.match(/\s[+-]\d{2,4}\b/g) || [];
-
-    return {
-      liveAwaySpread:(spreadMatches[0]||"").trim(),
-      liveHomeSpread:(spreadMatches[1]||"").trim(),
-      liveTotal: totalAny ? totalAny[1] : "",
-      liveAwayML:(mlMatches[0]||"").trim(),
-      liveHomeML:(mlMatches[1]||"").trim()
-    };
-  } finally {
-    if (DEBUG_LEVEL>=2) await ctx.tracing.stop({ path:"trace.zip" });
-    await browser.close();
+/** ===== Week label ===== */
+function weekLabel(sb, eventDateISO) {
+  const lg = normLeague(LEAGUE);
+  if (lg === "nfl") {
+    const w = sb?.week?.number;
+    if (Number.isFinite(w)) return `Week ${w}`;
+  } else {
+    const t = (sb?.week?.text || "").trim();
+    if (t) return t;
   }
+  const cal = sb?.leagues?.[0]?.calendar || sb?.calendar || [];
+  const t = new Date(eventDateISO).getTime();
+  for (const item of cal) {
+    const entries = Array.isArray(item?.entries) ? item.entries : [item];
+    for (const e of entries) {
+      const label = (e?.label || e?.detail || e?.text || "").trim();
+      const s = new Date(e?.startDate || e?.start || 0).getTime();
+      const ed= new Date(e?.endDate   || e?.end   || 0).getTime();
+      if (t >= s && t <= ed) return label || "Regular Season";
+    }
+  }
+  return "Regular Season";
 }
 
-/* ========= MAIN ========= */
-(async function main(){
-  if (!SHEET_ID || !CREDS_RAW){
-    console.error("Missing GOOGLE_SHEET_ID or GOOGLE_SERVICE_ACCOUNT"); process.exit(1);
+/** ===== Moneylines extractor (PickCenter shapes, variants) ===== */
+function extractMoneylines(o, awayId, homeId, competitors = []) {
+  let awayML = "", homeML = "";
+  if (o && (o.awayTeamOdds || o.homeTeamOdds)) {
+    awayML = numOrBlank(o.awayTeamOdds?.moneyLine ?? o.awayTeamOdds?.moneyline);
+    homeML = numOrBlank(o.homeTeamOdds?.moneyLine ?? o.homeTeamOdds?.moneyline);
+    if (awayML || homeML) return { awayML, homeML };
   }
-  const sheets = sheetsClient();
+  if (o && o.moneyline && (o.moneyline.away || o.moneyline.home)) {
+    const a = numOrBlank(o.moneyline.away?.close?.odds ?? o.moneyline.away?.open?.odds);
+    const h = numOrBlank(o.moneyline.home?.close?.odds ?? o.moneyline.home?.open?.odds);
+    if (a || h) return { awayML:a, homeML:h };
+  }
+  if (Array.isArray(o?.teamOdds)) {
+    for (const t of o.teamOdds) {
+      const tid = String(t?.teamId ?? t?.team?.id ?? "");
+      const ml  = numOrBlank(t?.moneyLine ?? t?.moneyline);
+      if (!ml) continue;
+      if (tid === String(awayId)) awayML = awayML || ml;
+      if (tid === String(homeId)) homeML = homeML || ml;
+    }
+    if (awayML || homeML) return { awayML, homeML };
+  }
+  if (Array.isArray(o?.competitors)) {
+    const findML = c => numOrBlank(c?.moneyLine ?? c?.moneyline ?? c?.odds?.moneyLine ?? c?.odds?.moneyline);
+    const aML = findML(o.competitors.find(c => String(c?.id ?? c?.teamId) === String(awayId)));
+    const hML = findML(o.competitors.find(c => String(c?.id ?? c?.teamId) === String(homeId)));
+    if (aML || hML) return { awayML:aML||"", homeML:hML||"" };
+  }
+  return { awayML, homeML };
+}
 
-  // Rebuild formatting each run so it's consistent
-  await resetAndApplyFormatting(sheets);
+/** ===== Pregame row builder (no halftime) ===== */
+function pregameRowFactory(sbForDay) {
+  return function pregameRow(event) {
+    const comp = event.competitions?.[0] || {};
+    const away = comp.competitors?.find(c => c.homeAway === "away");
+    const home = comp.competitors?.find(c => c.homeAway === "home");
 
-  const header = (await sheets.spreadsheets.values.get({ spreadsheetId:SHEET_ID, range:`${TAB_NAME}!A1:Z1` })).data.values?.[0]||[];
-  const hmap = headerMap(header);
-  const list = (await sheets.spreadsheets.values.get({ spreadsheetId:SHEET_ID, range:`${TAB_NAME}!A1:P6000` })).data.values||[];
-  const iDate=hmap["date"], iMu=hmap["matchup"], iAwaySp=hmap["away spread"], iHomeSp=hmap["home spread"];
+    const awayName = away?.team?.shortDisplayName || away?.team?.abbreviation || away?.team?.name || "Away";
+    const homeName = home?.team?.shortDisplayName || home?.team?.abbreviation || home?.team?.name || "Home";
+    const matchup  = `${awayName} @ ${homeName}`;
+    const dateET   = fmtETDate(event.date);
+    const weekText = weekLabel(sbForDay, event.date);
+    const status   = tidyStatus(event);
 
-  const today = new Date();
-  const dates = RUN_SCOPE==="week" ? [ yyyymmddET(addDays(today,-1)), yyyymmddET(today) ] : [ yyyymmddET(today) ];
-
-  for (const dateStr of dates){
-    const data = await (await fetch(scoreboardUrl(LEAGUE,dateStr))).json();
-    for (const ev of (data.events||[])){
-      const comp=ev.competitions?.[0]||{};
-      const awayC=comp.competitors?.find(c=>c.homeAway==="away");
-      const homeC=comp.competitors?.find(c=>c.homeAway==="home");
-      const away=awayC?.team?.shortDisplayName||"Away";
-      const home=homeC?.team?.shortDisplayName||"Home";
-      const matchup=`${away} @ ${home}`;
-      const status=(ev.status?.type?.name||"").toUpperCase();
-      const isFinal=status.includes("FINAL");
-      const isHalf=status.includes("HALF");
-      const isInProg=status.includes("PROGRESS");
-      const dateET=fmtETDate(ev.date);
-
-      if (MATCHUP_FILTER && matchup.toLowerCase()!==MATCHUP_FILTER.toLowerCase()) continue;
-
-      // find row by Date+Matchup
-      let rowNum=0;
-      for(let r=1;r<list.length;r++){
-        const row=list[r]||[];
-        if ((row[iMu]||"")===matchup && (row[iDate]||"")===dateET){ rowNum=r+1; break; }
-      }
-      if (!rowNum) continue;
-
-      const rowVals=list[rowNum-1]||[];
-      const updates=[]; const put=(n,v)=>{ const i=hmap[n]; if(i===undefined||v===undefined||v===null||v==="") return; updates.push({range:`${TAB_NAME}!${colLetter(i)}${rowNum}:${colLetter(i)}${rowNum}`,values:[[v]]}); };
-
-      // Finals: always write
-      let winner=null;
-      if (isFinal){
-        const a=Number(awayC?.score ?? ""), h=Number(homeC?.score ?? "");
-        if (!Number.isNaN(a) && !Number.isNaN(h)){ put("final score", `${a}-${h}`); winner = a>h ? "away" : (h>a ? "home" : null); }
-        put("status","Final");
-      }
-
-      // Live odds if needed
-      if (isInProg || isHalf || FORCE_LIVE){
-        const live = await scrapeLiveOdds(LEAGUE, ev.id);
-        if (live){
-          put("live away spread", live.liveAwaySpread);
-          put("live home spread", live.liveHomeSpread);
-          put("live away ml",    live.liveAwayML);
-          put("live home ml",    live.liveHomeML);
-          put("live total",      live.liveTotal);
-          if (!isFinal) put("status", isHalf ? "Half" : "Live");
+    // Odds (pregame)
+    const o0 = pickOdds(comp.odds || event.odds || []);
+    let awaySpread = "", homeSpread = "", total = "", awayML = "", homeML = "";
+    if (o0) {
+      total = (o0.overUnder ?? o0.total) ?? "";
+      const favId = String(o0.favorite || o0.favoriteTeamId || "");
+      // spread sign by favorite
+      const sp = Number.isFinite(Number(o0.spread)) ? Number(o0.spread) :
+                 (typeof o0.spread === "string" ? parseFloat(o0.spread) : NaN);
+      if (!Number.isNaN(sp) && favId) {
+        if (String(away?.team?.id||"") === favId) {
+          awaySpread = `-${Math.abs(sp)}`; homeSpread = `+${Math.abs(sp)}`;
+        } else if (String(home?.team?.id||"") === favId) {
+          homeSpread = `-${Math.abs(sp)}`; awaySpread = `+${Math.abs(sp)}`;
         }
       }
+      const ml = extractMoneylines(o0, away?.team?.id, home?.team?.id, comp.competitors||[]);
+      awayML = ml.awayML || ""; homeML = ml.homeML || "";
+    }
 
-      if (updates.length){
+    const finalScore = /FINAL/i.test(event.status?.type?.name || comp.status?.type?.name || "")
+      ? `${away?.score ?? ""}-${home?.score ?? ""}` : "";
+
+    return {
+      values: [
+        dateET, weekText, status, matchup, finalScore,
+        awaySpread, String(awayML||""), homeSpread, String(homeML||""), String(total||""),
+        "", "", "", "", "", "",  // live columns (not our responsibility)
+        String(event.id),        // Game ID
+        ""                       // Last Pre-Half Status (written by live engine)
+      ],
+      dateET, matchup
+    };
+  };
+}
+
+/** ====== MAIN (no halftime logic) ====== */
+(async function main() {
+  if (!SHEET_ID || !CREDS_RAW) {
+    console.error("Missing secrets.");
+    process.exit(1);
+  }
+  const CREDS = parseServiceAccount(CREDS_RAW);
+  const auth = new google.auth.GoogleAuth({
+    credentials: { client_email: CREDS.client_email, private_key: CREDS.private_key },
+    scopes: ["https://www.googleapis.com/auth/spreadsheets"],
+  });
+  const sheets = google.sheets({ version: "v4", auth });
+
+  // Ensure tab + headers
+  const meta = await sheets.spreadsheets.get({ spreadsheetId: SHEET_ID });
+  const tabs = (meta.data.sheets || []).map(s => s.properties?.title);
+  if (!tabs.includes(TAB_NAME)) {
+    await sheets.spreadsheets.batchUpdate({
+      spreadsheetId: SHEET_ID,
+      requestBody: { requests: [{ addSheet: { properties: { title: TAB_NAME } } }] }
+    });
+  }
+  const read = await sheets.spreadsheets.values.get({ spreadsheetId: SHEET_ID, range: `${TAB_NAME}!A1:Z` });
+  const values = read.data.values || [];
+  let header = values[0] || [];
+  if (header.length === 0) {
+    await sheets.spreadsheets.values.update({
+      spreadsheetId: SHEET_ID, range: `${TAB_NAME}!A1`,
+      valueInputOption: "RAW", requestBody: { values: [COLS] }
+    });
+    header = COLS.slice();
+  } else {
+    // upgrade header if missing new columns
+    const lower = header.map(h=>(h||"").toLowerCase());
+    const wantLower = COLS.map(c=>c.toLowerCase());
+    if (wantLower.some(c=>!lower.includes(c))) {
+      const merged = Array.from(new Set([...header, ...COLS])).slice(0, COLS.length);
+      await sheets.spreadsheets.values.update({
+        spreadsheetId: SHEET_ID, range: `${TAB_NAME}!A1`,
+        valueInputOption: "RAW", requestBody: { values: [merged] }
+      });
+      header = merged;
+    }
+  }
+  const hmap = mapHeadersToIndex(header);
+
+  const datesList = RUN_SCOPE === "week"
+    ? (()=>{ const start = new Date(); return Array.from({length:7}, (_,i)=> yyyymmddInET(new Date(start.getTime()+i*86400000))); })()
+    : [ yyyymmddInET(new Date()) ];
+
+  // Pull events
+  let firstDaySB = null;
+  let events = [];
+  for (const d of datesList) {
+    const sb = await fetchJson(scoreboardUrl(LEAGUE, d));
+    if (!firstDaySB) firstDaySB = sb;
+    events = events.concat(sb?.events || []);
+  }
+  const seen = new Set(); events = events.filter(e => !seen.has(e.id) && seen.add(e.id));
+  log(`Events found: ${events.length}`);
+
+  // Build pregame rows & index existing rows
+  const rows = values.slice(1);
+  const keyToRowNum = new Map();
+  rows.forEach((r, i) => {
+    const key = keyOf(r[hmap["date"]], r[hmap["matchup"]]);
+    keyToRowNum.set(key, i + 2);
+  });
+
+  const buildPregame = pregameRowFactory(firstDaySB);
+  const appendBatch = [];
+  for (const ev of events) {
+    const { values: rowVals, dateET, matchup } = buildPregame(ev);
+    const k = keyOf(dateET, matchup);
+    if (!keyToRowNum.has(k)) appendBatch.push(rowVals);
+  }
+  if (appendBatch.length) {
+    await sheets.spreadsheets.values.append({
+      spreadsheetId: SHEET_ID, range: `${TAB_NAME}!A1`,
+      valueInputOption: "RAW", requestBody: { values: appendBatch },
+    });
+    log(`✅ Appended ${appendBatch.length} pregame row(s).`);
+  }
+
+  // Finals pass (no halftime writes here)
+  const fresh = await sheets.spreadsheets.values.get({ spreadsheetId: SHEET_ID, range: `${TAB_NAME}!A1:Z` });
+  const hdr2 = fresh.data.values?.[0] || header;
+  const h2 = mapHeadersToIndex(hdr2);
+  const current = (fresh.data.values || []).slice(1);
+  const rowByKey = new Map();
+  current.forEach((r,i)=> rowByKey.set(keyOf(r[h2["date"]], r[h2["matchup"]]), i+2));
+
+  for (const ev of events) {
+    const comp = ev.competitions?.[0] || {};
+    const away = comp.competitors?.find(c => c.homeAway === "away");
+    const home = comp.competitors?.find(c => c.homeAway === "home");
+    const matchup = `${away?.team?.shortDisplayName||"Away"} @ ${home?.team?.shortDisplayName||"Home"}`;
+    const dateET = fmtETDate(ev.date);
+    const rowNum = rowByKey.get(keyOf(dateET, matchup));
+    if (!rowNum) continue;
+
+    const isFinal = /FINAL/i.test(ev.status?.type?.name || comp.status?.type?.name || "");
+    if (isFinal) {
+      const scorePair = `${away?.score ?? ""}-${home?.score ?? ""}`;
+      const data = [];
+      const add = (name,val) => {
+        const idx = h2[name.toLowerCase()]; if (idx==null) return;
+        const col = String.fromCharCode("A".charCodeAt(0)+idx);
+        data.push({ range:`${TAB_NAME}!${col}${rowNum}`, values:[[val]] });
+      };
+      add("final score", scorePair);
+      add("status", "Final");
+      if (data.length) {
         await sheets.spreadsheets.values.batchUpdate({
-          spreadsheetId:SHEET_ID,
-          requestBody:{ valueInputOption:"USER_ENTERED", data:updates }
+          spreadsheetId: SHEET_ID, requestBody: { valueInputOption:"RAW", data }
         });
       }
-
-      // Favorite from spreads; style D with underline+bold
-      const fav = favoriteBySpreads(rowVals[iAwaySp], rowVals[iHomeSp]);
-      await styleMatchupCell(sheets, rowNum, matchup, fav, winner);
     }
   }
 
-  log("✅ Orchestrator complete");
-})().catch(e=>{ console.error("FATAL", e); process.exit(1); });
+  log("✅ Orchestrator complete (pregame + finals only).");
+})().catch(err => { console.error("❌ Error:", err); process.exit(1); });
