@@ -1,4 +1,4 @@
-name: NFL Halftime (single game)
+name: NFL Halftime Manual Check
 
 on:
   workflow_dispatch:
@@ -7,7 +7,7 @@ on:
         description: "ESPN NFL gameId (e.g., 401671234)"
         required: true
       tab_name:
-        description: "Sheet tab"
+        description: "Sheet tab (default NFL)"
         required: false
         default: "NFL"
 
@@ -17,9 +17,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
-        with: { node-version: 20 }
+        with:
+          node-version: 20
       - run: npm i googleapis
-      - name: Watch single game to halftime
+      - name: Run single-game NFL halftime check
         env:
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
           GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
