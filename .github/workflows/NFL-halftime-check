@@ -1,0 +1,29 @@
+name: NFL Halftime (single game)
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_game_id:
+        description: "ESPN NFL gameId (e.g., 401671234)"
+        required: true
+      tab_name:
+        description: "Sheet tab"
+        required: false
+        default: "NFL"
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20 }
+      - run: npm i googleapis
+      - name: Watch single game to halftime
+        env:
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+          GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
+          TAB_NAME: ${{ github.event.inputs.tab_name }}
+          TARGET_GAME_ID: ${{ github.event.inputs.target_game_id }}
+          MAX_TOTAL_MIN: 200
+        run: node nfl-halftime-check.mjs
