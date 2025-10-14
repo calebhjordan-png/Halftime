@@ -1,15 +1,14 @@
-name: 🎓 CFB Live (Daily Planner)
+name: CFB Live (Daily Planner)
 
 on:
-  # Nightly planner for next day's college football games
   schedule:
-    - cron: "0 6 * * *"    # ~02:00 ET (adjust as needed)
+    - cron: '0 6 * * *'
   workflow_dispatch:
     inputs:
       target_date_et:
-        description: "YYYYMMDD (blank = tomorrow ET)"
+        description: 'YYYYMMDD (blank = tomorrow ET)'
         required: false
-        default: ""
+        default: ''
 
 jobs:
   plan:
@@ -17,46 +16,42 @@ jobs:
     outputs:
       games: ${{ steps.out.outputs.games }}
     steps:
-      - uses: actions/setup-node@v4
+      - name: Setup Node
+        uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: '20'
+
       - id: out
-        name: Fetch tomorrow's CFB games from ESPN
+        name: Fetch tomorrow's CFB games
         run: |
-          node - <<'NODE'
-          const tz="America/New_York";
-          const input=(process.env.INPUT||"").trim();
-
-          function toYYYYMMDD(d){
-            const p=new Intl.DateTimeFormat("en-US",{timeZone:tz,year:"numeric",month:"2-digit",day:"2-digit"}).formatToParts(d);
-            const g=k=>p.find(x=>x.type===k)?.value||"";
-            return `${g("year")}${g("month")}${g("day")}`;
-          }
-          function tomorrow(){
-            const now=new Date();
-            const parts=new Intl.DateTimeFormat("en-US",{timeZone:tz,year:"numeric",month:"2-digit",day:"2-digit"}).formatToParts(now);
-            const y=+parts.find(p=>p.type==="year").value;
-            const m=+parts.find(p=>p.type==="month").value;
-            const d=+parts.find(p=>p.type==="day").value;
-            const etMid=new Date(Date.UTC(y,m-1,d,5)); // ET ≈ UTC-5 anchor
-            return toYYYYMMDD(new Date(etMid.getTime()+86400000));
-          }
-
-          const yyyymmdd = (/^\d{8}$/.test(input)?input:tomorrow());
-          const url=`https://site.api.espn.com/apis/site/v2/sports/football/college-football/scoreboard?dates=${yyyymmdd}&groups=80&limit=300`;
-          console.log("GET", url);
-
-          fetch(url, { headers: { "User-Agent":"cfb-live-daily/1.0" } })
-            .then(r=>r.json())
-            .then(sb=>{
-              const seen=new Set();
-              const games=(sb.events||[]).filter(e=>e&&!seen.has(e.id)&&seen.add(e.id))
-                .map(e=>({game_id:e.id, kickoff_epoch: Math.floor(new Date(e.date).getTime()/1000)}));
-              require('fs').appendFileSync(process.env.GITHUB_OUTPUT, `games=${JSON.stringify(games)}\n`);
-              console.log("Games:", games);
-            })
-            .catch(e=>{ console.error(e); process.exit(1); });
-          NODE
+          node -e "
+          (async () => {
+            const tz='America/New_York';
+            const input=(process.env.INPUT||'').trim();
+            function toYYYYMMDD(d){
+              const p=new Intl.DateTimeFormat('en-US',{timeZone:tz,year:'numeric',month:'2-digit',day:'2-digit'}).formatToParts(d);
+              const g=k=>p.find(x=>x.type===k)?.value||'';
+              return `${g('year')}${g('month')}${g('day')}`;
+            }
+            function tomorrow(){
+              const now=new Date();
+              const p=new Intl.DateTimeFormat('en-US',{timeZone:tz,year:'numeric',month:'2-digit',day:'2-digit'}).formatToParts(now);
+              const y=+p.find(q=>q.type==='year').value, m=+p.find(q=>q.type==='month').value, d=+p.find(q=>q.type==='day').value;
+              const etMid=new Date(Date.UTC(y,m-1,d,5));
+              return toYYYYMMDD(new Date(etMid.getTime()+86400000));
+            }
+            const yyyymmdd = (/^\\d{8}$/.test(input) ? input : tomorrow());
+            const url = `https://site.api.espn.com/apis/site/v2/sports/football/college-football/scoreboard?dates=${yyyymmdd}&groups=80&limit=300`;
+            const res = await fetch(url,{headers:{'User-Agent':'cfb-live-daily/1.0'}});
+            if(!res.ok) throw new Error('HTTP '+res.status);
+            const sb = await res.json();
+            const seen = new Set();
+            const games = (sb.events||[])
+              .filter(e=>e && !seen.has(e.id) && seen.add(e.id))
+              .map(e=>({ game_id: e.id, kickoff_epoch: Math.floor(new Date(e.date).getTime()/1000) }));
+            require('fs').appendFileSync(process.env.GITHUB_OUTPUT, 'games='+JSON.stringify(games)+'\\n');
+          })().catch(e=>{console.error(e);process.exit(1);});
+          "
         env:
           INPUT: ${{ github.event.inputs.target_date_et }}
 
@@ -71,26 +66,30 @@ jobs:
     concurrency:
       group: cfb-live-${{ matrix.game_id }}
       cancel-in-progress: false
-
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
         with:
-          node-version: 20
-      - run: npm i googleapis
+          node-version: '20'
+
+      - name: Install deps
+        run: npm i googleapis
 
       - name: Sleep until kickoff+60
         env:
           WAKE_OFFSET_MIN: ${{ vars.WAKE_OFFSET_MIN || 60 }}
         run: |
           NOW=$(date +%s)
-          TARGET=$(( ${{ matrix.kickoff_epoch }} + ${WAKE_OFFSET_MIN}*60 ))
+          TARGET=$(( ${{ matrix.kickoff_epoch }} + WAKE_OFFSET_MIN*60 ))
           WAIT=$(( TARGET - NOW ))
           [ $WAIT -lt 0 ] && WAIT=0
-          echo "Sleeping $WAIT sec for game ${{ matrix.game_id }}"
+          echo "Sleeping $WAIT sec for ${{ matrix.game_id }}"
           sleep $WAIT
 
-      - name: Run live engine for this game
+      - name: Start live engine
         env:
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
           GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
