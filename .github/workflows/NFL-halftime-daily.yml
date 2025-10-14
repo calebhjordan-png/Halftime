@@ -1,0 +1,114 @@
+name: NFL Halftime (daily planner)
+
+on:
+  schedule:
+    - cron: "0 6 * * *"   # ~02:00 ET depending on DST
+  workflow_dispatch:
+    inputs:
+      target_date_et:
+        description: "ET date (YYYYMMDD). Blank = tomorrow in ET."
+        required: false
+        default: ""
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      games: ${{ steps.plan.outputs.games }}
+      plan_date_et: ${{ steps.plan.outputs.plan_date_et }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20 }
+
+      - id: plan
+        name: Build game matrix for target ET date
+        run: |
+          node - <<'NODE'
+          const tz = "America/New_York";
+          const input = process.env.INPUT_DATE_ET?.trim();
+
+          function toYYYYMMDD(d) {
+            const parts = new Intl.DateTimeFormat("en-US",{timeZone:tz,year:"numeric",month:"2-digit",day:"2-digit"}).formatToParts(d);
+            const g=k=>parts.find(p=>p.type===k)?.value||"";
+            return `${g("year")}${g("month")}${g("day")}`;
+          }
+          function tomorrowInET() {
+            const now = new Date();
+            const parts = new Intl.DateTimeFormat("en-US",{ timeZone: tz, year:"numeric", month:"2-digit", day:"2-digit" }).formatToParts(now);
+            const y = +parts.find(p=>p.type==="year").value;
+            const m = +parts.find(p=>p.type==="month").value;
+            const d = +parts.find(p=>p.type==="day").value;
+            // Build an ET "midnight" by anchoring with UTC and adding 1 day
+            const etMidnight = new Date(Date.UTC(y, m-1, d, 5)); // approx ET=UTC-5/4; safe anchor
+            const plus1 = new Date(etMidnight.getTime() + 86400000);
+            return toYYYYMMDD(plus1);
+          }
+
+          const yyyymmdd = (input && /^\d{8}$/.test(input)) ? input : tomorrowInET();
+          const url = `https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard?dates=${yyyymmdd}`;
+          console.log("GET", url);
+
+          fetch(url, { headers: { "User-Agent":"nfl-halftime-daily/1.0" } })
+            .then(r => { if(!r.ok) throw new Error("HTTP "+r.status); return r.json(); })
+            .then(sb => {
+              const events = Array.isArray(sb.events) ? sb.events : [];
+              const seen = new Set();
+              const games = events
+                .filter(e => e && !seen.has(e.id) && seen.add(e.id))
+                .map(e => {
+                  const when = Math.floor(new Date(e.date).getTime()/1000); // kickoff epoch seconds (UTC)
+                  return { game_id: e.id, kickoff_epoch: when };
+                });
+
+              const out = JSON.stringify(games);
+              console.log("plan_date_et="+yyyymmdd);
+              console.log("games="+out);
+
+              const fs = require('fs');
+              fs.appendFileSync(process.env.GITHUB_OUTPUT, `plan_date_et=${yyyymmdd}\n`);
+              fs.appendFileSync(process.env.GITHUB_OUTPUT, `games=${out}\n`);
+            })
+            .catch(err => { console.error("Planner failed:", err); process.exit(1); });
+          NODE
+        env:
+          INPUT_DATE_ET: ${{ github.event.inputs.target_date_et }}
+
+  watchers:
+    needs: plan
+    if: ${{ needs.plan.outputs.games != '' && needs.plan.outputs.games != '[]' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.plan.outputs.games) }}
+    concurrency:
+      group: nfl-halftime-${{ matrix.game_id }}
+      cancel-in-progress: false
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20 }
+      - run: npm i googleapis
+
+      - name: Sleep until kickoff+60
+        env:
+          WAKE_OFFSET_MIN: ${{ vars.WAKE_OFFSET_MIN || 60 }}
+        run: |
+          NOW=$(date +%s)
+          TARGET=$(( ${{ matrix.kickoff_epoch }} + ${WAKE_OFFSET_MIN}*60 ))
+          WAIT=$(( TARGET - NOW ))
+          if [ $WAIT -lt 0 ]; then WAIT=0; fi
+          echo "Sleeping $WAIT seconds for game ${{ matrix.game_id }} (kickoff+${WAKE_OFFSET_MIN}m)"
+          sleep $WAIT
+
+      - name: Run single-game halftime watcher
+        env:
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+          GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
+          TAB_NAME: NFL
+          TARGET_GAME_ID: ${{ matrix.game_id }}
+          MAX_TOTAL_MIN: 200
+        run: node nfl-halftime-check.mjs
