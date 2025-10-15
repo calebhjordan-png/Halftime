@@ -14,7 +14,7 @@ jobs:
     timeout-minutes: 15
 
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Setup Node.js
@@ -24,11 +24,8 @@ jobs:
 
       - name: Install dependencies
         run: |
-          # axios is required by orchestrator.mjs
           npm install googleapis axios
 
-      # Pull & refresh today's slate (pregame + live), and sweep finals.
-      # We purposely run this frequently; orchestrator is idempotent and cheap.
       - name: Update live board (today) + finals sweep
         env:
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
