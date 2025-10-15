@@ -18,6 +18,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
+<<<<<<< HEAD
           node-version: "20"
 
       - name: Install dependencies
@@ -32,3 +33,12 @@ jobs:
           TAB_NAME: CFB
           PREFILL_MODE: week
         run: node orchestrator.mjs
+=======
+          node-version: 22
+          cache: npm
+      - run: npm install
+      # No Playwright here
+      - run: node orchestrator.mjs
+
+# refresh workflow name cache
+>>>>>>> 5be2830 (Trigger GitHub Actions workflow name refresh)
