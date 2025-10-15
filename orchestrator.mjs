@@ -145,9 +145,12 @@ const colMap = (hdr = []) =>
         ? Array.from({ length: 7 }, (_, i) => yyyymmddET(addDaysET(Date.now(), i)))
         : [yyyymmddET(new Date())];
 
-    const scoreboards = (
-      await Promise.allSettled(dates.map(d => fetchJson(scoreboardUrl(LEAGUE, d)).then(j => ({ d, j })))))
-    ).filter(r => r.status === "fulfilled").map(r => r.value);
+    const scoreboards = (await Promise.allSettled(
+  dates.map(d => fetchJson(scoreboardUrl(LEAGUE, d)).then(j => ({ d, j })))
+))
+  .filter(r => r.status === "fulfilled")
+  .map(r => r.value);
+
 
     const seen = new Set();
     const events = [];
@@ -264,3 +267,4 @@ const colMap = (hdr = []) =>
 
   console.log("✅ Finals sweep complete.");
 })();
+
