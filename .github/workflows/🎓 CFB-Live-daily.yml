@@ -2,7 +2,7 @@ name: CFB Live (Daily Planner)
 
 on:
   schedule:
-    - cron: '0 6 * * *'
+    - cron: '0 6 * * *'   # plan in the morning UTC
   workflow_dispatch:
     inputs:
       target_date_et:
@@ -24,34 +24,45 @@ jobs:
       - id: out
         name: Fetch tomorrow's CFB games
         run: |
-          node -e "
+          node - <<'NODE'
           (async () => {
-            const tz='America/New_York';
-            const input=(process.env.INPUT||'').trim();
-            function toYYYYMMDD(d){
-              const p=new Intl.DateTimeFormat('en-US',{timeZone:tz,year:'numeric',month:'2-digit',day:'2-digit'}).formatToParts(d);
-              const g=k=>p.find(x=>x.type===k)?.value||'';
+            const tz = 'America/New_York';
+            const input = (process.env.INPUT || '').trim();
+
+            function toYYYYMMDD(d) {
+              const p = new Intl.DateTimeFormat('en-US', { timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit' }).formatToParts(d);
+              const g = k => p.find(x => x.type === k)?.value || '';
               return `${g('year')}${g('month')}${g('day')}`;
             }
-            function tomorrow(){
-              const now=new Date();
-              const p=new Intl.DateTimeFormat('en-US',{timeZone:tz,year:'numeric',month:'2-digit',day:'2-digit'}).formatToParts(now);
-              const y=+p.find(q=>q.type==='year').value, m=+p.find(q=>q.type==='month').value, d=+p.find(q=>q.type==='day').value;
-              const etMid=new Date(Date.UTC(y,m-1,d,5));
-              return toYYYYMMDD(new Date(etMid.getTime()+86400000));
+            function tomorrowET() {
+              const now = new Date();
+              const parts = new Intl.DateTimeFormat('en-US', { timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit' }).formatToParts(now);
+              const y = +parts.find(p => p.type === 'year').value;
+              const m = +parts.find(p => p.type === 'month').value;
+              const d = +parts.find(p => p.type === 'day').value;
+              // midnight ET ≈ 05:00 UTC, then add one day
+              const etMid = new Date(Date.UTC(y, m - 1, d, 5));
+              return toYYYYMMDD(new Date(etMid.getTime() + 24 * 3600 * 1000));
             }
-            const yyyymmdd = (/^\\d{8}$/.test(input) ? input : tomorrow());
+
+            const yyyymmdd = (/^\d{8}$/.test(input) ? input : tomorrowET());
             const url = `https://site.api.espn.com/apis/site/v2/sports/football/college-football/scoreboard?dates=${yyyymmdd}&groups=80&limit=300`;
-            const res = await fetch(url,{headers:{'User-Agent':'cfb-live-daily/1.0'}});
-            if(!res.ok) throw new Error('HTTP '+res.status);
+
+            const res = await fetch(url, { headers: { 'User-Agent': 'cfb-live-daily/1.0' } });
+            if (!res.ok) throw new Error('HTTP ' + res.status);
             const sb = await res.json();
+
             const seen = new Set();
-            const games = (sb.events||[])
-              .filter(e=>e && !seen.has(e.id) && seen.add(e.id))
-              .map(e=>({ game_id: e.id, kickoff_epoch: Math.floor(new Date(e.date).getTime()/1000) }));
-            require('fs').appendFileSync(process.env.GITHUB_OUTPUT, 'games='+JSON.stringify(games)+'\\n');
-          })().catch(e=>{console.error(e);process.exit(1);});
-          "
+            const games = (sb.events || [])
+              .filter(e => e && !seen.has(e.id) && seen.add(e.id))
+              .map(e => ({
+                game_id: String(e.id),
+                kickoff_epoch: Math.floor(new Date(e.date).getTime() / 1000)
+              }));
+
+            require('fs').appendFileSync(process.env.GITHUB_OUTPUT, `games=${JSON.stringify(games)}\n`);
+          })().catch(err => { console.error(err); process.exit(1); });
+          NODE
         env:
           INPUT: ${{ github.event.inputs.target_date_et }}
 
