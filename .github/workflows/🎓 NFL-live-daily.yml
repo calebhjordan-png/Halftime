@@ -1,9 +1,9 @@
-name: NFL Games (Prefill - Full Week)
+name: CFB Games (Prefill - Full Week)
 
 on:
   schedule:
-    - cron: "30 10 * * 2"       # Tue 6:30 AM ET
-    - cron: "15 15 * * 0"       # Sun 11:15 AM ET
+    - cron: "15 11 * * 4,5,6"   # Thu/Fri/Sat 7:15 AM ET
+    - cron: "15 15 * * 6"       # Sat 11:15 AM ET
   workflow_dispatch:
 
 jobs:
@@ -14,12 +14,12 @@ jobs:
       - uses: actions/setup-node@v4
         with: { node-version: "20" }
       - run: npm i googleapis
-      - name: Prefill week (NFL)
+      - name: Prefill week (CFB)
         env:
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
           GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
-          LEAGUE: nfl
-          TAB_NAME: NFL
+          LEAGUE: college-football
+          TAB_NAME: CFB
           PREFILL_MODE: week      # ⬅️ important
           RUN_SCOPE: week
         run: node orchestrator.mjs
