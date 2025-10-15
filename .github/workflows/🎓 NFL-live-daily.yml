@@ -1,9 +1,8 @@
-name: 🏈 NFL Live (Daily Planner)
+name: NFL Live (Daily Planner)
 
 on:
-  # Run frequently on typical NFL days to refresh live lines, update finals, etc.
   schedule:
-    # Thu–Mon: every 10 minutes from ~11:00 AM ET through ~2:00 AM ET
+    # Thu–Mon, every 10 min from 11:00 AM ET to 2:00 AM ET
     - cron: "*/10 16-6 * * 4-1"
   workflow_dispatch:
 
