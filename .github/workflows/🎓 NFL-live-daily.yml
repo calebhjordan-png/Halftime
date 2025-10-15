@@ -1,25 +1,39 @@
-name: CFB Games (Prefill - Full Week)
+name: 🏈 NFL Live (Daily Planner)
 
 on:
+  # Run frequently on typical NFL days to refresh live lines, update finals, etc.
   schedule:
-    - cron: "15 11 * * 4,5,6"   # Thu/Fri/Sat 7:15 AM ET
-    - cron: "15 15 * * 6"       # Sat 11:15 AM ET
+    # Thu–Mon: every 10 minutes from ~11:00 AM ET through ~2:00 AM ET
+    - cron: "*/10 16-6 * * 4-1"
   workflow_dispatch:
 
 jobs:
-  prefill:
+  watchers:
+    name: live
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with: { node-version: "20" }
-      - run: npm i googleapis
-      - name: Prefill week (CFB)
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install dependencies
+        run: |
+          # axios is required by orchestrator.mjs
+          npm install googleapis axios
+
+      # Pull & refresh today's slate (pregame + live), and sweep finals.
+      # We purposely run this frequently; orchestrator is idempotent and cheap.
+      - name: Update live board (today) + finals sweep
         env:
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
           GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
-          LEAGUE: college-football
-          TAB_NAME: CFB
-          PREFILL_MODE: week      # ⬅️ important
-          RUN_SCOPE: week
+          LEAGUE: nfl
+          TAB_NAME: NFL
+          PREFILL_MODE: today
         run: node orchestrator.mjs
