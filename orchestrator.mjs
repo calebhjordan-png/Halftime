@@ -42,7 +42,7 @@ function fmtESPNDate(d) {
   return `${y}${m}${day}`;
 }
 
-// Display date: DD/MM/YY
+// Display date: DD/MM/YY  ← requested format
 function fmtDisplayDateDMY(d) {
   const dd = String(d.getDate()).padStart(2, "0");
   const mm = String(d.getMonth() + 1).padStart(2, "0");
@@ -82,8 +82,9 @@ function richTextUnderlineForMatchup(matchup, favSide, awayName, homeName) {
 
 /** Robust odds extraction:
  *  1) Prefer team spreads from awayTeamOdds/homeTeamOdds
- *  2) Else parse odds.details like "TEAM -2.5 O/U 55.5"
- *  3) Fill moneylines from odds or summary
+ *  2) Else parse odds.spread + favoriteDetails
+ *  3) Else parse odds.details text
+ *  4) Else infer from moneylines
  */
 function parseSpreadsFromOdds(odds, awayName, homeName, awayAbbr, homeAbbr) {
   let spreadAway = null;
@@ -98,7 +99,7 @@ function parseSpreadsFromOdds(odds, awayName, homeName, awayAbbr, homeAbbr) {
     return { spreadAway, spreadHome };
   }
 
-  // 2) Use odds.spread + favoriteDetails (numeric + favored team)
+  // 2) Use odds.spread + favoriteDetails
   const sVal = asNum(odds?.spread);
   if (sVal != null) {
     const favText = (odds?.favoriteDetails || "").toLowerCase();
@@ -108,73 +109,50 @@ function parseSpreadsFromOdds(odds, awayName, homeName, awayAbbr, homeAbbr) {
     const awayFav = awayKey.some(k => favText.includes(k));
     const homeFav = homeKey.some(k => favText.includes(k));
 
-    if (awayFav) {
-      spreadAway = -Math.abs(sVal);
-      spreadHome = Math.abs(sVal);
-      return { spreadAway, spreadHome };
-    }
-    if (homeFav) {
-      spreadHome = -Math.abs(sVal);
-      spreadAway = Math.abs(sVal);
-      return { spreadAway, spreadHome };
-    }
+    if (awayFav) return { spreadAway: -Math.abs(sVal), spreadHome: Math.abs(sVal) };
+    if (homeFav) return { spreadAway: Math.abs(sVal), spreadHome: -Math.abs(sVal) };
   }
 
-  // 3) Parse odds.details string (handles many ESPN formats)
+  // 3) Parse odds.details
   const details = (odds?.details || "").toLowerCase();
   if (details) {
-    const rxNum = /([+-]?\d+(?:\.\d+)?)/; // capture first signed number after team token
+    const rxNum = /([+-]?\d+(?:\.\d+)?)/; // first signed number after team token
 
-    const awayHitIdx = (() => {
-      for (const k of [awayName, awayAbbr].filter(Boolean)) {
+    const posOf = (nm, abbr) => {
+      for (const k of [nm, abbr].filter(Boolean)) {
         const i = details.indexOf(k.toLowerCase());
         if (i >= 0) return i;
       }
       return -1;
-    })();
+    };
+    const aIdx = posOf(awayName, awayAbbr);
+    const hIdx = posOf(homeName, homeAbbr);
 
-    const homeHitIdx = (() => {
-      for (const k of [homeName, homeAbbr].filter(Boolean)) {
-        const i = details.indexOf(k.toLowerCase());
-        if (i >= 0) return i;
-      }
-      return -1;
-    })();
-
-    const numAfter = (startIdx) => {
-      if (startIdx < 0) return null;
-      const tail = details.slice(startIdx);
-      const m = tail.match(rxNum);
+    const numAfter = (idx) => {
+      if (idx < 0) return null;
+      const m = details.slice(idx).match(rxNum);
       return m ? asNum(m[1]) : null;
     };
 
-    const aNum = numAfter(awayHitIdx);
-    const hNum = numAfter(homeHitIdx);
-
-    if (aNum != null && hNum != null) {
-      // If both present, choose the signed convention (favorite negative)
-      // If signs are not symmetric, accept as-is.
-      return { spreadAway: aNum, spreadHome: hNum };
-    }
-    if (aNum != null) return { spreadAway: aNum, spreadHome: aNum != null ? -aNum : null };
-    if (hNum != null) return { spreadAway: hNum != null ? -hNum : null, spreadHome: hNum };
+    const aNum = numAfter(aIdx);
+    const hNum = numAfter(hIdx);
+    if (aNum != null && hNum != null) return { spreadAway: aNum, spreadHome: hNum };
+    if (aNum != null) return { spreadAway: aNum, spreadHome: -aNum };
+    if (hNum != null) return { spreadAway: -hNum, spreadHome: hNum };
   }
 
-  return { spreadAway, spreadHome }; // may be nulls; caller can infer from ML if needed
+  return { spreadAway, spreadHome };
 }
 
 /** ========= MAIN ========= */
 async function main() {
   console.log(`Running orchestrator for ${LEAGUE}, mode=${PREFILL_MODE}`);
 
-  // Build date window
+  // Date window
   const now = new Date();
   const start = new Date(now);
   const end = new Date(now);
-  if (PREFILL_MODE === "today") {
-    // today only
-  } else {
-    // a full week window to prefill slates
+  if (PREFILL_MODE !== "today") {
     start.setDate(start.getDate() - 1);
     end.setDate(end.getDate() + 7);
   }
@@ -185,15 +163,18 @@ async function main() {
   }
 
   // Pull scoreboards
+  const ESPN_SCOREBOARD = "https://site.api.espn.com/apis/site/v2/sports/football";
   const boards = (
     await Promise.allSettled(
-      days.map((d) => fetchJson(scoreboardUrl(LEAGUE, fmtESPNDate(d))).then((j) => ({ d, j })))
+      days.map((d) =>
+        fetchJson(`${ESPN_SCOREBOARD}/${LEAGUE}/scoreboard?dates=${
+          d.getFullYear()}${String(d.getMonth()+1).padStart(2,"0")}${String(d.getDate()).padStart(2,"0")}`)
+          .then((j) => ({ d, j }))
+      )
     )
-  )
-    .filter((r) => r.status === "fulfilled")
-    .map((r) => r.value);
+  ).filter(r => r.status === "fulfilled").map(r => r.value);
 
-  const events = boards.flatMap((b) => b.j?.events ?? []);
+  const events = boards.flatMap(b => b.j?.events ?? []);
   console.log(`Fetched ${events.length} games for ${LEAGUE}`);
 
   const outRows = [];
@@ -203,8 +184,8 @@ async function main() {
     const comp = competitions?.[0];
     if (!comp) continue;
 
-    const away = comp.competitors?.find((c) => c.homeAway === "away");
-    const home = comp.competitors?.find((c) => c.homeAway === "home");
+    const away = comp.competitors?.find(c => c.homeAway === "away");
+    const home = comp.competitors?.find(c => c.homeAway === "home");
     if (!away || !home) continue;
 
     const awayName = away.team?.shortDisplayName || away.team?.displayName || "";
@@ -212,21 +193,19 @@ async function main() {
     const awayAbbr = away.team?.abbreviation || "";
     const homeAbbr = home.team?.abbreviation || "";
 
+    const displayDate = fmtDisplayDateDMY(new Date(date)); // DD/MM/YY
     const kickoff = fmtKickET(date);
-    const displayDate = fmtDisplayDateDMY(new Date(date));
     const weekLabel = week?.number ? `Week ${week.number}` : "Week ?";
 
-    // Odds
     const odds = comp?.odds?.[0] || {};
     let total = asNum(odds?.overUnder);
     let mlAway = asNum(odds?.awayTeamOdds?.moneyLine);
     let mlHome = asNum(odds?.homeTeamOdds?.moneyLine);
 
-    // Spreads (robust)
     let { spreadAway, spreadHome } = parseSpreadsFromOdds(odds, awayName, homeName, awayAbbr, homeAbbr);
 
-    // If ML missing, try summary endpoint
-    if (mlAway == null || mlHome == null || total == null) {
+    // Fill from summary if needed
+    if (mlAway == null || mlHome == null || total == null || spreadAway == null || spreadHome == null) {
       try {
         const sum = await fetchJson(summaryUrl(LEAGUE, id));
         const pc = sum?.pickcenter?.[0];
@@ -234,44 +213,40 @@ async function main() {
           if (mlAway == null && pc.awayTeamOdds?.moneyLine != null) mlAway = asNum(pc.awayTeamOdds.moneyLine);
           if (mlHome == null && pc.homeTeamOdds?.moneyLine != null) mlHome = asNum(pc.homeTeamOdds.moneyLine);
           if (total == null && pc.overUnder != null) total = asNum(pc.overUnder);
-          // spreads may also be present there:
           if (spreadAway == null && pc.awayTeamOdds?.spread != null) spreadAway = asNum(pc.awayTeamOdds.spread);
           if (spreadHome == null && pc.homeTeamOdds?.spread != null) spreadHome = asNum(pc.homeTeamOdds.spread);
         }
-      } catch { /* ignore */ }
+      } catch {}
     }
 
-    // As a last resort: infer spreads from MLs (favorite has negative ML; set -2.5/+2.5 placeholder)
+    // Last resort—infer from MLs
     if (spreadAway == null && spreadHome == null && mlAway != null && mlHome != null) {
       if (mlAway < 0 && mlHome > 0) { spreadAway = -2.5; spreadHome = 2.5; }
       else if (mlHome < 0 && mlAway > 0) { spreadHome = -2.5; spreadAway = 2.5; }
     }
 
     const matchup = `${awayName} @ ${homeName}`;
-
-    // Favorite side for underline
     let favSide = null;
     if (spreadAway != null && spreadHome != null) {
       favSide = spreadAway < 0 ? "away" : (spreadHome < 0 ? "home" : null);
     } else if (mlAway != null && mlHome != null) {
-      favSide = mlAway < mlHome ? "away" : (mlHome < mlAway ? "home" : null); // more negative is favorite
+      favSide = mlAway < mlHome ? "away" : (mlHome < mlAway ? "home" : null);
     }
-
     const { text, runs } = richTextUnderlineForMatchup(matchup, favSide, awayName, homeName);
 
     outRows.push({
       values: [
-        { userEnteredValue: { stringValue: String(id) } },         // A Game ID
-        { userEnteredValue: { stringValue: displayDate } },        // B Date (DD/MM/YY)
-        { userEnteredValue: { stringValue: weekLabel } },          // C Week
-        { userEnteredValue: { stringValue: kickoff } },            // D Status (kick time)
-        { userEnteredValue: { stringValue: text }, textFormatRuns: runs }, // E Matchup w/ underline
-        { userEnteredValue: { stringValue: "" } },                 // F Final Score (prefill only)
-        { userEnteredValue: spreadAway != null ? { numberValue: spreadAway } : {} }, // G Away Spread
-        { userEnteredValue: mlAway != null ? { numberValue: mlAway } : {} },         // H Away ML
-        { userEnteredValue: spreadHome != null ? { numberValue: spreadHome } : {} }, // I Home Spread
-        { userEnteredValue: mlHome != null ? { numberValue: mlHome } : {} },         // J Home ML
-        { userEnteredValue: total != null ? { numberValue: total } : {} },           // K Total
+        { userEnteredValue: { stringValue: String(id) } },         // A
+        { userEnteredValue: { stringValue: displayDate } },        // B  (DD/MM/YY)
+        { userEnteredValue: { stringValue: weekLabel } },          // C
+        { userEnteredValue: { stringValue: kickoff } },            // D
+        { userEnteredValue: { stringValue: text }, textFormatRuns: runs }, // E
+        { userEnteredValue: { stringValue: "" } },                 // F
+        { userEnteredValue: spreadAway != null ? { numberValue: spreadAway } : {} }, // G
+        { userEnteredValue: mlAway != null ? { numberValue: mlAway } : {} },         // H
+        { userEnteredValue: spreadHome != null ? { numberValue: spreadHome } : {} }, // I
+        { userEnteredValue: mlHome != null ? { numberValue: mlHome } : {} },         // J
+        { userEnteredValue: total != null ? { numberValue: total } : {} },           // K
       ],
     });
   }
@@ -281,7 +256,7 @@ async function main() {
     return;
   }
 
-  // Avoid duplicates by reading existing Game IDs
+  // Avoid duplicates by Game ID
   const meta = await sheets.spreadsheets.get({
     spreadsheetId: GOOGLE_SHEET_ID,
     includeGridData: false,
@@ -325,7 +300,7 @@ async function main() {
               startRowIndex,
               endRowIndex,
               startColumnIndex: 0,
-              endColumnIndex: 11, // A..K
+              endColumnIndex: 11,
             },
           },
         },
