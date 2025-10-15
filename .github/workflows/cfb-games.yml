@@ -1,16 +1,11 @@
-name: CFB Games (Prefill)
+name: CFB Games (Prefill - Full Week)
 
 on:
+  schedule:
+    # Morning ET and early afternoon passes to catch full slates
+    - cron: "15 11 * * 4,5,6"   # Thu/Fri/Sat 7:15 AM ET
+    - cron: "15 15 * * 6"       # Sat 11:15 AM ET
   workflow_dispatch:
-    inputs:
-      run_scope:
-        description: "Scope (today | week)"
-        required: false
-        default: "week"
-      tab_name:
-        description: "Sheet tab to write"
-        required: false
-        default: "CFB"
 
 jobs:
   prefill:
@@ -26,13 +21,15 @@ jobs:
           node-version: "20"
 
       - name: Install deps
-        run: npm ci
+        run: |
+          npm i googleapis playwright
 
-      - name: Prefill CFB games
+      - name: Prefill week (CFB)
         env:
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
           GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
           LEAGUE: college-football
-          TAB_NAME: ${{ github.event.inputs.tab_name || 'CFB' }}
-          RUN_SCOPE: ${{ github.event.inputs.run_scope || 'week' }}
-        run: node live-game.mjs
+          TAB_NAME: CFB
+          RUN_SCOPE: week             # 👈 pull the full upcoming week
+          ADAPTIVE_HALFTIME: "0"      # 👈 disable halftime/sleep behavior for prefill
+        run: node orchestrator.mjs
