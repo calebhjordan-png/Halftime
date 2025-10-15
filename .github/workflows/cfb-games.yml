@@ -2,9 +2,9 @@ name: CFB Games (Prefill - Full Week)
 
 on:
   schedule:
-    # Morning ET and early afternoon passes to catch full slates
+    # Thursday through Saturday runs to capture full college slates
     - cron: "15 11 * * 4,5,6"   # Thu/Fri/Sat 7:15 AM ET
-    - cron: "15 15 * * 6"       # Sat 11:15 AM ET
+    - cron: "15 15 * * 6"       # Saturday 11:15 AM ET
   workflow_dispatch:
 
 jobs:
@@ -12,17 +12,17 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Setup Node
+      - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: "20"
 
-      - name: Install deps
+      - name: Install dependencies
         run: |
-          npm i googleapis playwright
+          npm install googleapis axios playwright
 
       - name: Prefill week (CFB)
         env:
@@ -30,6 +30,5 @@ jobs:
           GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
           LEAGUE: college-football
           TAB_NAME: CFB
-          RUN_SCOPE: week             # 👈 pull the full upcoming week
-          ADAPTIVE_HALFTIME: "0"      # 👈 disable halftime/sleep behavior for prefill
+          PREFILL_MODE: week
         run: node orchestrator.mjs
