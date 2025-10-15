@@ -2,14 +2,15 @@ name: CFB Games (Prefill - Full Week)
 
 on:
   schedule:
-    # Thursday through Saturday runs to capture full college slates
-    - cron: "15 11 * * 4,5,6"   # Thu/Fri/Sat 7:15 AM ET
-    - cron: "15 15 * * 6"       # Saturday 11:15 AM ET
+    # Thu/Fri/Sat morning + an extra Saturday refresh
+    - cron: "15 11 * * 4,5,6"   # 7:15 AM ET
+    - cron: "15 15 * * 6"       # 11:15 AM ET
   workflow_dispatch:
 
 jobs:
   prefill:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
 
     steps:
       - name: Checkout repository
@@ -18,12 +19,11 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-<<<<<<< HEAD
           node-version: "20"
 
       - name: Install dependencies
         run: |
-          npm install googleapis axios playwright
+          npm install googleapis axios
 
       - name: Prefill week (CFB)
         env:
@@ -33,12 +33,3 @@ jobs:
           TAB_NAME: CFB
           PREFILL_MODE: week
         run: node orchestrator.mjs
-=======
-          node-version: 22
-          cache: npm
-      - run: npm install
-      # No Playwright here
-      - run: node orchestrator.mjs
-
-# refresh workflow name cache
->>>>>>> 5be2830 (Trigger GitHub Actions workflow name refresh)
