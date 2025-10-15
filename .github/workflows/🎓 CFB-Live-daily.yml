@@ -2,11 +2,13 @@ name: CFB Live (Daily Planner)
 
 on:
   schedule:
-    - cron: '0 6 * * *'   # plan in the morning UTC
+    - cron: '0 6 * * *'          # morning plan
+    - cron: '*/15 15-23 * * *'   # daytime/evening ET windows (tune as you like)
+    - cron: '*/15 0-4 * * *'     # late games
   workflow_dispatch:
     inputs:
       target_date_et:
-        description: 'YYYYMMDD (blank = tomorrow ET)'
+        description: 'YYYYMMDD (blank = today ET)'
         required: false
         default: ''
 
@@ -15,6 +17,9 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       games: ${{ steps.out.outputs.games }}
+    env:
+      MAX_AHEAD_MIN: ${{ vars.MAX_AHEAD_MIN || 120 }}   # only start watchers for games within next N minutes
+      GRACE_PAST_MIN: ${{ vars.GRACE_PAST_MIN || 60 }}  # include games that started within the last N minutes
     steps:
       - name: Setup Node
         uses: actions/setup-node@v4
@@ -22,46 +27,53 @@ jobs:
           node-version: '20'
 
       - id: out
-        name: Fetch tomorrow's CFB games
+        name: Build near-term game matrix (CFB)
         run: |
           node - <<'NODE'
           (async () => {
             const tz = 'America/New_York';
             const input = (process.env.INPUT || '').trim();
+            const maxAheadMin = parseInt(process.env.MAX_AHEAD_MIN || '120', 10);
+            const gracePastMin = parseInt(process.env.GRACE_PAST_MIN || '60', 10);
 
             function toYYYYMMDD(d) {
               const p = new Intl.DateTimeFormat('en-US', { timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit' }).formatToParts(d);
               const g = k => p.find(x => x.type === k)?.value || '';
               return `${g('year')}${g('month')}${g('day')}`;
             }
-            function tomorrowET() {
+            function todayET() {
               const now = new Date();
-              const parts = new Intl.DateTimeFormat('en-US', { timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit' }).formatToParts(now);
-              const y = +parts.find(p => p.type === 'year').value;
-              const m = +parts.find(p => p.type === 'month').value;
-              const d = +parts.find(p => p.type === 'day').value;
-              // midnight ET ≈ 05:00 UTC, then add one day
-              const etMid = new Date(Date.UTC(y, m - 1, d, 5));
-              return toYYYYMMDD(new Date(etMid.getTime() + 24 * 3600 * 1000));
+              const p = new Intl.DateTimeFormat('en-US', { timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit' }).formatToParts(now);
+              const y = +p.find(q => q.type === 'year').value, m = +p.find(q => q.type === 'month').value, d = +p.find(q => q.type === 'day').value;
+              const etMid = new Date(Date.UTC(y, m - 1, d, 5)); // ~ET midnight
+              return toYYYYMMDD(etMid);
             }
 
-            const yyyymmdd = (/^\d{8}$/.test(input) ? input : tomorrowET());
+            const yyyymmdd = (/^\d{8}$/.test(input) ? input : todayET());
             const url = `https://site.api.espn.com/apis/site/v2/sports/football/college-football/scoreboard?dates=${yyyymmdd}&groups=80&limit=300`;
 
-            const res = await fetch(url, { headers: { 'User-Agent': 'cfb-live-daily/1.0' } });
+            const res = await fetch(url, { headers: { 'User-Agent': 'cfb-live-daily/2.0' } });
             if (!res.ok) throw new Error('HTTP ' + res.status);
             const sb = await res.json();
+
+            const nowSec = Math.floor(Date.now()/1000);
+            const maxAheadSec = maxAheadMin * 60;
+            const gracePastSec = gracePastMin * 60;
 
             const seen = new Set();
             const games = (sb.events || [])
               .filter(e => e && !seen.has(e.id) && seen.add(e.id))
               .map(e => ({
                 game_id: String(e.id),
-                kickoff_epoch: Math.floor(new Date(e.date).getTime() / 1000)
-              }));
+                kickoff_epoch: Math.floor(new Date(e.date).getTime()/1000)
+              }))
+              .filter(g => {
+                const wait = g.kickoff_epoch - nowSec;
+                return (wait <= maxAheadSec) && (wait >= -gracePastSec);
+              });
 
             require('fs').appendFileSync(process.env.GITHUB_OUTPUT, `games=${JSON.stringify(games)}\n`);
-          })().catch(err => { console.error(err); process.exit(1); });
+          })().catch(e => { console.error(e); process.exit(1); });
           NODE
         env:
           INPUT: ${{ github.event.inputs.target_date_et }}
@@ -89,15 +101,24 @@ jobs:
       - name: Install deps
         run: npm i googleapis
 
-      - name: Sleep until kickoff+60
+      - name: Short sleep to kickoff+60 (cap wait)
         env:
           WAKE_OFFSET_MIN: ${{ vars.WAKE_OFFSET_MIN || 60 }}
+          MAX_SLEEP_MIN:   ${{ vars.MAX_SLEEP_MIN   || 20 }}   # hard cap per run
         run: |
           NOW=$(date +%s)
           TARGET=$(( ${{ matrix.kickoff_epoch }} + WAKE_OFFSET_MIN*60 ))
           WAIT=$(( TARGET - NOW ))
-          [ $WAIT -lt 0 ] && WAIT=0
-          echo "Sleeping $WAIT sec for ${{ matrix.game_id }}"
+          CAP=$(( MAX_SLEEP_MIN*60 ))
+          if [ $WAIT -le 0 ]; then
+            echo "Kick already passed; proceeding immediately."
+            exit 0
+          fi
+          if [ $WAIT -gt $CAP ]; then
+            echo "Too early (need $WAIT s, cap $CAP s). Skipping now; planner will re-queue closer to kickoff."
+            exit 0
+          fi
+          echo "Sleeping $WAIT sec until kickoff+offset..."
           sleep $WAIT
 
       - name: Start live engine
