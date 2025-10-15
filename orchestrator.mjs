@@ -46,7 +46,7 @@ function addDaysET(base, days) {
   return new Date(etMid.getTime() + days * 86400000);
 }
 async function fetchJson(url) {
-  const r = await fetch(url, { headers: { "User-Agent": "orchestrator/3.4", "Referer": "https://www.espn.com/" } });
+  const r = await fetch(url, { headers: { "User-Agent": "orchestrator/3.5", "Referer": "https://www.espn.com/" } });
   if (!r.ok) throw new Error(`HTTP ${r.status} for ${url}`);
   return r.json();
 }
@@ -90,13 +90,34 @@ const assignSpreads = (odds, away, home) => {
   return { awaySpread: "", homeSpread: "" };
 };
 
-function resolveWeekLabel(sb, lg) {
-  const n = sb?.week?.number;
-  return Number.isFinite(n) ? `Week ${n}` : (sb?.week?.text || "Regular Season");
-}
-
 const colMap = (hdr = []) =>
   Object.fromEntries(hdr.map((h, i) => [(h || "").trim().toLowerCase(), i]));
+
+/** Map event date to "Week N" using ESPN calendar ranges (works for CFB/NFL). */
+function weekFromCalendars(boards, eventDate) {
+  const ts = new Date(eventDate).getTime();
+  const calendars = [];
+  for (const b of boards) {
+    const cal = b?.j?.leagues?.[0]?.calendar;
+    if (Array.isArray(cal)) calendars.push(...cal);
+  }
+  for (const c of calendars) {
+    const start = c.startDate ? new Date(c.startDate).getTime() : null;
+    const end   = c.endDate   ? new Date(c.endDate).getTime()   : null;
+    if (start != null && end != null && ts >= start && ts <= end) {
+      const label = (c.label || c.value || "").trim();
+      // normalize "Week 8", etc.
+      const m = label.match(/week\s*\d+/i);
+      return m ? m[0].replace(/^\w/, ch => ch.toUpperCase()) : (label || "Week ?");
+    }
+  }
+  // fallback: if any board had a numeric week
+  for (const b of boards) {
+    const n = b?.j?.week?.number;
+    if (Number.isFinite(n)) return `Week ${n}`;
+  }
+  return "Week ?";
+}
 
 /** ========== MAIN ========== */
 (async () => {
@@ -146,20 +167,21 @@ const colMap = (hdr = []) =>
         : [yyyymmddET(new Date())];
 
     const scoreboards = (await Promise.allSettled(
-  dates.map(d => fetchJson(scoreboardUrl(LEAGUE, d)).then(j => ({ d, j })))
-))
-  .filter(r => r.status === "fulfilled")
-  .map(r => r.value);
-
+      dates.map(d => fetchJson(scoreboardUrl(LEAGUE, d)).then(j => ({ d, j })))
+    ))
+      .filter(r => r.status === "fulfilled")
+      .map(r => r.value);
 
     const seen = new Set();
     const events = [];
-    for (const { j } of scoreboards)
-      for (const e of j?.events || [])
+    for (const { j } of scoreboards) {
+      for (const e of j?.events || []) {
         if (!seen.has(e.id)) {
           seen.add(e.id);
           events.push(e);
         }
+      }
+    }
 
     const rows = vals.slice(1);
     const idToRow = new Map();
@@ -178,14 +200,36 @@ const colMap = (hdr = []) =>
       const home = comp.competitors?.find(c => c.homeAway === "home");
       const matchup = `${away?.team?.shortDisplayName || "Away"} @ ${home?.team?.shortDisplayName || "Home"}`;
       const kickoff = new Date(e.date).getTime();
-      const diffHr = Math.abs((kickoff - now) / 3600000);
+      const nearKick = Math.abs((kickoff - now) / 3600000) <= 2;  // ±2 hours window
 
-      const odds = pickOdds(comp.odds || e.odds || null);
-      const { awaySpread, homeSpread } = assignSpreads(odds, away, home);
-      const total = odds?.overUnder ?? odds?.total ?? "";
-      const awayML = numOrBlank(odds?.awayTeamOdds?.moneyLine ?? odds?.awayTeamOdds?.moneyline);
-      const homeML = numOrBlank(odds?.homeTeamOdds?.moneyLine ?? odds?.homeTeamOdds?.moneyline);
-      const weekLbl = resolveWeekLabel(scoreboards[0]?.j || {}, LEAGUE);
+      // Primary odds from scoreboard
+      let odds = pickOdds(comp.odds || e.odds || null);
+      let { awaySpread, homeSpread } = assignSpreads(odds, away, home);
+      let total  = odds?.overUnder ?? odds?.total ?? "";
+      let awayML = numOrBlank(odds?.awayTeamOdds?.moneyLine ?? odds?.awayTeamOdds?.moneyline);
+      let homeML = numOrBlank(odds?.homeTeamOdds?.moneyLine ?? odds?.homeTeamOdds?.moneyline);
+
+      // ⬅️ NEW: Fallback to /summary if MLs missing (typical for CFB scoreboard)
+      if ((!awayML || !homeML) && nearKick) {
+        try {
+          const sum = await fetchJson(summaryUrl(LEAGUE, e.id));
+          const scomp = sum?.header?.competitions?.[0] || sum?.competitions?.[0] || {};
+          const sOdds = pickOdds(scomp.odds || sum?.odds || null);
+          if (sOdds) {
+            if (!awaySpread || !homeSpread) {
+              const spreads = assignSpreads(sOdds, away, home);
+              awaySpread = awaySpread || spreads.awaySpread;
+              homeSpread = homeSpread || spreads.homeSpread;
+            }
+            total  = total  || sOdds.overUnder || sOdds.total || "";
+            awayML = awayML || numOrBlank(sOdds?.awayTeamOdds?.moneyLine ?? sOdds?.awayTeamOdds?.moneyline);
+            homeML = homeML || numOrBlank(sOdds?.homeTeamOdds?.moneyLine ?? sOdds?.homeTeamOdds?.moneyline);
+          }
+        } catch { /* ignore */ }
+      }
+
+      // Week label from calendars (works for CFB too)
+      const weekLbl = weekFromCalendars(scoreboards, e.date);
       const status = fmtETKick(e.date);
 
       const row = idToRow.get(e.id);
@@ -195,13 +239,11 @@ const colMap = (hdr = []) =>
           awaySpread, awayML, homeSpread, homeML, String(total),
           "", "", "", "", "", ""
         ]);
-      } else if (diffHr <= 2) {
-        // Auto-refresh odds within 2h window
+      } else if (nearKick) {
+        // Refresh odds within 2h window
         const col = c => String.fromCharCode("A".charCodeAt(0) + c);
-        const set = (i, v) => {
-          if (i == null || v == "") return;
-          updates.push({ range: `${TAB_NAME}!${col(i)}${row}`, values: [[v]] });
-        };
+        const set = (i, v) => { if (i == null || v === "" || v == null) return;
+          updates.push({ range: `${TAB_NAME}!${col(i)}${row}`, values: [[v]] }); };
         set(idx.awaySpread, awaySpread);
         set(idx.homeSpread, homeSpread);
         set(idx.awayML, awayML);
@@ -267,4 +309,3 @@ const colMap = (hdr = []) =>
 
   console.log("✅ Finals sweep complete.");
 })();
-
