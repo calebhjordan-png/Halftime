@@ -1,47 +1,41 @@
-  let finalsWritten = 0;
-  let attempts = 0;
+name: Orchestrator Finals (sweeper)
 
-  // repeat fetch until all finals written or max attempts reached
-  while (attempts < 2) {   // check twice, 15s apart
-    for (const e of events) {
-      const comp = e.competitions?.[0] || {};
-      const away = comp.competitors?.find(c=>c.homeAway==="away");
-      const home = comp.competitors?.find(c=>c.homeAway==="home");
-      const matchup = `${away?.team?.shortDisplayName||"Away"} @ ${home?.team?.shortDisplayName||"Home"}`;
-      const dateET  = fmtETDate(e.date);
+on:
+  schedule:
+    - cron: '*/15 17-23 * * *'  # 1 PM–11 PM UTC
+    - cron: '*/15 0-9 * * *'    # 12 AM–9 AM UTC
+  workflow_dispatch:
 
-      const statusName = (e.status?.type?.name || comp.status?.type?.name || "").toUpperCase();
-      const state      = (e.status?.type?.state || comp.status?.type?.state || "").toLowerCase();
-      const isFinal    = /FINAL/.test(statusName) || state === "post";
-      if (!isFinal) continue;
+jobs:
+  sweep:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        league: [nfl, college-football]
+        include:
+          - league: nfl
+            tab: NFL
+          - league: college-football
+            tab: CFB
 
-      const row = idMap.get(String(e.id)) || keyMap.get(keyOf(dateET, matchup));
-      if (!row) continue;
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      const score = `${away?.score ?? ""}-${home?.score ?? ""}`;
-      const updates = [];
-      const add = (name,val)=>{
-        const idx = h2[name.toLowerCase()];
-        if (idx == null) return;
-        const col = String.fromCharCode("A".charCodeAt(0)+idx);
-        updates.push({ range:`${TAB_NAME}!${col}${row}`, values:[[val]] });
-      };
-      add("final score", score);
-      add("status", "Final");
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
 
-      if (updates.length) {
-        await sheets.spreadsheets.values.batchUpdate({
-          spreadsheetId: SHEET_ID,
-          requestBody: { valueInputOption:"RAW", data: updates }
-        });
-        finalsWritten++;
-      }
-    }
-    if (finalsWritten > 0) break;
-    attempts++;
-    console.log("No new finals yet, retrying in 15s...");
-    await new Promise(r => setTimeout(r, 15000));
-  }
+      - name: Install deps
+        run: npm i googleapis
 
-  console.log(`✅ Finals written: ${finalsWritten}`);
-})();
+      - name: Finals sweep (sheet-driven)
+        env:
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+          GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
+          LEAGUE: ${{ matrix.league }}
+          TAB_NAME: ${{ matrix.tab }}
+          PREFILL_MODE: off            # finals only; no date-limited fetches
+        run: node orchestrator.mjs
