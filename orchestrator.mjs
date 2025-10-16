@@ -1,3 +1,4 @@
+// orchestrator.mjs
 import { google } from "googleapis";
 import axios from "axios";
 
@@ -57,7 +58,7 @@ function fmtKickET(isoStr) {
   });
 }
 
-/* ====== underline the pregame favorite inside the matchup cell ====== */
+/* ====== underline favorite in matchup cell (prefill), later we overwrite runs with bold winner too ====== */
 function richTextUnderlineForMatchup(matchup, favSide, awayName, homeName) {
   const text = matchup || "";
   const len = text.length;
@@ -175,7 +176,7 @@ async function runPrefill() {
     }
     const { text, runs } = richTextUnderlineForMatchup(matchup, favSide, awayName, homeName);
 
-    // Build new row (A..F): Game ID, Date, Week, Status, Matchup, Final Score
+    // Build row (A..F) only — Odds columns can be filled by your other task
     outRows.push({
       values: [
         { userEnteredValue: { stringValue: String(id) } },       // A Game ID
@@ -184,7 +185,6 @@ async function runPrefill() {
         { userEnteredValue: { stringValue: kickoff } },          // D Status (kick time)
         { userEnteredValue: { stringValue: text }, textFormatRuns: runs }, // E Matchup (fav underlined)
         { userEnteredValue: { stringValue: "" } },               // F Final Score
-        // NOTE: Odds columns (G..K) are left for other jobs if you populate them elsewhere.
       ],
     });
   }
@@ -249,11 +249,18 @@ async function runPrefill() {
   console.log(`✅ Prefill completed: ${newRows.length} new rows`);
 }
 
-/* ==================== FINALS SWEEP ==================== */
+/* ==================== FINALS SWEEP + FORMATTING ==================== */
+const COLORS = {
+  green: { red: 0.85, green: 0.95, blue: 0.85 },
+  red:   { red: 0.98, green: 0.85, blue: 0.85 },
+  gray:  { red: 0.93, green: 0.93, blue: 0.93 },
+};
+
 async function runFinalsSweep() {
   console.log(`🏁 Finals sweep started for ${LEAGUE}/${TAB_NAME}`);
 
-  const readRange = `${TAB_NAME}!A2:F`;
+  // We’ll read A..K so we have odds columns
+  const readRange = `${TAB_NAME}!A2:K`;
   const res = await sheets.spreadsheets.values.get({
     spreadsheetId: GOOGLE_SHEET_ID,
     range: readRange,
@@ -264,70 +271,216 @@ async function runFinalsSweep() {
     return;
   }
 
-  // Candidates: rows that either have blank final score OR status is not "Final"
-  const candidates = [];
-  rows.forEach((r, idx) => {
-    const gameId = (r[0] || "").trim();
-    const status = (r[3] || "").trim();
-    const finalScore = (r[5] || "").trim();
-    if (!gameId) return;
-    if (!finalScore || status.toLowerCase() !== "final") {
-      candidates.push({ rowIndex: idx, gameId });
-    }
+  // Sheet meta for formatting
+  const meta = await sheets.spreadsheets.get({
+    spreadsheetId: GOOGLE_SHEET_ID,
+    includeGridData: false,
   });
+  const targetSheet = meta.data.sheets?.find((s) => s.properties?.title === TAB_NAME);
+  if (!targetSheet) {
+    console.error(`Tab "${TAB_NAME}" not found`);
+    process.exit(1);
+  }
+  const sheetId = targetSheet.properties.sheetId;
 
-  console.log(`Found ${candidates.length} candidate(s) with no final score.`);
+  // col indices (0-based) for updateCells convenience
+  const COL = {
+    A: 0, B: 1, C: 2, D: 3, E: 4, F: 5, G: 6, H: 7, I: 8, J: 9, K: 10,
+  };
 
-  if (candidates.length === 0) return;
+  const valueUpdates = [];   // values API (status & final score)
+  const formatRequests = []; // batchUpdate (formatting + rich text on E)
 
   let finalsWritten = 0;
-  const updates = [];
 
-  for (const c of candidates) {
+  for (let i = 0; i < rows.length; i++) {
+    const r = rows[i] || [];
+    const rowNum = i + 2; // 1-based + header
+
+    const gameId = (r[0] || "").trim();
+    if (!gameId) continue;
+
+    const status = (r[3] || "").trim();
+    const finalScoreExisting = (r[5] || "").trim();
+
+    // If already final with a score, we can still do formatting; otherwise we also fetch summary
+    let awayScore = null, homeScore = null, isFinal = false;
+    let matchupText = r[4] || ""; // E
     try {
-      const sum = await fetchJson(summaryUrl(LEAGUE, c.gameId));
+      const sum = await fetchJson(summaryUrl(LEAGUE, gameId));
       const comp = sum?.header?.competitions?.[0];
       const st = comp?.status?.type?.name || comp?.status?.type?.state;
-      const isFinal = typeof st === "string" && st.toLowerCase().includes("final");
-      if (!isFinal) continue;
+      isFinal = typeof st === "string" && st.toLowerCase().includes("final");
 
       const away = comp?.competitors?.find(x => x.homeAway === "away");
       const home = comp?.competitors?.find(x => x.homeAway === "home");
       if (!away || !home) continue;
 
-      const finalScoreStr = `${away.score}-${home.score}`;
-      const targetRow = c.rowIndex + 2; // account for header
+      awayScore = asNum(away?.score);
+      homeScore = asNum(home?.score);
 
-      // ✅ Only update Status (D) and Final Score (F) — DO NOT touch Matchup (E)
-      updates.push({
-        range: `${TAB_NAME}!D${targetRow}:D${targetRow}`,
-        values: [["Final"]],
-      });
-      updates.push({
-        range: `${TAB_NAME}!F${targetRow}:F${targetRow}`,
-        values: [[finalScoreStr]],
+      // Write final score & status only if needed
+      if (isFinal && (!finalScoreExisting || status.toLowerCase() !== "final")) {
+        const finalScoreStr = `${awayScore}-${homeScore}`;
+        valueUpdates.push({
+          range: `${TAB_NAME}!D${rowNum}:D${rowNum}`,
+          values: [["Final"]],
+        });
+        valueUpdates.push({
+          range: `${TAB_NAME}!F${rowNum}:F${rowNum}`,
+          values: [[finalScoreStr]],
+        });
+        finalsWritten++;
+      }
+
+      // ====== Build rich text for Matchup: Bold the winner; keep favorite underline if we can detect ======
+      const winnerSide = awayScore > homeScore ? "away" : (homeScore > awayScore ? "home" : null);
+
+      // Guess the favorite from spreads or ML present on the row
+      const awaySpread = asNum(r[6]); // G
+      const homeSpread = asNum(r[8]); // I
+      const awayML     = asNum(r[7]); // H
+      const homeML     = asNum(r[9]); // J
+      const total      = asNum(r[10]); // K
+
+      let favSide = null;
+      if (awaySpread != null && homeSpread != null) {
+        favSide = awaySpread < 0 ? "away" : (homeSpread < 0 ? "home" : null);
+      } else if (awayML != null && homeML != null) {
+        favSide = awayML < homeML ? "away" : (homeML < awayML ? "home" : null);
+      }
+
+      // Extract away/home names from the matchup ("Away @ Home")
+      const [awayName, homeName] = (matchupText || "").split(" @ ").map(s => (s || "").trim());
+
+      // Build runs: bold winner, underline favorite if we can
+      const text = matchupText || "";
+      const runs = [];
+      const pushRun = (start, fmt) => {
+        if (start > 0) runs.push({ startIndex: 0 });
+        runs.push({ startIndex: start, format: fmt });
+      };
+      const applyStyleTo = (team, style) => {
+        if (!team) return;
+        const start = text.indexOf(team);
+        if (start >= 0) runs.push({ startIndex: start, format: style });
+      };
+
+      // winner bold
+      if (winnerSide === "away") applyStyleTo(awayName, { bold: true });
+      if (winnerSide === "home") applyStyleTo(homeName, { bold: true });
+
+      // favorite underline
+      if (favSide === "away") applyStyleTo(awayName, { underline: true });
+      if (favSide === "home") applyStyleTo(homeName, { underline: true });
+
+      // Normalize runs order & dedupe by startIndex, merging styles
+      const byIndex = new Map();
+      for (const run of runs) {
+        const idx = run.startIndex ?? 0;
+        const prev = byIndex.get(idx) || { startIndex: idx, format: {} };
+        byIndex.set(idx, { startIndex: idx, format: { ...prev.format, ...run.format } });
+      }
+      const finalRuns = Array.from(byIndex.values()).sort((a, b) => a.startIndex - b.startIndex);
+
+      // Apply textFormatRuns to the single cell E(row)
+      formatRequests.push({
+        updateCells: {
+          rows: [{
+            values: [{
+              userEnteredValue: { stringValue: text },
+              textFormatRuns: finalRuns,
+            }],
+          }],
+          fields: "userEnteredValue,textFormatRuns",
+          range: {
+            sheetId,
+            startRowIndex: rowNum - 1,
+            endRowIndex: rowNum,
+            startColumnIndex: COL.E,
+            endColumnIndex: COL.E + 1,
+          },
+        },
       });
 
-      finalsWritten++;
+      // ====== Color ML/Spread/Total cells based on result ======
+      // Helpers
+      const bg = (color) => ({ userEnteredFormat: { backgroundColor: color } });
+      const colorCell = (col, color) => {
+        formatRequests.push({
+          repeatCell: {
+            range: {
+              sheetId,
+              startRowIndex: rowNum - 1,
+              endRowIndex: rowNum,
+              startColumnIndex: col,
+              endColumnIndex: col + 1,
+            },
+            cell: { userEnteredFormat: { backgroundColor: color } },
+            fields: "userEnteredFormat.backgroundColor",
+          },
+        });
+      };
+      const PUSH = COLORS.gray;
+
+      // Moneyline: green for the winner side, red for loser (if values exist)
+      if (awayML != null || homeML != null) {
+        if (awayScore > homeScore) {
+          colorCell(COL.H, COLORS.green); // away ML
+          colorCell(COL.J, COLORS.red);   // home ML
+        } else if (homeScore > awayScore) {
+          colorCell(COL.H, COLORS.red);
+          colorCell(COL.J, COLORS.green);
+        }
+      }
+
+      // Spread cover
+      if (awaySpread != null) {
+        const awayCovers = awayScore + awaySpread > homeScore ? true
+                         : awayScore + awaySpread < homeScore ? false
+                         : null; // push
+        colorCell(COL.G, awayCovers === null ? PUSH : (awayCovers ? COLORS.green : COLORS.red));
+      }
+      if (homeSpread != null) {
+        const homeCovers = homeScore + homeSpread > awayScore ? true
+                         : homeScore + homeSpread < awayScore ? false
+                         : null;
+        colorCell(COL.I, homeCovers === null ? PUSH : (homeCovers ? COLORS.green : COLORS.red));
+      }
+
+      // Total Over/Under (no pick column; just color by outcome)
+      if (total != null && awayScore != null && homeScore != null) {
+        const sum = awayScore + homeScore;
+        const color = sum > total ? COLORS.green
+                    : sum < total ? COLORS.red
+                    : PUSH;
+        colorCell(COL.K, color);
+      }
     } catch (e) {
-      console.warn(`Skipping ${c.gameId} (${e.message})`);
+      console.warn(`Skipping row ${rowNum} / game ${gameId}: ${e.message}`);
     }
   }
 
-  if (updates.length === 0) {
-    console.log("No finals ready.");
-    return;
+  // write values (status + finals) first
+  if (valueUpdates.length > 0) {
+    await sheets.spreadsheets.values.batchUpdate({
+      spreadsheetId: GOOGLE_SHEET_ID,
+      requestBody: {
+        valueInputOption: "USER_ENTERED",
+        data: valueUpdates,
+      },
+    });
   }
 
-  await sheets.spreadsheets.values.batchUpdate({
-    spreadsheetId: GOOGLE_SHEET_ID,
-    requestBody: {
-      valueInputOption: "USER_ENTERED",
-      data: updates,
-    },
-  });
+  // then formatting updates
+  if (formatRequests.length > 0) {
+    await sheets.spreadsheets.batchUpdate({
+      spreadsheetId: GOOGLE_SHEET_ID,
+      requestBody: { requests: formatRequests },
+    });
+  }
 
-  console.log(`✅ Finals written: ${finalsWritten}`);
+  console.log(`✅ Finals written: ${finalsWritten} | formatted: ${rows.length}`);
 }
 
 /* ==================== ROUTER ==================== */
