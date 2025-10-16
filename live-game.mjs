@@ -1,181 +1,273 @@
-/**
- * live-game.mjs
- * Watches ONE game (TARGET_GAME_ID) for NFL or CFB.
- * Writes only halftime-related data into the sheet:
- *   - Pre-half: current Q/time into Status
- *   - Halftime: sets Status=Half and Half Score=<away-home>
- *
- * ENV (required): GOOGLE_SHEET_ID, GOOGLE_SERVICE_ACCOUNT, TARGET_GAME_ID
- * ENV (optional): LEAGUE=nfl|college-football, TAB_NAME, MAX_TOTAL_MIN, DEBUG_MODE
- */
+// live-game.mjs
+// Watches ONE game. When it reaches halftime, writes:
+//   L: Half Score     (e.g., "17-10")
+//   M: Live Away Spread
+//   N: Live Away ML
+//   O: Live Home Spread
+//   P: Live Home ML
+//   Q: Live Total
+//
+// Env required:
+//   GOOGLE_SERVICE_ACCOUNT  -> JSON of service account (with Sheets scope)
+//   GOOGLE_SHEET_ID         -> your spreadsheet id
+//   TAB_NAME                -> "CFB" or "NFL" (exact tab name)
+//   TARGET_GAME_ID          -> ESPN event id (e.g., 401756924)
+//   LEAGUE                  -> "nfl" or "college-football"
+//
+// Optional env:
+//   POLL_SECONDS            -> default 20
+//   MAX_TOTAL_MIN           -> hard stop, default 200 (3h20m)
+//   DEBUG_MODE              -> "true" for extra logs
+
+import axios from "axios";
 import { google } from "googleapis";
 
-const SHEET_ID = process.env.GOOGLE_SHEET_ID;
-const SA_JSON  = process.env.GOOGLE_SERVICE_ACCOUNT;
-const LEAGUE   = (process.env.LEAGUE || "nfl").toLowerCase();
-const TAB_NAME = process.env.TAB_NAME || (LEAGUE === "college-football" ? "CFB" : "NFL");
-const EVENT_ID = process.env.TARGET_GAME_ID;
-const MAX_TOTAL_MIN = Number(process.env.MAX_TOTAL_MIN || "200");
-const DEBUG_MODE = process.env.DEBUG_MODE === "true";
+// ---------- config ----------
+const {
+  GOOGLE_SERVICE_ACCOUNT,
+  GOOGLE_SHEET_ID,
+  TAB_NAME,
+  TARGET_GAME_ID,
+  LEAGUE,
+  POLL_SECONDS = "20",
+  MAX_TOTAL_MIN = "200",
+  DEBUG_MODE = "false",
+} = process.env;
 
-if (!SHEET_ID || !SA_JSON || !EVENT_ID) {
-  console.error("Missing env: GOOGLE_SHEET_ID, GOOGLE_SERVICE_ACCOUNT, TARGET_GAME_ID");
+if (!GOOGLE_SERVICE_ACCOUNT || !GOOGLE_SHEET_ID || !TAB_NAME || !TARGET_GAME_ID || !LEAGUE) {
+  console.error("Missing one or more required env vars.");
   process.exit(1);
 }
+const debug = (...args) => { if (DEBUG_MODE === "true") console.log("[debug]", ...args); };
 
-const ET = "America/New_York";
-const pick = (o,p)=>p.replace(/\[(\d+)\]/g,'.$1').split('.').reduce((a,k)=>a?.[k],o);
+// ESPN endpoints
+const SUMMARY_URL = `https://site.api.espn.com/apis/site/v2/sports/football/${LEAGUE}/summary?event=${TARGET_GAME_ID}`;
 
-async function fetchJson(url, tries=3) {
-  for (let i=1;i<=tries;i++){
-    try{
-      const r = await fetch(url,{headers:{"User-Agent":"live-engine/2.0"}});
-      if(!r.ok) throw new Error(`HTTP ${r.status}`);
-      return await r.json();
-    }catch(e){ if(i===tries) throw e; await new Promise(r=>setTimeout(r,500*i)); }
-  }
+// Google Sheets auth
+const sa = JSON.parse(GOOGLE_SERVICE_ACCOUNT);
+const jwt = new google.auth.JWT(
+  sa.client_email,
+  null,
+  sa.private_key,
+  ["https://www.googleapis.com/auth/spreadsheets"]
+);
+const sheets = google.sheets({ version: "v4", auth: jwt });
+
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+async function getSummary() {
+  const res = await axios.get(SUMMARY_URL, { timeout: 15000 });
+  return res.data;
 }
-const summaryUrl = id => `https://site.api.espn.com/apis/site/v2/sports/football/${LEAGUE}/summary?event=${id}`;
 
-function parseStatus(sum){
-  const a = pick(sum,"header.competitions.0.status") || {};
-  const b = pick(sum,"competitions.0.status") || {};
-  const s = a?.type?.shortDetail ? a : b;
-  const type = s.type || {};
+// ESPN “game status” helpers
+function parseStatus(summary) {
+  // Status is in competitions[0].status
+  const comp = summary?.header?.competitions?.[0] || summary?.competitions?.[0];
+  const status = comp?.status;
+  const type = status?.type || {};
+  const period = status?.period ?? comp?.status?.period ?? null;
+  const displayClock = status?.displayClock ?? "";
+  const detail = type?.detail ?? status?.type?.detail ?? "";
+  const state = type?.state ?? ""; // pre, in, post
+
+  // Treat "Halftime" as halftime; or Q2 and clock 0:00
+  const isHalftime =
+    /halftime/i.test(detail || "") ||
+    (/in/i.test(state) && (period === 2) && (displayClock === "0:00"));
+
+  // If game is over we’ll still allow a halftime write if we missed it
+  const isFinal = /final/i.test(detail || "") || state === "post";
+
+  // Score at this instant
+  const comp0 = summary?.header?.competitions?.[0] || summary?.competitions?.[0];
+  const [home, away] = (comp0?.competitors || []).sort((a,b)=> (a.homeAway==="home")?1:-1);
+  // Note: above sort puts 'home' second; let’s rebuild clearly:
+  const homeTeam = (comp0?.competitors || []).find(c=>c.homeAway==="home");
+  const awayTeam = (comp0?.competitors || []).find(c=>c.homeAway==="away");
+
   return {
-    shortDetail: type.shortDetail || "",
-    state: type.state || "",
-    period: Number(s.period ?? 0),
-    displayClock: s.displayClock ?? "0:00",
-    name: (type.name || "").toUpperCase(),
+    isHalftime,
+    isFinal,
+    display: detail || `${displayClock} P${period || ""}`,
+    homeScore: Number(homeTeam?.score ?? 0),
+    awayScore: Number(awayTeam?.score ?? 0),
+    comp: comp0,
   };
 }
 
-function getTeams(sum){
-  let away,home;
-  let cps = pick(sum,"header.competitions.0.competitors");
-  if(!Array.isArray(cps)||cps.length<2) cps = pick(sum,"competitions.0.competitors");
-  if(Array.isArray(cps)&&cps.length>=2){
-    away = cps.find(c=>c.homeAway==="away");
-    home = cps.find(c=>c.homeAway==="home");
-  }
-  if((!away||!home)&&Array.isArray(pick(sum,"boxscore.teams"))){
-    const bs=pick(sum,"boxscore.teams");
-    away = bs.find(t=>t.homeAway==="away")||away;
-    home = bs.find(t=>t.homeAway==="home")||home;
-  }
-  const tn=t=>t?.team?.shortDisplayName||t?.team?.abbreviation||t?.team?.displayName||"Team";
-  const ts=t=>Number(t?.score??t?.statistics?.find?.(s=>s.name==="points")?.value??0);
-  return {awayName:tn(away),homeName:tn(home),awayScore:ts(away),homeScore:ts(home)};
+// Odds extractor: prefer ESPN BET; fall back to first provider with live/current lines
+function pickProvider(oddsArray) {
+  if (!Array.isArray(oddsArray) || oddsArray.length === 0) return null;
+  // Prefer ESPN BET
+  const espnBet = oddsArray.find(o => /espn bet/i.test(o?.provider?.name || ""));
+  if (espnBet) return espnBet;
+  // Otherwise pick any provider with awayTeamOdds/homeTeamOdds
+  return oddsArray.find(o => o?.awayTeamOdds || o?.homeTeamOdds) || oddsArray[0];
 }
 
-const normalize=n=>String(n).trim().replace(/\./g,"").replace(/\bState\b/gi,"St").replace(/\s+/g," ");
-const matchup=(a,h)=>`${normalize(a)} @ ${normalize(h)}`;
-function kickoffISO(sum){return pick(sum,"header.competitions.0.date")||pick(sum,"competitions.0.date")||null;}
-function etDateStr(iso){
-  if(!iso)return"";
-  const dt=new Date(iso);
-  const parts=new Intl.DateTimeFormat("en-US",{timeZone:ET,year:"numeric",month:"2-digit",day:"2-digit"}).formatToParts(dt);
-  const fx=t=>parts.find(x=>x.type===t)?.value||"";
-  return `${fx("month")}/${fx("day")}/${fx("year")}`;
+function extractLiveOdds(summary) {
+  // Some feeds put odds at summary.pickcenter, some at summary.odds (array)
+  // We’ll check:
+  //   summary.pickcenter[] -> objects with provider & ...,
+  //   summary.odds[]       -> similar shape
+  const rawOdds = summary?.pickcenter || summary?.odds || [];
+  if (!Array.isArray(rawOdds) || rawOdds.length === 0) return null;
+
+  const prov = pickProvider(rawOdds);
+  if (!prov) return null;
+
+  // Normalize fields
+  // Typical shape:
+  // prov.overUnder
+  // prov.awayTeamOdds: { spread, moneyLine }
+  // prov.homeTeamOdds: { spread, moneyLine }
+  // Sometimes spread might be undefined, sometimes 0, sometimes a string
+  const toNum = v => (v === null || v === undefined || v === "") ? "" : Number(v);
+
+  let awaySpread = toNum(prov?.awayTeamOdds?.spread);
+  let awayML     = toNum(prov?.awayTeamOdds?.moneyLine);
+  let homeSpread = toNum(prov?.homeTeamOdds?.spread);
+  let homeML     = toNum(prov?.homeTeamOdds?.moneyLine);
+  let total      = toNum(prov?.overUnder);
+
+  // If spreads missing but one "spread" exists (single value), build symmetric:
+  if ((awaySpread === "" || isNaN(awaySpread)) && (homeSpread !== "" && !isNaN(homeSpread))) {
+    awaySpread = -Number(homeSpread);
+  }
+  if ((homeSpread === "" || isNaN(homeSpread)) && (awaySpread !== "" && !isNaN(awaySpread))) {
+    homeSpread = -Number(awaySpread);
+  }
+
+  // Clean NaNs to blank strings for Sheets
+  const clean = v => (v === "" || Number.isNaN(v)) ? "" : v;
+
+  return {
+    awaySpread: clean(awaySpread),
+    awayML:     clean(awayML),
+    homeSpread: clean(homeSpread),
+    homeML:     clean(homeML),
+    total:      clean(total),
+  };
 }
 
-function decideSleep(period,clock){
-  let mins=20;
-  if(Number(period)===2){
-    const m=/(\d{1,2}):(\d{2})/.exec(clock||"");
-    if(m){const left=+m[1]+(+m[2])/60;if(left<=10)mins=Math.max(1,Math.ceil(left*2));}
-  }
-  if(DEBUG_MODE)mins=Math.min(mins,0.2);
-  return mins;
-}
-const msFromMin=m=>Math.max(60_000,Math.round(m*60_000));
-
-async function sheetsClient(){
-  const creds=JSON.parse(SA_JSON);
-  const jwt=new google.auth.JWT(creds.client_email,null,creds.private_key,["https://www.googleapis.com/auth/spreadsheets"]);
-  await jwt.authorize();
-  return google.sheets({version:"v4",auth:jwt});
-}
-function colMap(hdr=[]){const map={};hdr.forEach((h,i)=>map[(h||"").trim().toLowerCase()]=i);return map;}
-
-async function findRowIndex(sheets,{dateET,mu,gameId}){
-  const res=await sheets.spreadsheets.values.get({spreadsheetId:SHEET_ID,range:`${TAB_NAME}!A1:Z2000`});
-  const rows=res.data.values||[];
-  if(!rows.length)return-1;
-  const hdr=rows[0]||[];
-  const h=colMap(hdr);
-  if(h["game id"]!=null){
-    for(let i=1;i<rows.length;i++){
-      if((rows[i][h["game id"]]||"").toString().trim()===String(gameId))return i;
-    }
-  }
-  const iDate=h["date"],iMu=h["matchup"];
-  if(iDate==null||iMu==null)return-1;
-  for(let i=1;i<rows.length;i++){
-    const r=rows[i]||[],d=(r[iDate]||"").trim(),m=(r[iMu]||"").trim();
-    if(d===dateET&&m===mu)return i;
-  }
-  return-1;
-}
-
-async function writeCells(sheets,rowIdx,kv){
-  const header=(await sheets.spreadsheets.values.get({spreadsheetId:SHEET_ID,range:`${TAB_NAME}!A1:Z1`})).data.values?.[0]||[];
-  const h=colMap(header);
-  const updates=[];
-  for(const [name,val]of Object.entries(kv)){
-    if(val==null)return;
-    const j=h[name.toLowerCase()];if(j==null)continue;
-    const col=String.fromCharCode("A".charCodeAt(0)+j);
-    const row=rowIdx+2;
-    updates.push({range:`${TAB_NAME}!${col}${row}`,values:[[val]]});
-  }
-  if(!updates.length)return 0;
-  await sheets.spreadsheets.values.batchUpdate({
-    spreadsheetId:SHEET_ID,
-    requestBody:{valueInputOption:"USER_ENTERED",data:updates}
+// Locate the row by Game ID in column A
+async function findRowByGameId(gameId) {
+  // Read col A only (fast)
+  const get = await sheets.spreadsheets.values.get({
+    spreadsheetId: GOOGLE_SHEET_ID,
+    range: `${TAB_NAME}!A:A`,
+    majorDimension: "COLUMNS",
   });
-  return updates.length;
+  const colA = get.data?.values?.[0] || [];
+  // Header in row 1 -> data starts row 2
+  const idx = colA.findIndex(v => String(v).trim() === String(gameId).trim());
+  if (idx === -1) return null;
+  const row = idx + 1; // 1-based
+  if (row === 1) return null; // header row
+  return row;
 }
 
-(async()=>{
-  const sheets=await sheetsClient();
-  let totalMin=0;
-  for(;;){
-    const sum=await fetchJson(summaryUrl(EVENT_ID));
-    const st=parseStatus(sum);
-    const tm=getTeams(sum);
-    const dateET=etDateStr(kickoffISO(sum));
-    const mu=matchup(tm.awayName,tm.homeName);
-    const rowIdx=await findRowIndex(sheets,{dateET,mu,gameId:EVENT_ID});
-    const currentStatus=st.shortDetail||st.state||"unknown";
-    console.log(`[${currentStatus}] ${mu} Q${st.period||0} (${st.displayClock})`);
+// Write halftime score + live odds to L..Q
+async function writeHalftimeRow(row, halfScore, live) {
+  const values = [
+    [
+      halfScore,
+      live?.awaySpread ?? "",
+      live?.awayML ?? "",
+      live?.homeSpread ?? "",
+      live?.homeML ?? "",
+      live?.total ?? "",
+    ],
+  ];
+  await sheets.spreadsheets.values.update({
+    spreadsheetId: GOOGLE_SHEET_ID,
+    range: `${TAB_NAME}!L${row}:Q${row}`,
+    valueInputOption: "USER_ENTERED",
+    requestBody: { values },
+  });
+}
 
-    const isHalf=/HALF/i.test(st.name)||(st.state==="in"&&Number(st.period)===2&&/^0?:?0{1,2}\b/.test(st.displayClock||""));
-    if(rowIdx>=0&&!isHalf){
-      const hdrRes=await sheets.spreadsheets.values.get({spreadsheetId:SHEET_ID,range:`${TAB_NAME}!A1:Z1`});
-      const hdr=hdrRes.data.values?.[0]||[];
-      const h=colMap(hdr);
-      const rowRes=await sheets.spreadsheets.values.get({spreadsheetId:SHEET_ID,range:`${TAB_NAME}!A${rowIdx+2}:Z${rowIdx+2}`});
-      const row=rowRes.data.values?.[0]||[];
-      const cur=(row[h["status"]]||"").toString().trim();
-      if(cur!=="Half"&&cur!=="Final"){
-        await writeCells(sheets,rowIdx,{"status":currentStatus});
-      }
-    }
+// Write Status cell (column D) with a minimal update (no styles)
+async function writeStatus(row, statusText) {
+  await sheets.spreadsheets.values.update({
+    spreadsheetId: GOOGLE_SHEET_ID,
+    range: `${TAB_NAME}!D${row}:D${row}`,
+    valueInputOption: "USER_ENTERED",
+    requestBody: { values: [[statusText]] },
+  });
+}
 
-    if(isHalf){
-      const halfScore=`${tm.awayScore}-${tm.homeScore}`;
-      if(rowIdx<0){console.log(`No matching row for ${mu}`);return;}
-      await writeCells(sheets,rowIdx,{"status":"Half","half score":halfScore});
-      console.log(`✅ Halftime written (${halfScore})`);
-      return;
-    }
+// If Status already "Half" or "Final", don't keep scribbling over it
+async function readStatus(row) {
+  const res = await sheets.spreadsheets.values.get({
+    spreadsheetId: GOOGLE_SHEET_ID,
+    range: `${TAB_NAME}!D${row}:D${row}`,
+  });
+  return res.data?.values?.[0]?.[0] ?? "";
+}
 
-    const sleepM=decideSleep(st.period,st.displayClock);
-    console.log(`Sleeping ${sleepM}m`);
-    await new Promise(r=>setTimeout(r,msFromMin(sleepM)));
-    totalMin+=sleepM;
-    if(totalMin>=MAX_TOTAL_MIN){console.log("⏹ MAX_TOTAL_MIN reached.");return;}
+(async function main() {
+  console.log(`Watching ${LEAGUE} game ${TARGET_GAME_ID} for halftime → ${TAB_NAME}`);
+
+  const row = await findRowByGameId(TARGET_GAME_ID);
+  if (!row) {
+    console.error(`Game ID ${TARGET_GAME_ID} not found in column A of tab "${TAB_NAME}".`);
+    process.exit(0);
   }
-})().catch(e=>{console.error("Fatal:",e);process.exit(1);});
+
+  const startedAt = Date.now();
+  const maxMs = Number(MAX_TOTAL_MIN) * 60_000;
+  const pollMs = Number(POLL_SECONDS) * 1000;
+
+  while (true) {
+    if (Date.now() - startedAt > maxMs) {
+      console.log("Max watch time reached. Exiting.");
+      break;
+    }
+
+    let summary;
+    try {
+      summary = await getSummary();
+    } catch (e) {
+      console.warn("Fetch summary failed (will retry):", e?.message || e);
+      await sleep(pollMs);
+      continue;
+    }
+
+    const { isHalftime, isFinal, display, homeScore, awayScore } = parseStatus(summary);
+
+    const currentStatus = (await readStatus(row)) || "";
+    // Keep Status updated DURING the half only; if already Half/Final, leave it.
+    if (!/^Half$|^Final$/i.test(currentStatus)) {
+      await writeStatus(row, display || "");
+    }
+
+    if (isHalftime || isFinal) {
+      // At halftime (or if we reached final before we got to it), lock in the halftime line write.
+      const halfScore = `${awayScore}-${homeScore}`;
+
+      let live = null;
+      try {
+        live = extractLiveOdds(summary);
+      } catch (e) {
+        console.warn("extractLiveOdds error:", e?.message || e);
+      }
+
+      debug("Halftime write:", { halfScore, live });
+
+      await writeHalftimeRow(row, halfScore, live || {});
+      // Also set Status explicitly to "Half" if not Final
+      if (!isFinal) {
+        await writeStatus(row, "Half");
+      }
+      console.log("Halftime data written. Exiting.");
+      break;
+    }
+
+    await sleep(pollMs);
+  }
+})().catch(err => {
+  console.error("Watcher fatal:", err?.stack || err);
+  process.exit(1);
+});
