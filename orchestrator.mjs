@@ -1,4 +1,3 @@
-// orchestrator.mjs
 import fs from "node:fs/promises";
 import { google } from "googleapis";
 import axios from "axios";
@@ -36,7 +35,7 @@ function yyyymmddFromDate(d) {
 function startOfWeekUTC(d) {
   const copy = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
   const dow = copy.getUTCDay();
-  const delta = (dow + 6) % 7; // to Monday
+  const delta = (dow + 6) % 7; // Monday
   copy.setUTCDate(copy.getUTCDate() - delta);
   return copy;
 }
@@ -118,7 +117,7 @@ function toKickoffLocal(competition) {
   const date = competition?.date ? new Date(competition.date) : null;
   if (!date) return "";
   const hh = date.getUTCHours(), mm = pad2(date.getUTCMinutes());
-  const hoursET = ((hh + 24) - 4) % 24; // simple UTC→ET display
+  const hoursET = ((hh + 24) - 4) % 24;
   const h12 = ((hoursET + 11) % 12) + 1;
   const ampm = hoursET < 12 ? "AM" : "PM";
   return `${h12}:${mm} ${ampm}`;
@@ -141,7 +140,7 @@ function computeFavoriteKey(odds) {
 }
 
 /* ---------------------------- write sheet ------------------------- */
-// SAFER: never set a run that starts at or past the text length.
+// SAFE underline: no trailing run when end === text length
 function buildUnderlineRuns(text, start, end) {
   if (start == null || end == null) return [];
   const len = (text || "").length;
@@ -150,7 +149,6 @@ function buildUnderlineRuns(text, start, end) {
   const e = Math.max(0, Math.min(end, len));
   if (s >= e) return [];
   const runs = [{ startIndex: s, format: { underline: true } }];
-  // Only add a trailing run if it starts strictly before len
   if (e < len) runs.push({ startIndex: e });
   return runs;
 }
