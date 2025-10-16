@@ -29,20 +29,23 @@ jobs:
         with:
           node-version: 20
 
-      # Install deps on the runner so imports resolve (axios + googleapis)
+      # ✅ Install axios + googleapis in the repo workspace, and verify
       - name: Install runtime deps
+        working-directory: ${{ github.workspace }}
         run: |
-          if [ -f package.json ]; then
-            npm ci
-          else
-            npm install --no-save axios googleapis
-          fi
+          echo "Workspace:" && pwd
+          # Create a minimal package.json if none exists so npm doesn't complain
+          test -f package.json || echo '{}' > package.json
+          npm install --no-save axios googleapis
+          echo "Installed modules:" && ls -la node_modules | head -n 50
+          echo "npm ls axios:" && npm ls axios || true
 
       - name: Run orchestrator finals sweep
+        working-directory: ${{ github.workspace }}
         env:
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
           GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
           LEAGUE: ${{ matrix.league }}
           TAB_NAME: ${{ matrix.tab }}
-          PREFILL_MODE: finals        # your script should treat this as "finals sweep"
+          PREFILL_MODE: finals       # your script reads this as the finals sweep mode
         run: node orchestrator.mjs
