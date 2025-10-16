@@ -71,12 +71,9 @@ function richTextUnderlineForMatchup(matchup, favSide, awayName, homeName) {
 
   const end = start + favName.length;
   const runs = [];
-  // If favorite starts after 0, create a neutral run at 0
-  if (start > 0) runs.push({ startIndex: 0 });
-  // Underline just the favorite
-  runs.push({ startIndex: start, format: { underline: true } });
-  // Ensure we turn underline off after the favorite
-  if (end < len) runs.push({ startIndex: end });
+  if (start > 0) runs.push({ startIndex: 0 }); // neutral until favorite
+  runs.push({ startIndex: start, format: { underline: true } }); // underline favorite only
+  if (end < len) runs.push({ startIndex: end }); // turn underline back off
   return { text, runs };
 }
 
@@ -106,6 +103,47 @@ function parseSpreadsFromOdds(odds, awayName, homeName, awayAbbr, homeAbbr) {
     }
   }
   return { spreadAway: null, spreadHome: null };
+}
+
+/* ========== Moneyline fallbacks (CFB-safe) ========== */
+async function extractMoneylines(comp) {
+  const odds = comp?.odds?.[0] || {};
+  // 1) inline first
+  let mlAway = asNum(odds?.awayTeamOdds?.moneyLine);
+  let mlHome = asNum(odds?.homeTeamOdds?.moneyLine);
+  if (mlAway != null || mlHome != null) return { mlAway, mlHome };
+
+  // 2) odds subresource link
+  const oddsLink =
+    odds?.links?.find?.((l) => (l.rel || []).includes("odds"))?.href ||
+    comp?.odds?.find?.((o) => o?.links?.some?.((l) => (l.rel || []).includes("odds")))?.links?.find?.((l) => (l.rel || []).includes("odds"))?.href;
+
+  if (oddsLink) {
+    try {
+      const data = await fetchJson(oddsLink);
+      // Common shapes we’ve seen:
+      // - data.items[0].awayTeamOdds.moneyLine / homeTeamOdds.moneyLine
+      // - data.items[0].moneyLineAway / moneyLineHome
+      // - data.items[0].prices[0].away.moneyLine / home.moneyLine (rare)
+      const item = (data?.items && data.items[0]) || data;
+      mlAway =
+        asNum(item?.awayTeamOdds?.moneyLine) ??
+        asNum(item?.moneyLineAway) ??
+        asNum(item?.prices?.[0]?.away?.moneyLine) ??
+        null;
+      mlHome =
+        asNum(item?.homeTeamOdds?.moneyLine) ??
+        asNum(item?.moneyLineHome) ??
+        asNum(item?.prices?.[0]?.home?.moneyLine) ??
+        null;
+      if (mlAway != null || mlHome != null) return { mlAway, mlHome };
+    } catch (e) {
+      // Silent fallback; we’ll just leave ML blank if ESPN doesn’t expose it here
+    }
+  }
+
+  // 3) give up gracefully (leave nulls)
+  return { mlAway: null, mlHome: null };
 }
 
 /* ========== PREFILL ========== */
@@ -159,13 +197,14 @@ async function runPrefill() {
     const kickoff = fmtKickET(date);
     const weekLabel = week?.number ? `Week ${week.number}` : "Week ?";
 
-    // Odds
+    // Odds & totals
     const odds = comp?.odds?.[0] || {};
     const total = asNum(odds?.overUnder);
 
-    let mlAway = asNum(odds?.awayTeamOdds?.moneyLine);
-    let mlHome = asNum(odds?.homeTeamOdds?.moneyLine);
+    // Moneyline (with fallback)
+    let { mlAway, mlHome } = await extractMoneylines(comp);
 
+    // Spreads
     const { spreadAway, spreadHome } = parseSpreadsFromOdds(
       odds, awayName, homeName, awayAbbr, homeAbbr
     );
@@ -181,11 +220,11 @@ async function runPrefill() {
     const matchup = `${awayName} @ ${homeName}`;
     const { text, runs } = richTextUnderlineForMatchup(matchup, favSide, awayName, homeName);
 
-    // Compose A..K row (NOTE the explicit base textFormat on column E)
+    // Compose A..K row
     outRows.push({
       values: [
         { userEnteredValue: { stringValue: String(id) } },           // A Game ID
-        { userEnteredValue: { stringValue: displayDate } },          // B Date
+        { userEnteredValue: { stringValue: displayDate } },          // B Date (MM/DD/YY)
         { userEnteredValue: { stringValue: weekLabel } },            // C Week
         { userEnteredValue: { stringValue: kickoff } },              // D Status
         {
@@ -244,8 +283,11 @@ async function runPrefill() {
         {
           updateCells: {
             rows: newRows,
-            // include base textFormat reset for E along with runs
-            fields: "userEnteredValue,textFormatRuns,userEnteredFormat.textFormat.underline,userEnteredFormat.textFormat.bold",
+            fields:
+              "userEnteredValue," +
+              "textFormatRuns," +
+              "userEnteredFormat.textFormat.underline," +
+              "userEnteredFormat.textFormat.bold",
             range: {
               sheetId,
               startRowIndex,
@@ -262,7 +304,7 @@ async function runPrefill() {
   console.log(`✅ Prefill completed: ${newRows.length} new rows`);
 }
 
-/* ========== Finals sweep (bold winner; grade only when Final) ========== */
+/* ========== Finals sweep (winner bold; grade only when Final) ========== */
 const COLORS = {
   green: { red: 0.85, green: 0.95, blue: 0.85 },
   red:   { red: 0.98, green: 0.85, blue: 0.85 },
@@ -335,7 +377,7 @@ async function runFinalsSweep() {
 
       if (!isFinal) continue; // ✅ Only grade when Final
 
-      // Winner bold only (preserve existing underline from prefill)
+      // Winner bold only (preserve underline)
       const matchupText = r[4] || "";
       const [awayName, homeName] = (matchupText || "").split(" @ ").map(s => (s || "").trim());
       const winnerSide = awayScore > homeScore ? "away" : (homeScore > awayScore ? "home" : null);
@@ -387,6 +429,12 @@ async function runFinalsSweep() {
             fields: "userEnteredFormat.backgroundColor",
           },
         });
+      };
+
+      const COLORS = {
+        green: { red: 0.85, green: 0.95, blue: 0.85 },
+        red:   { red: 0.98, green: 0.85, blue: 0.85 },
+        gray:  { red: 0.93, green: 0.93, blue: 0.93 },
       };
 
       if (awayML != null || homeML != null) {
