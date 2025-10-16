@@ -26,7 +26,6 @@ const COL = {
 /* ===== Colors ===== */
 const GREEN = { red: 0.85, green: 0.95, blue: 0.85 };
 const RED   = { red: 0.98, green: 0.88, blue: 0.88 };
-// If we ever need to clear, use explicit WHITE instead of {} to avoid black.
 const WHITE = { red: 1, green: 1, blue: 1 };
 
 /* ===== Google Sheets ===== */
@@ -46,22 +45,19 @@ async function getSheetIdByTitle(sheets, spreadsheetId, title) {
   if (!tab) throw new Error(`Tab "${title}" not found`);
   return tab.properties.sheetId;
 }
-
-/* Read entire grid A:K to support UPSERT */
 async function readGridMap(sheets, spreadsheetId, title) {
-  const range = `'${title}'!A2:K`; // skip header
+  const range = `'${title}'!A2:K`;
   const { data } = await sheets.spreadsheets.values.get({ spreadsheetId, range });
   const rows = data.values || [];
-  // map: gameId -> { rowIndex0, values }
   const map = new Map();
   rows.forEach((vals, i) => {
     const gid = vals?.[0] ? String(vals[0]) : "";
-    if (gid) map.set(gid, { rowIndex0: 1 + i, values: vals }); // +1 because header at row 0
+    if (gid) map.set(gid, { rowIndex0: 1 + i, values: vals });
   });
   return { rowsCount: rows.length, map };
 }
 
-/* ===== Utils ===== */
+/* ===== Small utils ===== */
 function pLimit(n) {
   let active = 0, q = [];
   const next = () => { active--; if (q.length) q.shift()(); };
@@ -96,7 +92,7 @@ function parseNum(v){
   return /^[+-]?\d+(\.\d+)?$/.test(s)?Number(s):null;
 }
 
-/* Favorite underline helper */
+/* Favorite underline helpers */
 function teamLabel(away, home, favKey){
   const a=away?.team?.shortDisplayName||away?.team?.abbreviation||away?.team?.name||"Away";
   const h=home?.team?.shortDisplayName||home?.team?.abbreviation||home?.team?.name||"Home";
@@ -125,11 +121,20 @@ function winnerKey(a,h){ if(a>h) return "away"; if(h>a) return "home"; return nu
 
 /* ===== ESPN fetch ===== */
 const leaguePath = () => LEAGUE==="college-football" ? "football/college-football" : "football/nfl";
-async function fetchScoreboard(){ // week or today
+
+/* >>> CHANGED: include groups=80 for CFB so we get ALL FBS, not just Top 25. <<< */
+async function fetchScoreboard(){
   const url=`https://site.api.espn.com/apis/site/v2/sports/${leaguePath()}/scoreboard`;
-  const {data}=await axios.get(url,{timeout:15000});
+  const params = {};
+  if (LEAGUE === "college-football") {
+    params.groups = "80";   // FBS only
+    params.limit  = 300;    // plenty
+  }
+  // (RUN_SCOPE kept for future use; ESPN defaults are usually current week)
+  const {data}=await axios.get(url,{ timeout:15000, params });
   return data;
 }
+
 function pickProvider(oddsArr){
   if (!Array.isArray(oddsArr)||!oddsArr.length) return null;
   const byName = n => oddsArr.find(o => (o?.provider?.name||"").toUpperCase()===n.toUpperCase());
@@ -160,8 +165,9 @@ async function fetchMlFallback(eventId){
     if (Array.isArray(data?.pickcenter)) pools.push(...data.pickcenter);
     if (Array.isArray(data?.odds)) pools.push(...data.odds);
     const upper=s=>(s||"").toUpperCase();
-    const byProv=pools.find.bind(pools);
-    let pick = PROVIDER_PREFERENCE.map(p => pools.find(x=>upper(x?.provider?.name)===upper(p) && (x?.awayTeamOdds?.moneyLine!=null || x?.homeTeamOdds?.moneyLine!=null))).find(Boolean);
+    let pick = PROVIDER_PREFERENCE
+      .map(p => pools.find(x=>upper(x?.provider?.name)===upper(p) && (x?.awayTeamOdds?.moneyLine!=null || x?.homeTeamOdds?.moneyLine!=null)))
+      .find(Boolean);
     if (!pick) pick = pools.find(x => x?.awayTeamOdds?.moneyLine!=null || x?.homeTeamOdds?.moneyLine!=null);
     if (!pick) return {awayML:null,homeML:null};
     return {
@@ -195,7 +201,6 @@ function valuesForRow(r){
 }
 function bgCell(color){ return { userEnteredFormat:{ backgroundColor: color } }; }
 
-/* grading backgrounds only for finals */
 function gradeBackgrounds(finalScore, odds){
   const {a,h}=scorePair(finalScore||"");
   if (a==null || h==null) return {};
@@ -234,7 +239,7 @@ async function main(){
   const events = Array.isArray(board?.events) ? board.events : [];
 
   const requests = [];
-  let appendCursor = 1 + rowsCount; // 0-based row index for next append (header=0, first data row=1)
+  let appendCursor = 1 + rowsCount;
 
   for (const ev of events){
     const comp = ev?.competitions?.[0];
@@ -246,7 +251,7 @@ async function main(){
     const statusName = (comp?.status?.type?.name || ev?.status?.type?.name || "").toLowerCase();
     const isFinal = statusName.includes("final");
 
-    // Odds (with CFB ML fallback)
+    // Odds (+ CFB ML fallback)
     let odds = extractOdds(comp);
     if (LEAGUE==="college-football" && (odds.awayML==null || odds.homeML==null)){
       const ml = await limit(()=>fetchMlFallback(comp.id));
@@ -254,16 +259,14 @@ async function main(){
       if (odds.homeML==null) odds.homeML = ml.homeML;
     }
 
-    // Teams / favorite underline
+    // Teams & favorite underline
     const away = comp?.competitors?.find(c=>c.homeAway==="away");
     const home = comp?.competitors?.find(c=>c.homeAway==="home");
     const favKey = favoriteKeyFromOdds(odds);
     const { text: matchupText, uStart, uEnd } = teamLabel(away, home, favKey);
 
-    // Score + status/time
-    const finalScore = isFinal
-      ? `${away?.score ?? ""}-${home?.score ?? ""}`
-      : "";
+    // Score/time/labels
+    const finalScore = isFinal ? `${away?.score ?? ""}-${home?.score ?? ""}` : "";
     const weekTxt = inferWeekTxt(LEAGUE, ev?.week || comp?.week || {});
     const status = isFinal ? "Final" : toLocalET(comp?.date);
 
@@ -283,48 +286,22 @@ async function main(){
 
     const existing = sheetMap.get(gameId);
 
-    /* ---------- UPSERT ---------- */
     const writeRow = (rowIndex0) => {
-      // 1) write the entire row values (append) OR only selected cells (update)
-      if (existing){
-        // update odds/time/score/matchup in place for existing row
-        // values: write F..K, D (status), E (matchup), B (date), C (week)
-        const cells = [
-          { col: COL.date,       v: rowPayload.date     },
-          { col: COL.week,       v: rowPayload.week     },
-          { col: COL.status,     v: rowPayload.status   },
-          { col: COL.matchup,    v: rowPayload.matchupText },
-          { col: COL.finalScore, v: rowPayload.finalScore },
-          { col: COL.awaySpread, v: rowPayload.awaySpread },
-          { col: COL.awayML,     v: rowPayload.awayML     },
-          { col: COL.homeSpread, v: rowPayload.homeSpread },
-          { col: COL.homeML,     v: rowPayload.homeML     },
-          { col: COL.total,      v: rowPayload.total      },
-        ];
-        requests.push({
-          updateCells: {
-            range: { sheetId, startRowIndex: rowIndex0, endRowIndex: rowIndex0+1, startColumnIndex: 0, endColumnIndex: 11 },
-            rows: [{ values: [
-              val(gameId), val(rowPayload.date), val(rowPayload.week), val(rowPayload.status),
-              val(rowPayload.matchupText), val(rowPayload.finalScore),
-              val(rowPayload.awaySpread), val(rowPayload.awayML),
-              val(rowPayload.homeSpread), val(rowPayload.homeML), val(rowPayload.total)
-            ]}],
-            fields: "userEnteredValue"
-          }
-        });
-      } else {
-        // append full row
-        requests.push({
-          updateCells: {
-            range: { sheetId, startRowIndex: rowIndex0, endRowIndex: rowIndex0+1, startColumnIndex: 0, endColumnIndex: 11 },
-            rows: [{ values: valuesForRow(rowPayload) }],
-            fields: "userEnteredValue"
-          }
-        });
-      }
+      // upsert values
+      requests.push({
+        updateCells: {
+          range: { sheetId, startRowIndex: rowIndex0, endRowIndex: rowIndex0+1, startColumnIndex: 0, endColumnIndex: 11 },
+          rows: [{ values: [
+            val(rowPayload.gameId), val(rowPayload.date), val(rowPayload.week), val(rowPayload.status),
+            val(rowPayload.matchupText), val(rowPayload.finalScore),
+            val(rowPayload.awaySpread), val(rowPayload.awayML),
+            val(rowPayload.homeSpread), val(rowPayload.homeML), val(rowPayload.total)
+          ]}],
+          fields: "userEnteredValue"
+        }
+      });
 
-      // 2) underline favorite (safe text runs)
+      // safe underline (no-op on non-fav)
       const runs = textRuns(rowPayload.matchupText, rowPayload.uStart, rowPayload.uEnd);
       if (runs.length){
         requests.push({
@@ -336,7 +313,7 @@ async function main(){
         });
       }
 
-      // 3) finals-only cell coloring (NO formatting for non-finals)
+      // finals-only grading (no formatting on non-finals)
       if (rowPayload.status === "Final" && rowPayload.finalScore){
         const g = gradeBackgrounds(rowPayload.finalScore, odds);
         const colorAt = (col, bg) => {
@@ -344,7 +321,7 @@ async function main(){
           requests.push({
             updateCells: {
               range: { sheetId, startRowIndex: rowIndex0, endRowIndex: rowIndex0+1, startColumnIndex: col, endColumnIndex: col+1 },
-              rows: [{ values: [bgCell(bg)] }],
+              rows: [{ values: [{ userEnteredFormat:{ backgroundColor: bg } }] }],
               fields: "userEnteredFormat.backgroundColor"
             }
           });
