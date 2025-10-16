@@ -1,29 +1,25 @@
 name: CFB Games (Prefill - Full Week)
 
 on:
-  schedule:
-    # Thu/Fri/Sat morning + an extra Saturday refresh
-    - cron: "15 11 * * 4,5,6"   # 7:15 AM ET
-    - cron: "15 15 * * 6"       # 11:15 AM ET
   workflow_dispatch:
 
 jobs:
   prefill:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
-
     steps:
+      - name: Set up job
+        run: echo "Starting CFB prefill…"
+
       - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: '20'
 
       - name: Install dependencies
-        run: |
-          npm install googleapis axios
+        run: npm i axios googleapis
 
       - name: Prefill week (CFB)
         env:
@@ -31,5 +27,8 @@ jobs:
           GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
           LEAGUE: college-football
           TAB_NAME: CFB
-          PREFILL_MODE: week
+          RUN_SCOPE: week
         run: node orchestrator.mjs
+
+      - name: Complete job
+        run: echo "Done."
