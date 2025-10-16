@@ -1,34 +1,31 @@
 name: NFL Games (Prefill)
 
 on:
-  schedule:
-    # Run twice weekly to grab all upcoming games and refresh odds
-    - cron: "30 10 * * 2"   # Tuesday 6:30 AM ET
-    - cron: "15 15 * * 0"   # Sunday 11:15 AM ET
   workflow_dispatch:
 
 jobs:
   prefill:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout repository
+      - name: Set up job
+        run: echo "Starting NFL prefill…"
+
+      - name: Run actions/checkout@v4
         uses: actions/checkout@v4
 
-      - name: Setup Node.js
+      - name: Run actions/setup-node@v4
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: '20'
 
-      - name: Install dependencies
-        run: |
-          npm install googleapis axios playwright
+      - name: Install deps
+        run: npm i axios googleapis
 
-      - name: Prefill week (NFL)
+      - name: Run node orchestrator.mjs
         env:
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
           GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
           LEAGUE: nfl
           TAB_NAME: NFL
-          PREFILL_MODE: week
+          RUN_SCOPE: week
         run: node orchestrator.mjs
