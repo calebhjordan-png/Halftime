@@ -5,8 +5,8 @@ import axios from "axios";
 const {
   GOOGLE_SHEET_ID,
   GOOGLE_SERVICE_ACCOUNT,
-  LEAGUE = "college-football", // "nfl" or "college-football"
-  TAB_NAME = "CFB",            // Sheet tab name
+  LEAGUE = "college-football", // "nfl" | "college-football"
+  TAB_NAME = "CFB",            // target sheet tab name
   PREFILL_MODE = "week",       // "today" | "week" | "live_daily" | "finals"
 } = process.env;
 
@@ -35,20 +35,19 @@ const asNum = (v) =>
     ? v
     : (v != null && v !== "" ? Number(v) : null);
 
+/* ========== date / time formatting ========== */
 function fmtESPNDate(d) {
   const y = d.getFullYear();
   const m = String(d.getMonth() + 1).padStart(2, "0");
   const day = String(d.getDate()).padStart(2, "0");
   return `${y}${m}${day}`;
 }
-
 function fmtDisplayDateMDY(d) {
   const mm = String(d.getMonth() + 1).padStart(2, "0");
   const dd = String(d.getDate()).padStart(2, "0");
   const yy = String(d.getFullYear()).slice(-2);
   return `${mm}/${dd}/${yy}`;
 }
-
 function fmtKickET(isoStr) {
   const dt = new Date(isoStr);
   return dt.toLocaleTimeString("en-US", {
@@ -58,7 +57,7 @@ function fmtKickET(isoStr) {
   });
 }
 
-/* =========== Underline the favorite team in matchup =========== */
+/* ====== underline the pregame favorite inside the matchup cell ====== */
 function richTextUnderlineForMatchup(matchup, favSide, awayName, homeName) {
   const text = matchup || "";
   const len = text.length;
@@ -78,7 +77,7 @@ function richTextUnderlineForMatchup(matchup, favSide, awayName, homeName) {
   return { text, runs };
 }
 
-/* =========== Parse spreads and odds =========== */
+/* ========== parse spreads & odds (robust across ESPN shapes) ========== */
 function parseSpreadsFromOdds(odds, awayName, homeName, awayAbbr, homeAbbr) {
   let spreadAway = null;
   let spreadHome = null;
@@ -104,14 +103,18 @@ function parseSpreadsFromOdds(odds, awayName, homeName, awayAbbr, homeAbbr) {
   return { spreadAway, spreadHome };
 }
 
-/* ==================== PREFILL (today/week) ==================== */
+/* ==================== PREFILL (today / week / live_daily) ==================== */
 async function runPrefill() {
   console.log(`🏈 Running orchestrator for ${LEAGUE}, mode=${PREFILL_MODE}`);
 
   const now = new Date();
   const start = new Date(now);
   const end = new Date(now);
-  if (PREFILL_MODE !== "today") {
+
+  if (PREFILL_MODE === "today") {
+    // just today
+  } else {
+    // default to whole week-ish
     start.setDate(start.getDate() - 1);
     end.setDate(end.getDate() + 7);
   }
@@ -153,8 +156,11 @@ async function runPrefill() {
     let mlAway = asNum(odds?.awayTeamOdds?.moneyLine);
     let mlHome = asNum(odds?.homeTeamOdds?.moneyLine);
 
-    let { spreadAway, spreadHome } = parseSpreadsFromOdds(odds, awayName, homeName, awayAbbr, homeAbbr);
+    let { spreadAway, spreadHome } = parseSpreadsFromOdds(
+      odds, awayName, homeName, awayAbbr, homeAbbr
+    );
 
+    // very light fallback if only MLs exist
     if (spreadAway == null && spreadHome == null && mlAway != null && mlHome != null) {
       if (mlAway < 0 && mlHome > 0) { spreadAway = -2.5; spreadHome = 2.5; }
       else if (mlHome < 0 && mlAway > 0) { spreadHome = -2.5; spreadAway = 2.5; }
@@ -169,14 +175,16 @@ async function runPrefill() {
     }
     const { text, runs } = richTextUnderlineForMatchup(matchup, favSide, awayName, homeName);
 
+    // Build new row (A..F): Game ID, Date, Week, Status, Matchup, Final Score
     outRows.push({
       values: [
-        { userEnteredValue: { stringValue: String(id) } },
-        { userEnteredValue: { stringValue: displayDate } },
-        { userEnteredValue: { stringValue: weekLabel } },
-        { userEnteredValue: { stringValue: kickoff } },
-        { userEnteredValue: { stringValue: text }, textFormatRuns: runs },
-        { userEnteredValue: { stringValue: "" } },
+        { userEnteredValue: { stringValue: String(id) } },       // A Game ID
+        { userEnteredValue: { stringValue: displayDate } },      // B Date (MM/DD/YY)
+        { userEnteredValue: { stringValue: weekLabel } },        // C Week
+        { userEnteredValue: { stringValue: kickoff } },          // D Status (kick time)
+        { userEnteredValue: { stringValue: text }, textFormatRuns: runs }, // E Matchup (fav underlined)
+        { userEnteredValue: { stringValue: "" } },               // F Final Score
+        // NOTE: Odds columns (G..K) are left for other jobs if you populate them elsewhere.
       ],
     });
   }
@@ -186,6 +194,7 @@ async function runPrefill() {
     return;
   }
 
+  // Find target sheet
   const meta = await sheets.spreadsheets.get({
     spreadsheetId: GOOGLE_SHEET_ID,
     includeGridData: false,
@@ -197,6 +206,7 @@ async function runPrefill() {
   }
   const sheetId = targetSheet.properties.sheetId;
 
+  // Dedup by Game ID (col A)
   const existing = await sheets.spreadsheets.values.get({
     spreadsheetId: GOOGLE_SHEET_ID,
     range: `${TAB_NAME}!A2:A`,
@@ -211,9 +221,10 @@ async function runPrefill() {
     return;
   }
 
-  const startRowIndex = (existing.data.values?.length || 0) + 1;
+  const startRowIndex = (existing.data.values?.length || 0) + 1; // 1-based after header
   const endRowIndex = startRowIndex + newRows.length;
 
+  // Write rows (A..F) with textFormatRuns intact
   await sheets.spreadsheets.batchUpdate({
     spreadsheetId: GOOGLE_SHEET_ID,
     requestBody: {
@@ -227,7 +238,7 @@ async function runPrefill() {
               startRowIndex,
               endRowIndex,
               startColumnIndex: 0,
-              endColumnIndex: 6,
+              endColumnIndex: 6, // A..F
             },
           },
         },
@@ -253,6 +264,7 @@ async function runFinalsSweep() {
     return;
   }
 
+  // Candidates: rows that either have blank final score OR status is not "Final"
   const candidates = [];
   rows.forEach((r, idx) => {
     const gameId = (r[0] || "").trim();
@@ -284,12 +296,18 @@ async function runFinalsSweep() {
       if (!away || !home) continue;
 
       const finalScoreStr = `${away.score}-${home.score}`;
-      const targetRow = c.rowIndex + 2;
+      const targetRow = c.rowIndex + 2; // account for header
 
+      // ✅ Only update Status (D) and Final Score (F) — DO NOT touch Matchup (E)
       updates.push({
-        range: `${TAB_NAME}!D${targetRow}:F${targetRow}`,
-        values: [["Final", "", finalScoreStr]],
+        range: `${TAB_NAME}!D${targetRow}:D${targetRow}`,
+        values: [["Final"]],
       });
+      updates.push({
+        range: `${TAB_NAME}!F${targetRow}:F${targetRow}`,
+        values: [[finalScoreStr]],
+      });
+
       finalsWritten++;
     } catch (e) {
       console.warn(`Skipping ${c.gameId} (${e.message})`);
