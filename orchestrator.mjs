@@ -42,9 +42,9 @@ function fmtESPNDate(d) {
   return `${y}${m}${day}`;
 }
 
-// Display date: DD/MM/YY  ← requested format
-function fmtDisplayDateDMY(d) {
-   const mm = String(d.getMonth() + 1).padStart(2, "0");
+// Display date: MM/DD/YY  ← requested format
+function fmtDisplayDateMDY(d) {
+  const mm = String(d.getMonth() + 1).padStart(2, "0");
   const dd = String(d.getDate()).padStart(2, "0");
   const yy = String(d.getFullYear()).slice(-2);
   return `${mm}/${dd}/${yy}`;
@@ -163,14 +163,9 @@ async function main() {
   }
 
   // Pull scoreboards
-  const ESPN_SCOREBOARD = "https://site.api.espn.com/apis/site/v2/sports/football";
   const boards = (
     await Promise.allSettled(
-      days.map((d) =>
-        fetchJson(`${ESPN_SCOREBOARD}/${LEAGUE}/scoreboard?dates=${
-          d.getFullYear()}${String(d.getMonth()+1).padStart(2,"0")}${String(d.getDate()).padStart(2,"0")}`)
-          .then((j) => ({ d, j }))
-      )
+      days.map((d) => fetchJson(scoreboardUrl(LEAGUE, fmtESPNDate(d))).then((j) => ({ d, j })))
     )
   ).filter(r => r.status === "fulfilled").map(r => r.value);
 
@@ -193,7 +188,7 @@ async function main() {
     const awayAbbr = away.team?.abbreviation || "";
     const homeAbbr = home.team?.abbreviation || "";
 
-    const displayDate = fmtDisplayDateDMY(new Date(date)); // DD/MM/YY
+    const displayDate = fmtDisplayDateMDY(new Date(date)); // MM/DD/YY
     const kickoff = fmtKickET(date);
     const weekLabel = week?.number ? `Week ${week.number}` : "Week ?";
 
@@ -237,7 +232,7 @@ async function main() {
     outRows.push({
       values: [
         { userEnteredValue: { stringValue: String(id) } },         // A
-        { userEnteredValue: { stringValue: displayDate } },        // B  (DD/MM/YY)
+        { userEnteredValue: { stringValue: displayDate } },        // B  (MM/DD/YY)
         { userEnteredValue: { stringValue: weekLabel } },          // C
         { userEnteredValue: { stringValue: kickoff } },            // D
         { userEnteredValue: { stringValue: text }, textFormatRuns: runs }, // E
@@ -315,5 +310,3 @@ main().catch((e) => {
   console.error("❌ Orchestrator fatal:", e?.response?.data ?? e);
   process.exit(1);
 });
-
-
