@@ -7,7 +7,7 @@ const {
   GOOGLE_SHEET_ID,
   GOOGLE_SERVICE_ACCOUNT,
   LEAGUE = "college-football", // "nfl" | "college-football"
-  TAB_NAME = "CFB",            // target sheet tab name
+  TAB_NAME = "CFB",
   PREFILL_MODE = "week",       // "today" | "week" | "live_daily" | "finals"
 } = process.env;
 
@@ -115,7 +115,6 @@ async function runPrefill() {
   if (PREFILL_MODE === "today") {
     // just today
   } else {
-    // default to whole week-ish
     start.setDate(start.getDate() - 1);
     end.setDate(end.getDate() + 7);
   }
@@ -161,6 +160,7 @@ async function runPrefill() {
       odds, awayName, homeName, awayAbbr, homeAbbr
     );
 
+    // Fallback: infer small default if MLs show clear favorite/underdog (rare case)
     if (spreadAway == null && spreadHome == null && mlAway != null && mlHome != null) {
       if (mlAway < 0 && mlHome > 0) { spreadAway = -2.5; spreadHome = 2.5; }
       else if (mlHome < 0 && mlAway > 0) { spreadHome = -2.5; spreadAway = 2.5; }
@@ -175,14 +175,20 @@ async function runPrefill() {
     }
     const { text, runs } = richTextUnderlineForMatchup(matchup, favSide, awayName, homeName);
 
+    // ⬇️ WRITE A..K (note the numeric cells use numberValue)
     outRows.push({
       values: [
-        { userEnteredValue: { stringValue: String(id) } },       // A Game ID
-        { userEnteredValue: { stringValue: displayDate } },      // B Date (MM/DD/YY)
-        { userEnteredValue: { stringValue: weekLabel } },        // C Week
-        { userEnteredValue: { stringValue: kickoff } },          // D Status (kick time ET)
-        { userEnteredValue: { stringValue: text }, textFormatRuns: runs }, // E Matchup (fav underlined)
-        { userEnteredValue: { stringValue: "" } },               // F Final Score
+        { userEnteredValue: { stringValue: String(id) } },           // A Game ID
+        { userEnteredValue: { stringValue: displayDate } },          // B Date
+        { userEnteredValue: { stringValue: weekLabel } },            // C Week
+        { userEnteredValue: { stringValue: kickoff } },              // D Status
+        { userEnteredValue: { stringValue: text }, textFormatRuns: runs }, // E Matchup
+        { userEnteredValue: { stringValue: "" } },                   // F Final Score (blank)
+        { userEnteredValue: spreadAway != null ? { numberValue: spreadAway } : {} }, // G Away Spread
+        { userEnteredValue: mlAway     != null ? { numberValue: mlAway }     : {} }, // H Away ML
+        { userEnteredValue: spreadHome != null ? { numberValue: spreadHome } : {} }, // I Home Spread
+        { userEnteredValue: mlHome     != null ? { numberValue: mlHome }     : {} }, // J Home ML
+        { userEnteredValue: total      != null ? { numberValue: total }      : {} }, // K Total
       ],
     });
   }
@@ -233,7 +239,7 @@ async function runPrefill() {
               startRowIndex,
               endRowIndex,
               startColumnIndex: 0,
-              endColumnIndex: 6, // A..F
+              endColumnIndex: 11, // ✅ A..K (end is exclusive)
             },
           },
         },
@@ -244,7 +250,7 @@ async function runPrefill() {
   console.log(`✅ Prefill completed: ${newRows.length} new rows`);
 }
 
-/* ==================== FINALS SWEEP + FORMATTING ==================== */
+/* ==================== FINALS SWEEP + FORMATTING (unchanged logic) ==================== */
 const COLORS = {
   green: { red: 0.85, green: 0.95, blue: 0.85 },
   red:   { red: 0.98, green: 0.85, blue: 0.85 },
@@ -293,7 +299,6 @@ async function runFinalsSweep() {
     const statusCell = (r[3] || "").trim();
     const finalScoreCell = (r[5] || "").trim();
 
-    // Always check ESPN summary; we’ll only grade if final
     let isFinal = false;
     let awayScore = null, homeScore = null;
 
@@ -310,7 +315,6 @@ async function runFinalsSweep() {
       awayScore = asNum(away?.score);
       homeScore = asNum(home?.score);
 
-      // If just became final, write status + score
       if (isFinal && (!finalScoreCell || statusCell.toLowerCase() !== "final")) {
         const finalScoreStr = `${awayScore}-${homeScore}`;
         valueUpdates.push({ range: `${TAB_NAME}!D${rowNum}:D${rowNum}`, values: [["Final"]] });
@@ -318,19 +322,19 @@ async function runFinalsSweep() {
         finalsWritten++;
       }
 
-      // 🚫 If NOT final yet, skip all grading/formatting
+      // Only grade if Final
       if (!isFinal) continue;
 
-      // From here on, we’re FINAL — apply bold winner + color ML/Spread/Total
+      // Winner bold + keep favorite underline
       const matchupText = r[4] || "";
       const [awayName, homeName] = (matchupText || "").split(" @ ").map(s => (s || "").trim());
       const winnerSide = awayScore > homeScore ? "away" : (homeScore > awayScore ? "home" : null);
 
-      const awaySpread = asNum(r[6]); // G
-      const awayML     = asNum(r[7]); // H
-      const homeSpread = asNum(r[8]); // I
-      const homeML     = asNum(r[9]); // J
-      const total      = asNum(r[10]); // K
+      const awaySpread = asNum(r[6]);
+      const awayML     = asNum(r[7]);
+      const homeSpread = asNum(r[8]);
+      const homeML     = asNum(r[9]);
+      const total      = asNum(r[10]);
 
       let favSide = null;
       if (awaySpread != null && homeSpread != null) {
@@ -339,7 +343,6 @@ async function runFinalsSweep() {
         favSide = awayML < homeML ? "away" : (homeML < awayML ? "home" : null);
       }
 
-      // Build textFormatRuns: bold winner (finals only), keep fav underline
       const text = matchupText || "";
       const byIndex = new Map();
       const apply = (team, style) => {
@@ -370,7 +373,6 @@ async function runFinalsSweep() {
         },
       });
 
-      // Cell coloring helpers
       const colorCell = (col, color) => {
         formatRequests.push({
           repeatCell: {
@@ -386,9 +388,13 @@ async function runFinalsSweep() {
           },
         });
       };
-      const PUSH = COLORS.gray;
+      const COLORS = {
+        green: { red: 0.85, green: 0.95, blue: 0.85 },
+        red:   { red: 0.98, green: 0.85, blue: 0.85 },
+        gray:  { red: 0.93, green: 0.93, blue: 0.93 },
+      };
 
-      // ML grading (final only)
+      // ML grading
       if (awayML != null || homeML != null) {
         if (awayScore > homeScore) {
           colorCell(COL.H, COLORS.green);
@@ -399,26 +405,26 @@ async function runFinalsSweep() {
         }
       }
 
-      // Spread grading (final only)
+      // Spread grading
       if (awaySpread != null) {
         const awayCovers = awayScore + awaySpread > homeScore ? true
                          : awayScore + awaySpread < homeScore ? false
                          : null;
-        colorCell(COL.G, awayCovers === null ? PUSH : (awayCovers ? COLORS.green : COLORS.red));
+        colorCell(COL.G, awayCovers === null ? COLORS.gray : (awayCovers ? COLORS.green : COLORS.red));
       }
       if (homeSpread != null) {
         const homeCovers = homeScore + homeSpread > awayScore ? true
                          : homeScore + homeSpread < awayScore ? false
                          : null;
-        colorCell(COL.I, homeCovers === null ? PUSH : (homeCovers ? COLORS.green : COLORS.red));
+        colorCell(COL.I, homeCovers === null ? COLORS.gray : (homeCovers ? COLORS.green : COLORS.red));
       }
 
-      // Total grading (final only)
+      // Total grading
       if (total != null && awayScore != null && homeScore != null) {
         const sum = awayScore + homeScore;
         const color = sum > total ? COLORS.green
                     : sum < total ? COLORS.red
-                    : PUSH;
+                    : COLORS.gray;
         colorCell(COL.K, color);
       }
 
