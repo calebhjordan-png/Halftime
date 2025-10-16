@@ -2,8 +2,10 @@ name: Orchestrator Finals (sweeper)
 
 on:
   schedule:
-    - cron: '*/15 17-23 * * *'  # 1 PM–11 PM UTC (9 AM–7 PM ET)
-    - cron: '*/15 0-2 * * *'    # 12 AM–2 AM UTC (8 PM–10 PM ET)
+    # 1 PM–11 PM UTC (9 AM–7 PM ET)
+    - cron: "*/15 17-23 * * *"
+    # 12 AM–2 AM UTC (8 PM–10 PM ET)
+    - cron: "*/15 0-2 * * *"
   workflow_dispatch:
 
 jobs:
@@ -25,10 +27,16 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: 20
 
-      - name: Install deps
-        run: npm i googleapis
+      # Install deps on the runner so imports resolve (axios + googleapis)
+      - name: Install runtime deps
+        run: |
+          if [ -f package.json ]; then
+            npm ci
+          else
+            npm install --no-save axios googleapis
+          fi
 
       - name: Run orchestrator finals sweep
         env:
@@ -36,5 +44,5 @@ jobs:
           GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
           LEAGUE: ${{ matrix.league }}
           TAB_NAME: ${{ matrix.tab }}
-          RUN_SCOPE: today
+          PREFILL_MODE: finals        # your script should treat this as "finals sweep"
         run: node orchestrator.mjs
