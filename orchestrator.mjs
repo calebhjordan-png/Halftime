@@ -1,13 +1,13 @@
 import { google } from "googleapis";
 import axios from "axios";
 
-/* ========== ENV ========== */
+/* ===== ENV ===== */
 const {
   GOOGLE_SHEET_ID,
   GOOGLE_SERVICE_ACCOUNT,
-  LEAGUE = "college-football",   // "nfl" | "college-football"
+  LEAGUE = "college-football",     // "nfl" | "college-football"
   TAB_NAME = "CFB",
-  PREFILL_MODE = "week",         // "today" | "week" | "live_daily" | "finals"
+  PREFILL_MODE = "week",           // "today" | "week" | "live_daily" | "finals"
 } = process.env;
 
 if (!GOOGLE_SHEET_ID || !GOOGLE_SERVICE_ACCOUNT) {
@@ -15,14 +15,14 @@ if (!GOOGLE_SHEET_ID || !GOOGLE_SERVICE_ACCOUNT) {
   process.exit(1);
 }
 
-/* ========== Google Sheets ========== */
+/* ===== Google Sheets ===== */
 const auth = new google.auth.GoogleAuth({
   credentials: JSON.parse(GOOGLE_SERVICE_ACCOUNT),
   scopes: ["https://www.googleapis.com/auth/spreadsheets"],
 });
 const sheets = google.sheets({ version: "v4", auth });
 
-/* ========== ESPN ========== */
+/* ===== ESPN URLs ===== */
 const ESPN_BASE = "https://site.api.espn.com/apis/site/v2/sports/football";
 const CORE_BASE = "https://sports.core.api.espn.com/v2/sports/football";
 const scoreboardUrl = (league, yyyymmdd) =>
@@ -38,7 +38,7 @@ const asNum = (v) =>
     ? v
     : (v != null && v !== "" ? Number(v) : null);
 
-/* ========== Date helpers ========== */
+/* ===== Dates/Times ===== */
 function fmtESPNDate(d) {
   const y = d.getFullYear();
   const m = String(d.getMonth() + 1).padStart(2, "0");
@@ -60,7 +60,7 @@ function fmtKickET(isoStr) {
   });
 }
 
-/* ========== Rich text (underline favorite) ========== */
+/* ===== Rich text helper (underline favorite team only) ===== */
 function richTextUnderlineForMatchup(matchup, favSide, awayName, homeName) {
   const text = matchup || "";
   const len = text.length;
@@ -80,7 +80,7 @@ function richTextUnderlineForMatchup(matchup, favSide, awayName, homeName) {
   return { text, runs };
 }
 
-/* ========== Parse spreads accurately ========== */
+/* ===== Spreads (robust parse) ===== */
 function parseSpreadsFromOdds(odds, awayName, homeName, awayAbbr, homeAbbr) {
   const aTeam = asNum(odds?.awayTeamOdds?.spread);
   const hTeam = asNum(odds?.homeTeamOdds?.spread);
@@ -108,77 +108,124 @@ function parseSpreadsFromOdds(odds, awayName, homeName, awayAbbr, homeAbbr) {
   return { spreadAway: null, spreadHome: null };
 }
 
-/* ========== Moneyline fallbacks (stronger for CFB) ========== */
-async function extractMoneylines(comp, league, eventId) {
-  // 0) compId (needed for core odds)
-  const compId = comp?.id || comp?.uid?.split(":").pop();
+/* ===== Deep odds digger for ML (handles ESPN’s many shapes) ===== */
+function digMoneylines(obj) {
+  if (!obj || typeof obj !== "object") return { a: null, h: null };
 
-  // 1) inline odds
-  const inline = comp?.odds?.[0] || {};
-  let mlAway = asNum(inline?.awayTeamOdds?.moneyLine);
-  let mlHome = asNum(inline?.homeTeamOdds?.moneyLine);
-  if (mlAway != null || mlHome != null) return { mlAway, mlHome };
-
-  // 2) odds subresource linked off scoreboard
-  const oddsLink =
-    inline?.links?.find?.((l) => (l.rel || []).includes("odds"))?.href ||
-    comp?.odds?.find?.((o) => o?.links?.some?.((l) => (l.rel || []).includes("odds")))?.links?.find?.((l) => (l.rel || []).includes("odds"))?.href;
-
-  if (oddsLink) {
-    try {
-      const data = await fetchJson(oddsLink);
-      const item = (data?.items && data.items[0]) || data;
-      mlAway =
-        asNum(item?.awayTeamOdds?.moneyLine) ??
-        asNum(item?.moneyLineAway) ??
-        asNum(item?.prices?.[0]?.away?.moneyLine) ??
-        null;
-      mlHome =
-        asNum(item?.homeTeamOdds?.moneyLine) ??
-        asNum(item?.moneyLineHome) ??
-        asNum(item?.prices?.[0]?.home?.moneyLine) ??
-        null;
-      if (mlAway != null || mlHome != null) return { mlAway, mlHome };
-    } catch (_) {}
+  // direct known shapes
+  const candidates = [
+    obj?.awayTeamOdds?.moneyLine,
+    obj?.homeTeamOdds?.moneyLine,
+    obj?.moneyLineAway,
+    obj?.moneyLineHome,
+    obj?.away?.moneyLine,
+    obj?.home?.moneyLine,
+    obj?.awayMoneyLine,
+    obj?.homeMoneyLine,
+  ];
+  const aIdx = [0, 2, 4, 6].find(i => asNum(candidates[i]) != null);
+  const hIdx = [1, 3, 5, 7].find(i => asNum(candidates[i]) != null);
+  if (aIdx != null || hIdx != null) {
+    return { a: asNum(candidates[aIdx]), h: asNum(candidates[hIdx]) };
   }
 
-  // 3) summary header competitions odds (college often shows MLs here)
+  // arrays
+  if (Array.isArray(obj)) {
+    for (const it of obj) {
+      const { a, h } = digMoneylines(it);
+      if (a != null || h != null) return { a, h };
+    }
+  }
+
+  // objects (breadth-first)
+  for (const k of Object.keys(obj)) {
+    const v = obj[k];
+    if (v && typeof v === "object") {
+      const { a, h } = digMoneylines(v);
+      if (a != null || h != null) return { a, h };
+    }
+  }
+  return { a: null, h: null };
+}
+
+/* ===== Moneyline resolver (beefed up for CFB) ===== */
+async function extractMoneylines(comp, league, eventId) {
+  const compId = comp?.id || comp?.uid?.split(":").pop();
+
+  // 1) inline odds on competition
+  const inline = comp?.odds?.[0];
+  if (inline) {
+    const { a, h } = digMoneylines(inline);
+    if (a != null || h != null) return { mlAway: a, mlHome: h };
+  }
+
+  // 2) odds link or $ref found on inline odds or competition odds array
+  const oddsHref =
+    inline?.links?.find?.(l => (l.rel || []).includes("odds"))?.href ||
+    inline?.$ref ||
+    comp?.odds?.find?.(o => o?.$ref)?.$ref ||
+    comp?.odds?.find?.(o => o?.links?.some?.(l => (l.rel || []).includes("odds")))?.links?.find?.(l => (l.rel || []).includes("odds"))?.href;
+
+  if (oddsHref) {
+    try {
+      const data = await fetchJson(oddsHref);
+      // The response can be a page with items[], or the object itself
+      const srcs = [];
+      if (data?.items) srcs.push(...data.items);
+      srcs.push(data);
+
+      for (const s of srcs) {
+        const { a, h } = digMoneylines(s);
+        if (a != null || h != null) return { mlAway: a, mlHome: h };
+      }
+    } catch (_) { /* ignore */ }
+  }
+
+  // 3) summary header competitions odds
   try {
     const sum = await fetchJson(summaryUrl(league, eventId));
-    const hComp = sum?.header?.competitions?.[0];
-    const sOdds = hComp?.odds?.[0];
-    const a = asNum(sOdds?.awayTeamOdds?.moneyLine);
-    const h = asNum(sOdds?.homeTeamOdds?.moneyLine);
-    if (a != null || h != null) return { mlAway: a ?? null, mlHome: h ?? null };
-  } catch (_) {}
+    const hdrComp = sum?.header?.competitions?.[0];
+    const sOdds = hdrComp?.odds?.[0];
+    if (sOdds) {
+      const { a, h } = digMoneylines(sOdds);
+      if (a != null || h != null) return { mlAway: a, mlHome: h };
+    }
 
-  // 4) core odds endpoint (most reliable for CFB if compId is present)
+    // ESPN sometimes nests a richer odds object behind a $ref here as well
+    const ref =
+      sOdds?.$ref ||
+      sOdds?.links?.find?.(l => (l.rel || []).includes("odds"))?.href;
+    if (ref) {
+      try {
+        const refData = await fetchJson(ref);
+        const { a, h } = digMoneylines(refData?.items || refData);
+        if (a != null || h != null) return { mlAway: a, mlHome: h };
+      } catch (_) {}
+    }
+  } catch (_) { /* ignore */ }
+
+  // 4) core odds endpoint (usually present for CFB when public ML exists)
   if (compId) {
     try {
       const core = await fetchJson(coreOddsUrl(league, eventId, compId));
-      // core.items[*].homeTeamOdds.moneyLine / awayTeamOdds.moneyLine
-      const item = (core?.items && core.items[0]) || core;
-      const a = asNum(item?.awayTeamOdds?.moneyLine);
-      const h = asNum(item?.homeTeamOdds?.moneyLine);
-      if (a != null || h != null) return { mlAway: a ?? null, mlHome: h ?? null };
-    } catch (_) {}
+      const pool = core?.items || core;
+      const { a, h } = digMoneylines(pool);
+      if (a != null || h != null) return { mlAway: a, mlHome: h };
+    } catch (_) { /* ignore */ }
   }
 
-  // give up gracefully
+  // no ML available
   return { mlAway: null, mlHome: null };
 }
 
-/* ========== PREFILL ========== */
+/* ===== PREFILL ===== */
 async function runPrefill() {
   console.log(`🏈 Prefill for ${LEAGUE}, mode=${PREFILL_MODE}`);
 
   const now = new Date();
   const start = new Date(now);
   const end = new Date(now);
-
-  if (PREFILL_MODE === "today") {
-    // only today
-  } else {
+  if (PREFILL_MODE !== "today") {
     start.setDate(start.getDate() - 1);
     end.setDate(end.getDate() + 7);
   }
@@ -219,19 +266,19 @@ async function runPrefill() {
     const kickoff = fmtKickET(date);
     const weekLabel = week?.number ? `Week ${week.number}` : "Week ?";
 
-    // Odds & totals
+    // Base odds object & total
     const odds = comp?.odds?.[0] || {};
     const total = asNum(odds?.overUnder);
 
-    // Moneyline (with stronger fallback for CFB)
-    let { mlAway, mlHome } = await extractMoneylines(comp, LEAGUE, eventId);
+    // Moneylines (new robust resolver)
+    const { mlAway, mlHome } = await extractMoneylines(comp, LEAGUE, eventId);
 
     // Spreads
     const { spreadAway, spreadHome } = parseSpreadsFromOdds(
       odds, awayName, homeName, awayAbbr, homeAbbr
     );
 
-    // Favorite detection for underline
+    // Favorite to underline
     let favSide = null;
     if (spreadAway != null && spreadHome != null) {
       favSide = spreadAway < 0 ? "away" : (spreadHome < 0 ? "home" : null);
@@ -242,24 +289,20 @@ async function runPrefill() {
     const matchup = `${awayName} @ ${homeName}`;
     const { text, runs } = richTextUnderlineForMatchup(matchup, favSide, awayName, homeName);
 
-    // Compose A..K row
     outRows.push({
       values: [
-        { userEnteredValue: { stringValue: String(eventId) } },       // A Game ID
-        { userEnteredValue: { stringValue: displayDate } },          // B Date (MM/DD/YY)
-        { userEnteredValue: { stringValue: weekLabel } },            // C Week
-        { userEnteredValue: { stringValue: kickoff } },              // D Status
-        {
-          userEnteredValue: { stringValue: text },                   // E Matchup
-          textFormatRuns: runs,
-          userEnteredFormat: { textFormat: { underline: false, bold: false } }
-        },
-        { userEnteredValue: { stringValue: "" } },                   // F Final Score
-        { userEnteredValue: spreadAway != null ? { numberValue: spreadAway } : {} }, // G Away Spread
-        { userEnteredValue: mlAway     != null ? { numberValue: mlAway }     : {} }, // H Away ML
-        { userEnteredValue: spreadHome != null ? { numberValue: spreadHome } : {} }, // I Home Spread
-        { userEnteredValue: mlHome     != null ? { numberValue: mlHome }     : {} }, // J Home ML
-        { userEnteredValue: total      != null ? { numberValue: total }      : {} }, // K Total
+        { userEnteredValue: { stringValue: String(eventId) } },       // A
+        { userEnteredValue: { stringValue: displayDate } },           // B
+        { userEnteredValue: { stringValue: weekLabel } },             // C
+        { userEnteredValue: { stringValue: kickoff } },               // D
+        { userEnteredValue: { stringValue: text }, textFormatRuns: runs,
+          userEnteredFormat: { textFormat: { underline: false, bold: false } } }, // E
+        { userEnteredValue: { stringValue: "" } },                    // F
+        { userEnteredValue: spreadAway != null ? { numberValue: spreadAway } : {} }, // G
+        { userEnteredValue: mlAway     != null ? { numberValue: mlAway }     : {} }, // H
+        { userEnteredValue: spreadHome != null ? { numberValue: spreadHome } : {} }, // I
+        { userEnteredValue: mlHome     != null ? { numberValue: mlHome }     : {} }, // J
+        { userEnteredValue: total      != null ? { numberValue: total }      : {} }, // K
       ],
     });
   }
@@ -269,7 +312,7 @@ async function runPrefill() {
     return;
   }
 
-  // Find sheet id
+  // Find target sheet
   const meta = await sheets.spreadsheets.get({
     spreadsheetId: GOOGLE_SHEET_ID,
     includeGridData: false,
@@ -281,7 +324,7 @@ async function runPrefill() {
   }
   const sheetId = targetSheet.properties.sheetId;
 
-  // Filter out already-existing Game IDs
+  // Filter out already-present Game IDs
   const existing = await sheets.spreadsheets.values.get({
     spreadsheetId: GOOGLE_SHEET_ID,
     range: `${TAB_NAME}!A2:A`,
@@ -306,8 +349,7 @@ async function runPrefill() {
           updateCells: {
             rows: newRows,
             fields:
-              "userEnteredValue," +
-              "textFormatRuns," +
+              "userEnteredValue,textFormatRuns," +
               "userEnteredFormat.textFormat.underline," +
               "userEnteredFormat.textFormat.bold",
             range: {
@@ -326,7 +368,7 @@ async function runPrefill() {
   console.log(`✅ Prefill completed: ${newRows.length} new rows`);
 }
 
-/* ========== Finals sweep (winner bold; grade only when Final) ========== */
+/* ===== Finals sweep (unchanged from previous) ===== */
 const COLORS = {
   green: { red: 0.85, green: 0.95, blue: 0.85 },
   red:   { red: 0.98, green: 0.85, blue: 0.85 },
@@ -397,9 +439,9 @@ async function runFinalsSweep() {
         finalsWritten++;
       }
 
-      if (!isFinal) continue; // ✅ Only grade when Final
+      if (!isFinal) continue; // only grade once Final
 
-      // Winner bold only (preserve underline)
+      // Winner bold (preserving underline)
       const matchupText = r[4] || "";
       const [awayName, homeName] = (matchupText || "").split(" @ ").map(s => (s || "").trim());
       const winnerSide = awayScore > homeScore ? "away" : (homeScore > awayScore ? "home" : null);
@@ -453,19 +495,13 @@ async function runFinalsSweep() {
         });
       };
 
-      const COLORS = {
-        green: { red: 0.85, green: 0.95, blue: 0.85 },
-        red:   { red: 0.98, green: 0.85, blue: 0.85 },
-        gray:  { red: 0.93, green: 0.93, blue: 0.93 },
-      };
-
       if (awayML != null || homeML != null) {
         if (awayScore > homeScore) {
-          colorCell(COL.H, COLORS.green);
+          colorCell(COL.H, COLORS.green); // away ML wins
           colorCell(COL.J, COLORS.red);
         } else if (homeScore > awayScore) {
           colorCell(COL.H, COLORS.red);
-          colorCell(COL.J, COLORS.green);
+          colorCell(COL.J, COLORS.green); // home ML wins
         }
       }
 
@@ -510,7 +546,7 @@ async function runFinalsSweep() {
   console.log(`✅ Finals written: ${finalsWritten} | formatted finals`);
 }
 
-/* ========== Router ========== */
+/* ===== Entry ===== */
 (async () => {
   try {
     if (PREFILL_MODE === "finals") await runFinalsSweep();
