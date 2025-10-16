@@ -24,10 +24,13 @@ const sheets = google.sheets({ version: "v4", auth });
 
 /* ========== ESPN ========== */
 const ESPN_BASE = "https://site.api.espn.com/apis/site/v2/sports/football";
+const CORE_BASE = "https://sports.core.api.espn.com/v2/sports/football";
 const scoreboardUrl = (league, yyyymmdd) =>
   `${ESPN_BASE}/${league}/scoreboard?dates=${yyyymmdd}`;
 const summaryUrl = (league, gameId) =>
   `${ESPN_BASE}/${league}/summary?event=${gameId}`;
+const coreOddsUrl = (league, eventId, compId) =>
+  `${CORE_BASE}/${league}/events/${eventId}/competitions/${compId}/odds?region=us&lang=en`;
 
 const fetchJson = async (url) => (await axios.get(url)).data;
 const asNum = (v) =>
@@ -71,9 +74,9 @@ function richTextUnderlineForMatchup(matchup, favSide, awayName, homeName) {
 
   const end = start + favName.length;
   const runs = [];
-  if (start > 0) runs.push({ startIndex: 0 }); // neutral until favorite
-  runs.push({ startIndex: start, format: { underline: true } }); // underline favorite only
-  if (end < len) runs.push({ startIndex: end }); // turn underline back off
+  if (start > 0) runs.push({ startIndex: 0 });
+  runs.push({ startIndex: start, format: { underline: true } });
+  if (end < len) runs.push({ startIndex: end });
   return { text, runs };
 }
 
@@ -105,26 +108,25 @@ function parseSpreadsFromOdds(odds, awayName, homeName, awayAbbr, homeAbbr) {
   return { spreadAway: null, spreadHome: null };
 }
 
-/* ========== Moneyline fallbacks (CFB-safe) ========== */
-async function extractMoneylines(comp) {
-  const odds = comp?.odds?.[0] || {};
-  // 1) inline first
-  let mlAway = asNum(odds?.awayTeamOdds?.moneyLine);
-  let mlHome = asNum(odds?.homeTeamOdds?.moneyLine);
+/* ========== Moneyline fallbacks (stronger for CFB) ========== */
+async function extractMoneylines(comp, league, eventId) {
+  // 0) compId (needed for core odds)
+  const compId = comp?.id || comp?.uid?.split(":").pop();
+
+  // 1) inline odds
+  const inline = comp?.odds?.[0] || {};
+  let mlAway = asNum(inline?.awayTeamOdds?.moneyLine);
+  let mlHome = asNum(inline?.homeTeamOdds?.moneyLine);
   if (mlAway != null || mlHome != null) return { mlAway, mlHome };
 
-  // 2) odds subresource link
+  // 2) odds subresource linked off scoreboard
   const oddsLink =
-    odds?.links?.find?.((l) => (l.rel || []).includes("odds"))?.href ||
+    inline?.links?.find?.((l) => (l.rel || []).includes("odds"))?.href ||
     comp?.odds?.find?.((o) => o?.links?.some?.((l) => (l.rel || []).includes("odds")))?.links?.find?.((l) => (l.rel || []).includes("odds"))?.href;
 
   if (oddsLink) {
     try {
       const data = await fetchJson(oddsLink);
-      // Common shapes we’ve seen:
-      // - data.items[0].awayTeamOdds.moneyLine / homeTeamOdds.moneyLine
-      // - data.items[0].moneyLineAway / moneyLineHome
-      // - data.items[0].prices[0].away.moneyLine / home.moneyLine (rare)
       const item = (data?.items && data.items[0]) || data;
       mlAway =
         asNum(item?.awayTeamOdds?.moneyLine) ??
@@ -137,12 +139,32 @@ async function extractMoneylines(comp) {
         asNum(item?.prices?.[0]?.home?.moneyLine) ??
         null;
       if (mlAway != null || mlHome != null) return { mlAway, mlHome };
-    } catch (e) {
-      // Silent fallback; we’ll just leave ML blank if ESPN doesn’t expose it here
-    }
+    } catch (_) {}
   }
 
-  // 3) give up gracefully (leave nulls)
+  // 3) summary header competitions odds (college often shows MLs here)
+  try {
+    const sum = await fetchJson(summaryUrl(league, eventId));
+    const hComp = sum?.header?.competitions?.[0];
+    const sOdds = hComp?.odds?.[0];
+    const a = asNum(sOdds?.awayTeamOdds?.moneyLine);
+    const h = asNum(sOdds?.homeTeamOdds?.moneyLine);
+    if (a != null || h != null) return { mlAway: a ?? null, mlHome: h ?? null };
+  } catch (_) {}
+
+  // 4) core odds endpoint (most reliable for CFB if compId is present)
+  if (compId) {
+    try {
+      const core = await fetchJson(coreOddsUrl(league, eventId, compId));
+      // core.items[*].homeTeamOdds.moneyLine / awayTeamOdds.moneyLine
+      const item = (core?.items && core.items[0]) || core;
+      const a = asNum(item?.awayTeamOdds?.moneyLine);
+      const h = asNum(item?.homeTeamOdds?.moneyLine);
+      if (a != null || h != null) return { mlAway: a ?? null, mlHome: h ?? null };
+    } catch (_) {}
+  }
+
+  // give up gracefully
   return { mlAway: null, mlHome: null };
 }
 
@@ -180,7 +202,7 @@ async function runPrefill() {
   const outRows = [];
 
   for (const ev of events) {
-    const { id, date, competitions, week } = ev || {};
+    const { id: eventId, date, competitions, week } = ev || {};
     const comp = competitions?.[0];
     if (!comp) continue;
 
@@ -201,8 +223,8 @@ async function runPrefill() {
     const odds = comp?.odds?.[0] || {};
     const total = asNum(odds?.overUnder);
 
-    // Moneyline (with fallback)
-    let { mlAway, mlHome } = await extractMoneylines(comp);
+    // Moneyline (with stronger fallback for CFB)
+    let { mlAway, mlHome } = await extractMoneylines(comp, LEAGUE, eventId);
 
     // Spreads
     const { spreadAway, spreadHome } = parseSpreadsFromOdds(
@@ -223,7 +245,7 @@ async function runPrefill() {
     // Compose A..K row
     outRows.push({
       values: [
-        { userEnteredValue: { stringValue: String(id) } },           // A Game ID
+        { userEnteredValue: { stringValue: String(eventId) } },       // A Game ID
         { userEnteredValue: { stringValue: displayDate } },          // B Date (MM/DD/YY)
         { userEnteredValue: { stringValue: weekLabel } },            // C Week
         { userEnteredValue: { stringValue: kickoff } },              // D Status
