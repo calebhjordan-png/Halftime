@@ -1,558 +1,398 @@
+// orchestrator.mjs
+// Unified orchestrator for NFL + CFB prefill/live/finals updates.
+// Writes to Google Sheets tabs with columns:
+// [A] Game ID | [B] Date | [C] Week | [D] Status | [E] Matchup | [F] Final Score
+// [G] Away Spread | [H] Away ML | [I] Home Spread | [J] Home ML | [K] Total
+
+import fs from "node:fs/promises";
 import { google } from "googleapis";
 import axios from "axios";
 
-/* ===== ENV ===== */
-const {
-  GOOGLE_SHEET_ID,
-  GOOGLE_SERVICE_ACCOUNT,
-  LEAGUE = "college-football",     // "nfl" | "college-football"
-  TAB_NAME = "CFB",
-  PREFILL_MODE = "week",           // "today" | "week" | "live_daily" | "finals"
-} = process.env;
+/* ----------------------------- config ----------------------------- */
 
-if (!GOOGLE_SHEET_ID || !GOOGLE_SERVICE_ACCOUNT) {
-  console.error("❌ Missing GOOGLE_SHEET_ID or GOOGLE_SERVICE_ACCOUNT");
-  process.exit(1);
+const SHEET_ID = process.env.GOOGLE_SHEET_ID;
+const TAB_NAME = process.env.TAB_NAME || "CFB";              // "CFB" or "NFL"
+const LEAGUE = process.env.LEAGUE || "college-football";     // "college-football" | "nfl"
+const RUN_SCOPE = process.env.RUN_SCOPE || "week";           // "week" | "today" | "finals"
+const TZ_LABEL = "ET";
+
+/** Which sportsbook odds we prefer (in order). */
+const PROVIDER_PREFERENCE = [
+  "ESPN BET", "ESPN BET SPORTSBOOK",
+  "Caesars",
+  "DraftKings",
+  "consensus" // ESPN sometimes labels an aggregate this way
+];
+
+/* --------------------------- auth / sheets ------------------------ */
+
+function getSheetsClient() {
+  const svc = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT);
+  const auth = new google.auth.JWT(
+    svc.client_email,
+    null,
+    svc.private_key,
+    ["https://www.googleapis.com/auth/spreadsheets"]
+  );
+  return google.sheets({ version: "v4", auth });
 }
 
-/* ===== Google Sheets ===== */
-const auth = new google.auth.GoogleAuth({
-  credentials: JSON.parse(GOOGLE_SERVICE_ACCOUNT),
-  scopes: ["https://www.googleapis.com/auth/spreadsheets"],
-});
-const sheets = google.sheets({ version: "v4", auth });
+/* ------------------------------- utils ---------------------------- */
 
-/* ===== ESPN URLs ===== */
-const ESPN_BASE = "https://site.api.espn.com/apis/site/v2/sports/football";
-const CORE_BASE = "https://sports.core.api.espn.com/v2/sports/football";
-const scoreboardUrl = (league, yyyymmdd) =>
-  `${ESPN_BASE}/${league}/scoreboard?dates=${yyyymmdd}`;
-const summaryUrl = (league, gameId) =>
-  `${ESPN_BASE}/${league}/summary?event=${gameId}`;
-const coreOddsUrl = (league, eventId, compId) =>
-  `${CORE_BASE}/${league}/events/${eventId}/competitions/${compId}/odds?region=us&lang=en`;
+const pad2 = (n) => String(n).padStart(2, "0");
 
-const fetchJson = async (url) => (await axios.get(url)).data;
-const asNum = (v) =>
-  (v === 0 || (typeof v === "number" && !Number.isNaN(v)))
-    ? v
-    : (v != null && v !== "" ? Number(v) : null);
-
-/* ===== Dates/Times ===== */
-function fmtESPNDate(d) {
-  const y = d.getFullYear();
-  const m = String(d.getMonth() + 1).padStart(2, "0");
-  const day = String(d.getDate()).padStart(2, "0");
-  return `${y}${m}${day}`;
+function yyyymmddFromDate(d) {
+  return `${d.getUTCFullYear()}${pad2(d.getUTCMonth() + 1)}${pad2(d.getUTCDate())}`;
 }
-function fmtDisplayDateMDY(d) {
-  const mm = String(d.getMonth() + 1).padStart(2, "0");
-  const dd = String(d.getDate()).padStart(2, "0");
-  const yy = String(d.getFullYear()).slice(-2);
+
+function startOfWeekUTC(d) {
+  // ESPN CFB weeks start Monday; we’ll pull Sat–Sun by scanning the whole week.
+  const copy = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
+  const dow = copy.getUTCDay(); // 0 Sun..6 Sat
+  // force Monday
+  const delta = (dow + 6) % 7;
+  copy.setUTCDate(copy.getUTCDate() - delta);
+  return copy;
+}
+
+function signStr(n) {
+  if (n === null || n === undefined || Number.isNaN(n)) return "";
+  return n > 0 ? `+${n}` : `${n}`;
+}
+
+function parseNumeric(x) {
+  if (x === null || x === undefined) return null;
+  if (typeof x === "number") return x;
+  const m = String(x).replace(/[^\d.-]/g, "");
+  if (m === "" || m === "-" || m === ".") return null;
+  const val = Number(m);
+  return Number.isFinite(val) ? val : null;
+}
+
+function pickPreferredOdds(oddsArray) {
+  if (!Array.isArray(oddsArray) || oddsArray.length === 0) return null;
+
+  // Try preferred providers first
+  for (const provider of PROVIDER_PREFERENCE) {
+    const hit = oddsArray.find(o => (o?.provider?.name || "").toUpperCase() === provider.toUpperCase());
+    if (hit) return hit;
+  }
+  // Otherwise take the first that has any ML values
+  const withML = oddsArray.find(o => (o?.awayTeamOdds?.moneyLine ?? o?.homeTeamOdds?.moneyLine) != null);
+  if (withML) return withML;
+
+  // Or just the first
+  return oddsArray[0];
+}
+
+function extractOdds(competition) {
+  // ESPN structure: competition.odds[] with provider + {spread, overUnder, homeTeamOdds, awayTeamOdds}
+  const o = pickPreferredOdds(competition?.odds);
+  if (!o) return { spreadAway: null, spreadHome: null, total: null, awayML: null, homeML: null };
+
+  // Spreads: ESPN gives a single point (home favorite is negative).
+  // We want "away spread" and "home spread".
+  // If o.details like "MIA -13.5" exists, ESPN also provides o.spread and home/away team odds objects.
+  const spread = parseNumeric(o.spread);
+  let spreadAway = null;
+  let spreadHome = null;
+  if (spread != null) {
+    // negative spread => home favorite; that means away spread is +abs
+    // positive spread => away favorite; that means home spread is +abs
+    const isHomeFav = spread < 0;
+    const mag = Math.abs(spread);
+    if (isHomeFav) {
+      spreadHome = -mag;
+      spreadAway = +mag;
+    } else {
+      spreadAway = -mag;
+      spreadHome = +mag;
+    }
+  }
+
+  // Totals (overUnder)
+  const total = parseNumeric(o.overUnder);
+
+  // Moneylines (numbers already signed in feed)
+  // They may be strings; normalize to integers with sign.
+  const awayML = parseNumeric(o?.awayTeamOdds?.moneyLine);
+  const homeML = parseNumeric(o?.homeTeamOdds?.moneyLine);
+
+  return {
+    spreadAway, spreadHome, total,
+    awayML, homeML,
+    _provider: o?.provider?.name || "unknown"
+  };
+}
+
+function teamString(away, home, favoriteFavKey) {
+  // Build "Away @ Home" with underline on the pregame favorite team.
+  const underline = (name) => `_${name}_`; // we’ll convert to textFormatRuns when we write
+  const a = away?.team?.shortDisplayName || away?.team?.abbreviation || away?.team?.displayName || away?.team?.name || "Away";
+  const h = home?.team?.shortDisplayName || home?.team?.abbreviation || home?.team?.displayName || home?.team?.name || "Home";
+
+  if (favoriteFavKey === "away") return { text: `${a} @ ${h}`, uStart: 0, uEnd: a.length };         // underline away
+  if (favoriteFavKey === "home") return { text: `${a} @ ${h}`, uStart: (a.length + 3), uEnd: (a.length + 3 + h.length) }; // underline home
+  return { text: `${a} @ ${h}`, uStart: null, uEnd: null };
+}
+
+/* --------------------------- ESPN fetch --------------------------- */
+
+async function fetchScoreboardDates(startDateUTC, numDays = 7) {
+  const dates = [];
+  for (let i = 0; i < numDays; i++) {
+    const d = new Date(startDateUTC);
+    d.setUTCDate(d.getUTCDate() + i);
+    dates.push(yyyymmddFromDate(d));
+  }
+
+  const sportPath = LEAGUE === "nfl" ? "football/nfl" : "football/college-football";
+
+  const all = [];
+  await Promise.allSettled(
+    dates.map(async (dateStr) => {
+      const url = `https://site.api.espn.com/apis/site/v2/sports/${sportPath}/scoreboard?dates=${dateStr}`;
+      const { data } = await axios.get(url, { timeout: 15000 });
+      if (Array.isArray(data?.events)) {
+        all.push(...data.events);
+      }
+    })
+  );
+
+  return all;
+}
+
+/* --------------------------- build rows --------------------------- */
+
+function toSheetDate(iso) {
+  // Expecting local display MM/DD/YY; we’ll let the sheet keep text value preformatted.
+  const d = new Date(iso);
+  const mm = pad2(d.getUTCMonth() + 1);
+  const dd = pad2(d.getUTCDate());
+  const yy = String(d.getUTCFullYear()).slice(-2);
   return `${mm}/${dd}/${yy}`;
 }
-function fmtKickET(isoStr) {
-  const dt = new Date(isoStr);
-  return dt.toLocaleTimeString("en-US", {
-    timeZone: "America/New_York",
-    hour: "numeric",
-    minute: "2-digit",
-  });
+
+function toKickoffLocal(competition) {
+  // Put the display kickoff with "ET" but we do NOT write ET to the cell (as requested earlier).
+  const date = competition?.date ? new Date(competition.date) : null;
+  if (!date) return "";
+  // ESPN dates are ISO; we'll use HH:MM with "ET" removed (consumer knows column = ET).
+  const hh = date.getUTCHours();
+  const mm = pad2(date.getUTCMinutes());
+  // Convert to US/Eastern (approx: ESPN’s time already respects timezone in their UI; we stick with ET label)
+  // Keep it simple: user prefers no "ET" suffix; just the time string.
+  const hoursET = ((hh + 24) - 4) % 24; // UTC-4 (approx EDT). Good enough for our display use here.
+  const h12 = ((hoursET + 11) % 12) + 1;
+  const ampm = hoursET < 12 ? "AM" : "PM";
+  return `${h12}:${mm} ${ampm}`;
 }
 
-/* ===== Rich text helper (underline favorite team only) ===== */
-function richTextUnderlineForMatchup(matchup, favSide, awayName, homeName) {
-  const text = matchup || "";
-  const len = text.length;
-  if (!text || !favSide) return { text, runs: [] };
-
-  const favName = favSide === "away" ? awayName : homeName;
-  if (!favName) return { text, runs: [] };
-
-  const start = text.indexOf(favName);
-  if (start < 0 || start >= len) return { text, runs: [] };
-
-  const end = start + favName.length;
-  const runs = [];
-  if (start > 0) runs.push({ startIndex: 0 });
-  runs.push({ startIndex: start, format: { underline: true } });
-  if (end < len) runs.push({ startIndex: end });
-  return { text, runs };
+function inferWeekCN(league, weekObj) {
+  // Prefer provided "week text" when available; otherwise produce `Week N`.
+  const n = weekObj?.number || weekObj?.$ref || null;
+  if (typeof n === "number" && n > 0) return `Week ${n}`;
+  // fallback: ESPN’s CFB sometimes has type: "regular"
+  const txt = weekObj?.text || "Week";
+  return txt.startsWith("Week") ? txt : `Week ${txt}`;
 }
 
-/* ===== Spreads (robust parse) ===== */
-function parseSpreadsFromOdds(odds, awayName, homeName, awayAbbr, homeAbbr) {
-  const aTeam = asNum(odds?.awayTeamOdds?.spread);
-  const hTeam = asNum(odds?.homeTeamOdds?.spread);
-  if (aTeam != null && hTeam != null) {
-    return { spreadAway: aTeam, spreadHome: hTeam };
+function computeFavoriteKey(odds, teams) {
+  if (!odds) return null;
+  // If spreadAway is negative, away is favorite; if spreadHome is negative, home is favorite.
+  if (odds.spreadAway != null && odds.spreadAway < 0) return "away";
+  if (odds.spreadHome != null && odds.spreadHome < 0) return "home";
+  // fallback to ML if spreads absent
+  if (odds.awayML != null && odds.homeML != null) {
+    if (odds.awayML < odds.homeML) return "away";
+    if (odds.homeML < odds.awayML) return "home";
   }
-
-  const text = String(odds?.details ?? odds?.summary ?? "").trim();
-  if (text) {
-    const m = text.match(/\b([A-Z]{2,4})\s*([+-]?\d+(?:\.\d+)?)/);
-    if (m) {
-      const favAbbr = m[1];
-      const val = Number(m[2]);
-      if (!Number.isNaN(val)) {
-        const line = Math.abs(val);
-        const favIsAway = [awayAbbr].filter(Boolean)
-          .some(a => a.toUpperCase() === favAbbr.toUpperCase());
-        const favIsHome = [homeAbbr].filter(Boolean)
-          .some(a => a.toUpperCase() === favAbbr.toUpperCase());
-        if (favIsAway) return { spreadAway: -line, spreadHome: line };
-        if (favIsHome) return { spreadAway: line, spreadHome: -line };
-      }
-    }
-  }
-  return { spreadAway: null, spreadHome: null };
+  return null;
 }
 
-/* ===== Deep odds digger for ML (handles ESPN’s many shapes) ===== */
-function digMoneylines(obj) {
-  if (!obj || typeof obj !== "object") return { a: null, h: null };
+/* ---------------------------- write sheet ------------------------- */
 
-  // direct known shapes
-  const candidates = [
-    obj?.awayTeamOdds?.moneyLine,
-    obj?.homeTeamOdds?.moneyLine,
-    obj?.moneyLineAway,
-    obj?.moneyLineHome,
-    obj?.away?.moneyLine,
-    obj?.home?.moneyLine,
-    obj?.awayMoneyLine,
-    obj?.homeMoneyLine,
+function buildUnderlineRuns(text, start, end) {
+  if (start == null || end == null || start >= end) return [];
+  return [
+    { startIndex: start, format: { underline: true } },
+    { startIndex: end }
   ];
-  const aIdx = [0, 2, 4, 6].find(i => asNum(candidates[i]) != null);
-  const hIdx = [1, 3, 5, 7].find(i => asNum(candidates[i]) != null);
-  if (aIdx != null || hIdx != null) {
-    return { a: asNum(candidates[aIdx]), h: asNum(candidates[hIdx]) };
-  }
-
-  // arrays
-  if (Array.isArray(obj)) {
-    for (const it of obj) {
-      const { a, h } = digMoneylines(it);
-      if (a != null || h != null) return { a, h };
-    }
-  }
-
-  // objects (breadth-first)
-  for (const k of Object.keys(obj)) {
-    const v = obj[k];
-    if (v && typeof v === "object") {
-      const { a, h } = digMoneylines(v);
-      if (a != null || h != null) return { a, h };
-    }
-  }
-  return { a: null, h: null };
 }
 
-/* ===== Moneyline resolver (beefed up for CFB) ===== */
-async function extractMoneylines(comp, league, eventId) {
-  const compId = comp?.id || comp?.uid?.split(":").pop();
+async function writePrefillRows(sheets, sheetId, startRow, rows) {
+  if (!rows.length) return 0;
 
-  // 1) inline odds on competition
-  const inline = comp?.odds?.[0];
-  if (inline) {
-    const { a, h } = digMoneylines(inline);
-    if (a != null || h != null) return { mlAway: a, mlHome: h };
-  }
+  // Build batchUpdate with both values and textFormatRuns for the Matchup column.
+  const reqs = [];
+  let r = startRow;
 
-  // 2) odds link or $ref found on inline odds or competition odds array
-  const oddsHref =
-    inline?.links?.find?.(l => (l.rel || []).includes("odds"))?.href ||
-    inline?.$ref ||
-    comp?.odds?.find?.(o => o?.$ref)?.$ref ||
-    comp?.odds?.find?.(o => o?.links?.some?.(l => (l.rel || []).includes("odds")))?.links?.find?.(l => (l.rel || []).includes("odds"))?.href;
+  for (const row of rows) {
+    const values = [
+      { userEnteredValue: { stringValue: row.gameId || "" } },          // A
+      { userEnteredValue: { stringValue: row.date || "" } },            // B
+      { userEnteredValue: { stringValue: row.week || "" } },            // C
+      { userEnteredValue: { stringValue: row.status || "" } },          // D
+      { userEnteredValue: { stringValue: row.matchupText || "" } },     // E
+      { userEnteredValue: { stringValue: row.finalScore || "" } },      // F
+      { userEnteredValue: { numberValue: row.awaySpread ?? null } },    // G
+      { userEnteredValue: { numberValue: row.awayML ?? null } },        // H
+      { userEnteredValue: { numberValue: row.homeSpread ?? null } },    // I
+      { userEnteredValue: { numberValue: row.homeML ?? null } },        // J
+      { userEnteredValue: { numberValue: row.total ?? null } }          // K
+    ];
 
-  if (oddsHref) {
-    try {
-      const data = await fetchJson(oddsHref);
-      // The response can be a page with items[], or the object itself
-      const srcs = [];
-      if (data?.items) srcs.push(...data.items);
-      srcs.push(data);
+    // Add underline runs for the favorite team in Matchup (column E)
+    const eCol = 4; // zero-based index of column E
+    const textRuns = buildUnderlineRuns(row.matchupText, row.uStart, row.uEnd);
 
-      for (const s of srcs) {
-        const { a, h } = digMoneylines(s);
-        if (a != null || h != null) return { mlAway: a, mlHome: h };
+    reqs.push({
+      updateCells: {
+        range: {
+          sheetId,
+          startRowIndex: r,
+          endRowIndex: r + 1,
+          startColumnIndex: 0,
+          endColumnIndex: 11
+        },
+        rows: [{ values }],
+        fields: "userEnteredValue"
       }
-    } catch (_) { /* ignore */ }
-  }
-
-  // 3) summary header competitions odds
-  try {
-    const sum = await fetchJson(summaryUrl(league, eventId));
-    const hdrComp = sum?.header?.competitions?.[0];
-    const sOdds = hdrComp?.odds?.[0];
-    if (sOdds) {
-      const { a, h } = digMoneylines(sOdds);
-      if (a != null || h != null) return { mlAway: a, mlHome: h };
-    }
-
-    // ESPN sometimes nests a richer odds object behind a $ref here as well
-    const ref =
-      sOdds?.$ref ||
-      sOdds?.links?.find?.(l => (l.rel || []).includes("odds"))?.href;
-    if (ref) {
-      try {
-        const refData = await fetchJson(ref);
-        const { a, h } = digMoneylines(refData?.items || refData);
-        if (a != null || h != null) return { mlAway: a, mlHome: h };
-      } catch (_) {}
-    }
-  } catch (_) { /* ignore */ }
-
-  // 4) core odds endpoint (usually present for CFB when public ML exists)
-  if (compId) {
-    try {
-      const core = await fetchJson(coreOddsUrl(league, eventId, compId));
-      const pool = core?.items || core;
-      const { a, h } = digMoneylines(pool);
-      if (a != null || h != null) return { mlAway: a, mlHome: h };
-    } catch (_) { /* ignore */ }
-  }
-
-  // no ML available
-  return { mlAway: null, mlHome: null };
-}
-
-/* ===== PREFILL ===== */
-async function runPrefill() {
-  console.log(`🏈 Prefill for ${LEAGUE}, mode=${PREFILL_MODE}`);
-
-  const now = new Date();
-  const start = new Date(now);
-  const end = new Date(now);
-  if (PREFILL_MODE !== "today") {
-    start.setDate(start.getDate() - 1);
-    end.setDate(end.getDate() + 7);
-  }
-
-  const days = [];
-  for (let d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) {
-    days.push(new Date(d));
-  }
-
-  const boards = (
-    await Promise.allSettled(
-      days.map((d) =>
-        fetchJson(scoreboardUrl(LEAGUE, fmtESPNDate(d))).then((j) => ({ d, j }))
-      )
-    )
-  ).filter(r => r.status === "fulfilled").map(r => r.value);
-
-  const events = boards.flatMap(b => b.j?.events ?? []);
-  console.log(`Fetched ${events.length} games`);
-
-  const outRows = [];
-
-  for (const ev of events) {
-    const { id: eventId, date, competitions, week } = ev || {};
-    const comp = competitions?.[0];
-    if (!comp) continue;
-
-    const away = comp?.competitors?.find(c => c.homeAway === "away");
-    const home = comp?.competitors?.find(c => c.homeAway === "home");
-    if (!away || !home) continue;
-
-    const awayName = away.team?.shortDisplayName || away.team?.displayName || "";
-    const homeName = home.team?.shortDisplayName || home.team?.displayName || "";
-    const awayAbbr = away.team?.abbreviation || "";
-    const homeAbbr = home.team?.abbreviation || "";
-
-    const displayDate = fmtDisplayDateMDY(new Date(date));
-    const kickoff = fmtKickET(date);
-    const weekLabel = week?.number ? `Week ${week.number}` : "Week ?";
-
-    // Base odds object & total
-    const odds = comp?.odds?.[0] || {};
-    const total = asNum(odds?.overUnder);
-
-    // Moneylines (new robust resolver)
-    const { mlAway, mlHome } = await extractMoneylines(comp, LEAGUE, eventId);
-
-    // Spreads
-    const { spreadAway, spreadHome } = parseSpreadsFromOdds(
-      odds, awayName, homeName, awayAbbr, homeAbbr
-    );
-
-    // Favorite to underline
-    let favSide = null;
-    if (spreadAway != null && spreadHome != null) {
-      favSide = spreadAway < 0 ? "away" : (spreadHome < 0 ? "home" : null);
-    } else if (mlAway != null && mlHome != null) {
-      favSide = mlAway < mlHome ? "away" : (mlHome < mlAway ? "home" : null);
-    }
-
-    const matchup = `${awayName} @ ${homeName}`;
-    const { text, runs } = richTextUnderlineForMatchup(matchup, favSide, awayName, homeName);
-
-    outRows.push({
-      values: [
-        { userEnteredValue: { stringValue: String(eventId) } },       // A
-        { userEnteredValue: { stringValue: displayDate } },           // B
-        { userEnteredValue: { stringValue: weekLabel } },             // C
-        { userEnteredValue: { stringValue: kickoff } },               // D
-        { userEnteredValue: { stringValue: text }, textFormatRuns: runs,
-          userEnteredFormat: { textFormat: { underline: false, bold: false } } }, // E
-        { userEnteredValue: { stringValue: "" } },                    // F
-        { userEnteredValue: spreadAway != null ? { numberValue: spreadAway } : {} }, // G
-        { userEnteredValue: mlAway     != null ? { numberValue: mlAway }     : {} }, // H
-        { userEnteredValue: spreadHome != null ? { numberValue: spreadHome } : {} }, // I
-        { userEnteredValue: mlHome     != null ? { numberValue: mlHome }     : {} }, // J
-        { userEnteredValue: total      != null ? { numberValue: total }      : {} }, // K
-      ],
     });
-  }
 
-  if (outRows.length === 0) {
-    console.log("No new rows to write.");
-    return;
-  }
+    if (textRuns.length) {
+      reqs.push({
+        updateCells: {
+          range: {
+            sheetId,
+            startRowIndex: r,
+            endRowIndex: r + 1,
+            startColumnIndex: eCol,
+            endColumnIndex: eCol + 1
+          },
+          rows: [{
+            values: [{
+              userEnteredValue: { stringValue: row.matchupText },
+              textFormatRuns: textRuns
+            }]
+          }],
+          fields: "userEnteredValue,textFormatRuns"
+        }
+      });
+    }
 
-  // Find target sheet
-  const meta = await sheets.spreadsheets.get({
-    spreadsheetId: GOOGLE_SHEET_ID,
-    includeGridData: false,
-  });
-  const targetSheet = meta.data.sheets?.find((s) => s.properties?.title === TAB_NAME);
-  if (!targetSheet) {
-    console.error(`Tab "${TAB_NAME}" not found`);
-    process.exit(1);
+    r += 1;
   }
-  const sheetId = targetSheet.properties.sheetId;
-
-  // Filter out already-present Game IDs
-  const existing = await sheets.spreadsheets.values.get({
-    spreadsheetId: GOOGLE_SHEET_ID,
-    range: `${TAB_NAME}!A2:A`,
-  });
-  const existingIds = new Set((existing.data.values || []).map((r) => r[0]));
-  const newRows = outRows.filter(
-    (r) => !existingIds.has(r.values[0].userEnteredValue.stringValue)
-  );
-  if (newRows.length === 0) {
-    console.log("No new rows to write.");
-    return;
-  }
-
-  const startRowIndex = (existing.data.values?.length || 0) + 1;
-  const endRowIndex = startRowIndex + newRows.length;
 
   await sheets.spreadsheets.batchUpdate({
-    spreadsheetId: GOOGLE_SHEET_ID,
-    requestBody: {
-      requests: [
-        {
-          updateCells: {
-            rows: newRows,
-            fields:
-              "userEnteredValue,textFormatRuns," +
-              "userEnteredFormat.textFormat.underline," +
-              "userEnteredFormat.textFormat.bold",
-            range: {
-              sheetId,
-              startRowIndex,
-              endRowIndex,
-              startColumnIndex: 0,
-              endColumnIndex: 11, // A..K
-            },
-          },
-        },
-      ],
-    },
+    spreadsheetId: SHEET_ID,
+    requestBody: { requests: reqs }
   });
 
-  console.log(`✅ Prefill completed: ${newRows.length} new rows`);
+  return rows.length;
 }
 
-/* ===== Finals sweep (unchanged from previous) ===== */
-const COLORS = {
-  green: { red: 0.85, green: 0.95, blue: 0.85 },
-  red:   { red: 0.98, green: 0.85, blue: 0.85 },
-  gray:  { red: 0.93, green: 0.93, blue: 0.93 },
-};
+async function getSheetInfo(sheets) {
+  const meta = await sheets.spreadsheets.get({ spreadsheetId: SHEET_ID });
+  const sheet = meta.data.sheets.find(s => s.properties.title === TAB_NAME);
+  if (!sheet) throw new Error(`Tab "${TAB_NAME}" not found`);
+  return {
+    sheetId: sheet.properties.sheetId,
+    rowCount: sheet.properties.gridProperties.rowCount
+  };
+}
 
-async function runFinalsSweep() {
-  console.log(`🏁 Finals sweep for ${LEAGUE}/${TAB_NAME}`);
+/* ------------------------------ main ------------------------------ */
 
-  const readRange = `${TAB_NAME}!A2:K`;
-  const res = await sheets.spreadsheets.values.get({
-    spreadsheetId: GOOGLE_SHEET_ID,
-    range: readRange,
+async function main() {
+  const sheets = getSheetsClient();
+  const { sheetId } = await getSheetInfo(sheets);
+
+  // Determine date window
+  let events = [];
+  if (RUN_SCOPE === "today") {
+    const now = new Date();
+    const start = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+    events = await fetchScoreboardDates(start, 1);
+  } else {
+    const start = startOfWeekUTC(new Date());
+    events = await fetchScoreboardDates(start, 7);
+  }
+
+  // Build rows we don’t already have
+  // Fetch current sheet values for Game ID to avoid dupes
+  const grid = await sheets.spreadsheets.values.get({
+    spreadsheetId: SHEET_ID,
+    range: `${TAB_NAME}!A2:A`
   });
-  const rows = res.data.values || [];
-  if (rows.length === 0) {
-    console.log("No rows found.");
+  const existingIds = new Set((grid.data.values || []).map(v => v[0]).filter(Boolean));
+
+  const rows = [];
+  for (const ev of events) {
+    const comp = ev?.competitions?.[0];
+    if (!comp) continue;
+
+    const gameId = String(comp.id || ev.id || "");
+    if (!gameId) continue;
+    if (existingIds.has(gameId)) continue;           // don’t duplicate
+
+    const statusType = comp?.status?.type?.name || ev?.status?.type?.name || "";
+    const isFinal = (statusType || "").toLowerCase().includes("final");
+
+    const weekTxt = inferWeekCN(LEAGUE, ev?.week || comp?.week || {});
+    const kickoff = toKickoffLocal(comp);
+    const statusText = isFinal ? "Final" : kickoff;  // show kickoff time until final
+
+    // odds
+    const odds = extractOdds(comp);
+
+    // favorite for underline
+    const favKey = computeFavoriteKey(odds, comp?.competitors);
+    const away = comp?.competitors?.find(c => c.homeAway === "away");
+    const home = comp?.competitors?.find(c => c.homeAway === "home");
+    const { text: matchupText, uStart, uEnd } = teamString(away, home, favKey);
+
+    // final score if available
+    let finalScore = "";
+    if (isFinal) {
+      const aScore = away?.score != null ? String(away.score) : "";
+      const hScore = home?.score != null ? String(home.score) : "";
+      finalScore = `${aScore}-${hScore}`;
+    }
+
+    rows.push({
+      gameId,
+      date: toSheetDate(comp?.date || ev?.date),
+      week: weekTxt,
+      status: statusText,
+      matchupText, uStart, uEnd,
+      finalScore,
+      awaySpread: odds.spreadAway,
+      homeSpread: odds.spreadHome,
+      awayML: odds.awayML,
+      homeML: odds.homeML,
+      total: odds.total
+    });
+  }
+
+  if (!rows.length) {
+    console.log(`No new rows to write.`);
     return;
   }
 
-  const meta = await sheets.spreadsheets.get({
-    spreadsheetId: GOOGLE_SHEET_ID,
-    includeGridData: false,
+  // Find first empty row after header by using current length of column A
+  const aCol = await sheets.spreadsheets.values.get({
+    spreadsheetId: SHEET_ID,
+    range: `${TAB_NAME}!A:A`
   });
-  const targetSheet = meta.data.sheets?.find((s) => s.properties?.title === TAB_NAME);
-  if (!targetSheet) {
-    console.error(`Tab "${TAB_NAME}" not found`);
-    process.exit(1);
-  }
-  const sheetId = targetSheet.properties.sheetId;
+  const existing = (aCol.data.values || []).length; // includes header row
+  const firstEmptyRow = Math.max(existing, 2);      // A1 is header; start at row 2 minimum
 
-  const COL = { A:0,B:1,C:2,D:3,E:4,F:5,G:6,H:7,I:8,J:9,K:10 };
-
-  const valueUpdates = [];
-  const formatRequests = [];
-  let finalsWritten = 0;
-
-  for (let i = 0; i < rows.length; i++) {
-    const r = rows[i] || [];
-    const rowNum = i + 2;
-
-    const gameId = (r[0] || "").trim();
-    if (!gameId) continue;
-
-    const statusCell = (r[3] || "").trim();
-    const finalScoreCell = (r[5] || "").trim();
-
-    let isFinal = false;
-    let awayScore = null, homeScore = null;
-
-    try {
-      const sum = await fetchJson(summaryUrl(LEAGUE, gameId));
-      const comp = sum?.header?.competitions?.[0];
-      const st = comp?.status?.type?.name || comp?.status?.type?.state;
-      isFinal = typeof st === "string" && st.toLowerCase().includes("final");
-
-      const away = comp?.competitors?.find(x => x.homeAway === "away");
-      const home = comp?.competitors?.find(x => x.homeAway === "home");
-      if (!away || !home) continue;
-
-      awayScore = asNum(away?.score);
-      homeScore = asNum(home?.score);
-
-      if (isFinal && (!finalScoreCell || statusCell.toLowerCase() !== "final")) {
-        const finalScoreStr = `${awayScore}-${homeScore}`;
-        valueUpdates.push({ range: `${TAB_NAME}!D${rowNum}:D${rowNum}`, values: [["Final"]] });
-        valueUpdates.push({ range: `${TAB_NAME}!F${rowNum}:F${rowNum}`, values: [[finalScoreStr]] });
-        finalsWritten++;
-      }
-
-      if (!isFinal) continue; // only grade once Final
-
-      // Winner bold (preserving underline)
-      const matchupText = r[4] || "";
-      const [awayName, homeName] = (matchupText || "").split(" @ ").map(s => (s || "").trim());
-      const winnerSide = awayScore > homeScore ? "away" : (homeScore > awayScore ? "home" : null);
-
-      if (winnerSide) {
-        const text = matchupText;
-        const idx = text.indexOf(winnerSide === "away" ? awayName : homeName);
-        if (idx >= 0) {
-          const end = idx + (winnerSide === "away" ? awayName.length : homeName.length);
-          const runs = [];
-          if (idx > 0) runs.push({ startIndex: 0 });
-          runs.push({ startIndex: idx, format: { bold: true } });
-          if (end < text.length) runs.push({ startIndex: end });
-
-          formatRequests.push({
-            updateCells: {
-              rows: [{ values: [{ userEnteredValue: { stringValue: text }, textFormatRuns: runs }] }],
-              fields: "userEnteredValue,textFormatRuns",
-              range: {
-                sheetId,
-                startRowIndex: rowNum - 1,
-                endRowIndex: rowNum,
-                startColumnIndex: COL.E,
-                endColumnIndex: COL.E + 1,
-              },
-            },
-          });
-        }
-      }
-
-      // Grade markets
-      const awaySpread = asNum(r[6]);
-      const awayML     = asNum(r[7]);
-      const homeSpread = asNum(r[8]);
-      const homeML     = asNum(r[9]);
-      const total      = asNum(r[10]);
-
-      const colorCell = (col, color) => {
-        formatRequests.push({
-          repeatCell: {
-            range: {
-              sheetId,
-              startRowIndex: rowNum - 1,
-              endRowIndex: rowNum,
-              startColumnIndex: col,
-              endColumnIndex: col + 1,
-            },
-            cell: { userEnteredFormat: { backgroundColor: color } },
-            fields: "userEnteredFormat.backgroundColor",
-          },
-        });
-      };
-
-      if (awayML != null || homeML != null) {
-        if (awayScore > homeScore) {
-          colorCell(COL.H, COLORS.green); // away ML wins
-          colorCell(COL.J, COLORS.red);
-        } else if (homeScore > awayScore) {
-          colorCell(COL.H, COLORS.red);
-          colorCell(COL.J, COLORS.green); // home ML wins
-        }
-      }
-
-      if (awaySpread != null) {
-        const awayCovers = awayScore + awaySpread > homeScore ? true
-                         : awayScore + awaySpread < homeScore ? false
-                         : null;
-        colorCell(COL.G, awayCovers === null ? COLORS.gray : (awayCovers ? COLORS.green : COLORS.red));
-      }
-      if (homeSpread != null) {
-        const homeCovers = homeScore + homeSpread > awayScore ? true
-                         : homeScore + homeSpread < awayScore ? false
-                         : null;
-        colorCell(COL.I, homeCovers === null ? COLORS.gray : (homeCovers ? COLORS.green : COLORS.red));
-      }
-
-      if (total != null && awayScore != null && homeScore != null) {
-        const sum = awayScore + homeScore;
-        const color = sum > total ? COLORS.green
-                    : sum < total ? COLORS.red
-                    : COLORS.gray;
-        colorCell(COL.K, color);
-      }
-    } catch (e) {
-      console.warn(`Skipping row ${rowNum} / game ${gameId}: ${e.message}`);
-    }
-  }
-
-  if (valueUpdates.length > 0) {
-    await sheets.spreadsheets.values.batchUpdate({
-      spreadsheetId: GOOGLE_SHEET_ID,
-      requestBody: { valueInputOption: "USER_ENTERED", data: valueUpdates },
-    });
-  }
-  if (formatRequests.length > 0) {
-    await sheets.spreadsheets.batchUpdate({
-      spreadsheetId: GOOGLE_SHEET_ID,
-      requestBody: { requests: formatRequests },
-    });
-  }
-
-  console.log(`✅ Finals written: ${finalsWritten} | formatted finals`);
+  const wrote = await writePrefillRows(sheets, sheetId, firstEmptyRow - 1, rows);
+  console.log(`Wrote ${wrote} new row(s) to ${TAB_NAME}.`);
 }
 
-/* ===== Entry ===== */
-(async () => {
-  try {
-    if (PREFILL_MODE === "finals") await runFinalsSweep();
-    else await runPrefill();
-  } catch (e) {
-    console.error("❌ Orchestrator fatal:", e?.response?.data ?? e);
-    process.exit(1);
-  }
-})();
+main().catch(err => {
+  console.error(`Orchestrator fatal:`, err);
+  process.exit(1);
+});
