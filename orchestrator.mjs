@@ -71,52 +71,40 @@ function richTextUnderlineForMatchup(matchup, favSide, awayName, homeName) {
 
   const end = start + favName.length;
   const runs = [];
+  // If favorite starts after 0, create a neutral run at 0
   if (start > 0) runs.push({ startIndex: 0 });
+  // Underline just the favorite
   runs.push({ startIndex: start, format: { underline: true } });
+  // Ensure we turn underline off after the favorite
   if (end < len) runs.push({ startIndex: end });
   return { text, runs };
 }
 
 /* ========== Parse spreads accurately ========== */
-/**
- * Strategy:
- * 1) Prefer team-specific odds: awayTeamOdds.spread / homeTeamOdds.spread
- * 2) Else parse odds.details/summary like "CLE -3.5"
- * 3) Else (no trustworthy source) return nulls (do NOT invent numbers)
- */
 function parseSpreadsFromOdds(odds, awayName, homeName, awayAbbr, homeAbbr) {
-  // Step 1: team-specific spreads (most reliable when present)
   const aTeam = asNum(odds?.awayTeamOdds?.spread);
   const hTeam = asNum(odds?.homeTeamOdds?.spread);
   if (aTeam != null && hTeam != null) {
     return { spreadAway: aTeam, spreadHome: hTeam };
   }
 
-  // Step 2: parse “TEAM -X.X” from details/summary
   const text = String(odds?.details ?? odds?.summary ?? "").trim();
   if (text) {
-    // Match like "CLE -3.5", "JAX -2", "NE +1.5", etc.
     const m = text.match(/\b([A-Z]{2,4})\s*([+-]?\d+(?:\.\d+)?)/);
     if (m) {
       const favAbbr = m[1];
       const val = Number(m[2]);
       if (!Number.isNaN(val)) {
-        // If value is positive there, ESPN’s string might not encode sign as “favorite is -x”.
-        // We’ll interpret the captured number as the absolute line and apply sign via favorite.
         const line = Math.abs(val);
-
         const favIsAway = [awayAbbr].filter(Boolean)
           .some(a => a.toUpperCase() === favAbbr.toUpperCase());
         const favIsHome = [homeAbbr].filter(Boolean)
           .some(a => a.toUpperCase() === favAbbr.toUpperCase());
-
         if (favIsAway) return { spreadAway: -line, spreadHome: line };
         if (favIsHome) return { spreadAway: line, spreadHome: -line };
       }
     }
   }
-
-  // Step 3: give up (no fallback to ±2.5!)
   return { spreadAway: null, spreadHome: null };
 }
 
@@ -158,8 +146,8 @@ async function runPrefill() {
     const comp = competitions?.[0];
     if (!comp) continue;
 
-    const away = comp.competitors?.find(c => c.homeAway === "away");
-    const home = comp.competitors?.find(c => c.homeAway === "home");
+    const away = comp?.competitors?.find(c => c.homeAway === "away");
+    const home = comp?.competitors?.find(c => c.homeAway === "home");
     if (!away || !home) continue;
 
     const awayName = away.team?.shortDisplayName || away.team?.displayName || "";
@@ -182,7 +170,7 @@ async function runPrefill() {
       odds, awayName, homeName, awayAbbr, homeAbbr
     );
 
-    // Favorite detection just for underlining (don’t invent spreads)
+    // Favorite detection for underline
     let favSide = null;
     if (spreadAway != null && spreadHome != null) {
       favSide = spreadAway < 0 ? "away" : (spreadHome < 0 ? "home" : null);
@@ -193,14 +181,18 @@ async function runPrefill() {
     const matchup = `${awayName} @ ${homeName}`;
     const { text, runs } = richTextUnderlineForMatchup(matchup, favSide, awayName, homeName);
 
-    // Compose A..K row
+    // Compose A..K row (NOTE the explicit base textFormat on column E)
     outRows.push({
       values: [
         { userEnteredValue: { stringValue: String(id) } },           // A Game ID
         { userEnteredValue: { stringValue: displayDate } },          // B Date
         { userEnteredValue: { stringValue: weekLabel } },            // C Week
         { userEnteredValue: { stringValue: kickoff } },              // D Status
-        { userEnteredValue: { stringValue: text }, textFormatRuns: runs }, // E Matchup
+        {
+          userEnteredValue: { stringValue: text },                   // E Matchup
+          textFormatRuns: runs,
+          userEnteredFormat: { textFormat: { underline: false, bold: false } }
+        },
         { userEnteredValue: { stringValue: "" } },                   // F Final Score
         { userEnteredValue: spreadAway != null ? { numberValue: spreadAway } : {} }, // G Away Spread
         { userEnteredValue: mlAway     != null ? { numberValue: mlAway }     : {} }, // H Away ML
@@ -252,7 +244,8 @@ async function runPrefill() {
         {
           updateCells: {
             rows: newRows,
-            fields: "userEnteredValue,textFormatRuns",
+            // include base textFormat reset for E along with runs
+            fields: "userEnteredValue,textFormatRuns,userEnteredFormat.textFormat.underline,userEnteredFormat.textFormat.bold",
             range: {
               sheetId,
               startRowIndex,
@@ -269,7 +262,7 @@ async function runPrefill() {
   console.log(`✅ Prefill completed: ${newRows.length} new rows`);
 }
 
-/* ========== Finals sweep (no underline changes here) ========== */
+/* ========== Finals sweep (bold winner; grade only when Final) ========== */
 const COLORS = {
   green: { red: 0.85, green: 0.95, blue: 0.85 },
   red:   { red: 0.98, green: 0.85, blue: 0.85 },
@@ -342,7 +335,7 @@ async function runFinalsSweep() {
 
       if (!isFinal) continue; // ✅ Only grade when Final
 
-      // Winner bold only (do NOT add underline here — preserves prefill underline)
+      // Winner bold only (preserve existing underline from prefill)
       const matchupText = r[4] || "";
       const [awayName, homeName] = (matchupText || "").split(" @ ").map(s => (s || "").trim());
       const winnerSide = awayScore > homeScore ? "away" : (homeScore > awayScore ? "home" : null);
