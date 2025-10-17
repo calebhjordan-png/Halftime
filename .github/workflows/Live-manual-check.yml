@@ -8,7 +8,7 @@ on:
         required: true
         default: "nfl"
       game_id:
-        description: "Optional: Specific ESPN Game ID to check (leave blank for all live games)"
+        description: "Specific ESPN Game ID to force update (optional)"
         required: false
         default: ""
 
@@ -32,6 +32,6 @@ jobs:
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
           GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
           LEAGUE: ${{ github.event.inputs.league }}
-          TAB_NAME: ${{ github.event.inputs.league == 'nfl' && 'NFL' || 'CFB' }}
+          TAB_NAME: ${{ fromJson('{"nfl":"NFL","college-football":"CFB"}')[github.event.inputs.league] }}
           GAME_ID: ${{ github.event.inputs.game_id }}
         run: node live-game.mjs
