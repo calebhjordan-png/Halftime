@@ -3,10 +3,10 @@ name: NFL Live (Daily Planner)
 on:
   schedule:
     # Every 5 minutes during typical NFL windows:
-    # Thursday–Monday evenings 16:00–23:59 UTC
-    - cron: "*/5 16-23 * * 4-1"
-    # and Friday–Tuesday early mornings 00:00–06:59 UTC
-    - cron: "*/5 0-6 * * 5-2"
+    # Thu–Mon evenings 16:00–23:59 UTC
+    - cron: "*/5 16-23 * * 4,5,6,0,1"
+    # Fri–Tue early mornings 00:00–06:59 UTC
+    - cron: "*/5 0-6 * * 5,6,0,1,2"
   workflow_dispatch:
 
 jobs:
