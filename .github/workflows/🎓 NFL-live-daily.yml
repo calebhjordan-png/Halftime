@@ -2,7 +2,6 @@ name: NFL Live (Daily Planner)
 
 on:
   schedule:
-    # Every 5 minutes during typical NFL windows:
     # Thu–Mon evenings 16:00–23:59 UTC
     - cron: "*/5 16-23 * * 4,5,6,0,1"
     # Fri–Tue early mornings 00:00–06:59 UTC
@@ -12,19 +11,12 @@ on:
 jobs:
   live:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Setup Node
-        uses: actions/setup-node@v4
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
         with:
           node-version: "20"
-
-      - name: Install runtime deps
-        run: npm i axios googleapis
-
+      - run: npm i axios googleapis
       - name: Run live updater (NFL)
         env:
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
