@@ -5,18 +5,18 @@ on:
     inputs:
       league:
         description: "League to check (nfl or college-football)"
-        required: false
+        required: true
         default: "nfl"
-      tab:
-        description: "Sheet tab to update (NFL or CFB)"
+      game_id:
+        description: "Optional: Specific ESPN Game ID to check (leave blank for all live games)"
         required: false
-        default: "NFL"
+        default: ""
 
 jobs:
   run:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
       - name: Setup Node
@@ -24,13 +24,14 @@ jobs:
         with:
           node-version: "20"
 
-      - name: Install runtime deps
+      - name: Install deps
         run: npm i axios googleapis
 
-      - name: Run live updater (manual)
+      - name: Run manual live update
         env:
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
           GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
           LEAGUE: ${{ github.event.inputs.league }}
-          TAB_NAME: ${{ github.event.inputs.tab }}
+          TAB_NAME: ${{ github.event.inputs.league == 'nfl' && 'NFL' || 'CFB' }}
+          GAME_ID: ${{ github.event.inputs.game_id }}
         run: node live-game.mjs
