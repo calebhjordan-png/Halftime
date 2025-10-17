@@ -1,223 +1,282 @@
 // live-game.mjs
-// Robust live updater for NFL and CFB Google Sheets tabs.
-// Fetches live odds (spreads, MLs, totals) and halftime scores during active games.
+// ──────────────────────────────────────────────────────────────────────────────
+// What it does (every run):
+// 1) Download today's ESPN scoreboard for the league (NFL or CFB).
+// 2) For each row in the Sheet tab (A: Game ID), if the game is on the board:
+//    - ALWAYS update Status (col D) with ESPN short detail (e.g., "Q2 10:53", "Halftime").
+//    - IF the state is IN or HALFTIME, also write Half Score + live odds to L..Q.
+// 3) Leaves odds blank when there is no live market yet (but Status still updates).
+//
+// Env needed (all are already used everywhere else in your repo):
+//   GOOGLE_SHEET_ID
+//   GOOGLE_SERVICE_ACCOUNT  (full JSON of the service account; same secret as other jobs)
+//   LEAGUE                  ("nfl" or "college-football")
+//   TAB_NAME                ("NFL" or "CFB")
+//
+// Columns used in the tab:
+//   A: Game ID  | B: Date | C: Week | D: Status | E: Matchup | ... | L: Half Score | M..Q live odds
+//
+// Dependencies: axios, googleapis
+// ──────────────────────────────────────────────────────────────────────────────
 
-// ===== Imports =====
 import axios from "axios";
 import { google } from "googleapis";
 
-// ===== Env Vars =====
-const SHEET_ID = process.env.GOOGLE_SHEET_ID;
-const SA_JSON = process.env.GOOGLE_SERVICE_ACCOUNT;
-const LEAGUE = process.env.LEAGUE;              // "nfl" | "college-football"
-const TAB = process.env.TAB_NAME;               // "NFL" | "CFB"
+// ────────── Helpers
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
-// ===== Validation =====
-function requireEnv(name) {
+function reqEnv(name) {
   const v = process.env[name];
-  if (!v || !String(v).trim()) {
-    throw new Error(`Missing required env var: ${name}`);
-  }
+  if (!v) throw new Error(`Missing required env: ${name}`);
   return v;
 }
 
-function now() {
-  return new Date().toISOString();
+function toSafeNumber(v) {
+  if (v === null || v === undefined || v === "") return "";
+  const n = Number(v);
+  return Number.isFinite(n) ? n : "";
 }
 
-// ===== ESPN Odds API URLs =====
-const ODDS_URL = (league, gameId) =>
-  `https://sports.core.api.espn.com/v2/sports/football/leagues/${league}/events/${gameId}/competitions/${gameId}/odds`;
+function pickOdds(oddsArray) {
+  if (!Array.isArray(oddsArray) || oddsArray.length === 0) return null;
 
-// ===== Axios Helper =====
-async function safeGet(url) {
-  try {
-    const { data } = await axios.get(url, { timeout: 12000 });
-    return data;
-  } catch (err) {
-    const code = err?.response?.status;
-    if (code === 404 || code === 204) {
-      console.log(`[${now()}] No odds yet (HTTP ${code}): ${url}`);
-      return null;
+  // Prefer live odds first
+  const preferredBooks = [
+    "ESPN BET",
+    "Caesars",
+    "DraftKings",
+    "FanDuel",
+    "BetMGM",
+    "William Hill",
+  ];
+
+  // 1) filter anything that looks live/in play
+  const live = oddsArray.filter(
+    o =>
+      o?.live === true ||
+      o?.inPlay === true ||
+      o?.details?.toLowerCase?.().includes("live")
+  );
+
+  // 2) choose by book priority
+  const byBook = (list) => {
+    for (const name of preferredBooks) {
+      const m = list.find(o => (o?.provider?.name || o?.provider?.displayName || "").includes(name));
+      if (m) return m;
     }
-    console.warn(`[${now()}] Request failed (${code ?? err.code ?? "ERR"}) for ${url}`);
-    throw err;
-  }
-}
+    return list[0];
+  };
 
-// ===== ESPN Odds Parser =====
-function pickEspnBook(bookmakers = []) {
-  const espn = bookmakers.find(b => (b?.name || b?.displayName || "").toUpperCase().includes("ESPN"));
-  return espn || bookmakers[0] || null;
-}
+  const chosen = byBook(live.length ? live : oddsArray);
 
-function parseOddsPayload(payload) {
-  if (!payload?.items?.length) return null;
+  // Normalize the common ESPN odds shape
+  // Some feeds include:
+  //   chosen.spread, chosen.overUnder
+  //   chosen.awayTeamOdds.moneyLine, chosen.homeTeamOdds.moneyLine
+  //   chosen.awayTeamOdds.spreadOdds, chosen.homeTeamOdds.spreadOdds
+  const awayOdds = chosen?.awayTeamOdds || {};
+  const homeOdds = chosen?.homeTeamOdds || {};
 
-  const first = payload.items[0];
-  const book = pickEspnBook(first?.bookmakers);
-  if (!book?.markets?.length) return null;
+  const spread = chosen?.spread ?? chosen?.pointSpread ?? "";
+  const ou = chosen?.overUnder ?? chosen?.total ?? "";
 
-  let awayML = null, homeML = null, awaySpread = null, homeSpread = null, total = null;
+  // Moneylines
+  const awayML =
+    awayOdds?.moneyLine ?? awayOdds?.moneyline ?? chosen?.awayMoneyLine ?? "";
+  const homeML =
+    homeOdds?.moneyLine ?? homeOdds?.moneyline ?? chosen?.homeMoneyLine ?? "";
 
-  for (const m of book.markets) {
-    const t = (m?.type || m?.displayName || "").toLowerCase();
-    const outcomes = m?.outcomes || [];
+  // Spreads: if one spread is provided on the market, sign to away/home by favorite flag if available
+  let awaySpread = "";
+  let homeSpread = "";
 
-    // Moneyline
-    if (t.includes("moneyline")) {
-      for (const o of outcomes) {
-        const side = o?.homeAway?.toLowerCase?.();
-        if (side === "away") awayML = o?.price ?? awayML;
-        if (side === "home") homeML = o?.price ?? homeML;
+  if (spread !== "" && spread !== null && spread !== undefined) {
+    // If away is favorite, then awaySpread should be negative spread
+    const awayFav = !!awayOdds?.favorite;
+    const homeFav = !!homeOdds?.favorite;
+
+    if (awayFav && !homeFav) {
+      awaySpread = -Math.abs(Number(spread));
+      homeSpread = Math.abs(Number(spread));
+    } else if (homeFav && !awayFav) {
+      awaySpread = Math.abs(Number(spread));
+      homeSpread = -Math.abs(Number(spread));
+    } else {
+      // No favorite flag, try team-specific spreads if present
+      awaySpread =
+        awayOdds?.spread ?? awayOdds?.spreadOdds ?? awayOdds?.handicap ?? "";
+      homeSpread =
+        homeOdds?.spread ?? homeOdds?.spreadOdds ?? homeOdds?.handicap ?? "";
+
+      if (awaySpread === "" && homeSpread === "") {
+        // fallback: keep market spread but assign away negative by default
+        awaySpread = -Math.abs(Number(spread));
+        homeSpread = Math.abs(Number(spread));
       }
     }
-
-    // Spread
-    if (t.includes("spread")) {
-      for (const o of outcomes) {
-        const side = o?.homeAway?.toLowerCase?.();
-        if (side === "away") awaySpread = o?.point ?? awaySpread;
-        if (side === "home") homeSpread = o?.point ?? homeSpread;
-      }
-    }
-
-    // Total
-    if (t.includes("total") || t.includes("over/under")) {
-      const over = outcomes.find(o => (o?.type || o?.name || "").toLowerCase().includes("over"));
-      const under = outcomes.find(o => (o?.type || o?.name || "").toLowerCase().includes("under"));
-      total = over?.point ?? under?.point ?? total;
-    }
+  } else {
+    // maybe team odds carry the handicaps
+    awaySpread =
+      awayOdds?.spread ?? awayOdds?.spreadOdds ?? awayOdds?.handicap ?? "";
+    homeSpread =
+      homeOdds?.spread ?? homeOdds?.spreadOdds ?? homeOdds?.handicap ?? "";
   }
 
-  return { awayML, homeML, awaySpread, homeSpread, total };
+  return {
+    awaySpread: toSafeNumber(awaySpread),
+    homeSpread: toSafeNumber(homeSpread),
+    awayML: toSafeNumber(awayML),
+    homeML: toSafeNumber(homeML),
+    total: toSafeNumber(ou),
+  };
 }
 
-// ===== Google Sheets Setup =====
-async function getSheets() {
-  requireEnv("GOOGLE_SHEET_ID");
-  requireEnv("GOOGLE_SERVICE_ACCOUNT");
-
-  let creds;
+function buildHalfScore(comp) {
   try {
-    creds = JSON.parse(SA_JSON);
+    const c = Array.isArray(comp) ? comp[0] : comp; // competitions[0]
+    const teams = c?.competitors || [];
+    const away = teams.find(t => (t?.homeAway || "").toLowerCase() === "away");
+    const home = teams.find(t => (t?.homeAway || "").toLowerCase() === "home");
+
+    const sumFirstTwo = (lines) =>
+      (Array.isArray(lines) ? lines.slice(0, 2) : [])
+        .map(x => Number(x?.value ?? x ?? 0))
+        .reduce((a, b) => a + (Number.isFinite(b) ? b : 0), 0);
+
+    const awayHalf = sumFirstTwo(away?.linescores);
+    const homeHalf = sumFirstTwo(home?.linescores);
+
+    if (Number.isFinite(awayHalf) && Number.isFinite(homeHalf)) {
+      return `${awayHalf}-${homeHalf}`;
+    }
+    return "";
   } catch {
-    try {
-      creds = JSON.parse(Buffer.from(SA_JSON, "base64").toString("utf8"));
-    } catch {
-      throw new Error("GOOGLE_SERVICE_ACCOUNT must be valid JSON or base64-encoded JSON.");
-    }
+    return "";
   }
+}
 
-  const auth = new google.auth.JWT({
-    email: creds.client_email,
-    key: creds.private_key,
+function statusString(event) {
+  const c = event?.competitions?.[0];
+  const s = (c?.status || event?.status);
+  const st = s?.type || {};
+  const state = (st?.state || "").toUpperCase(); // PRE / IN / POST
+  let text = st?.shortDetail || st?.detail || s?.displayClock || "";
+
+  // Normalize common cases
+  if (state === "IN" && /HALF/i.test(text)) text = "Halftime";
+  if (state === "POST") text = "Final";
+  return { state, text: text || "" };
+}
+
+// ────────── Main
+(async () => {
+  const SHEET_ID = reqEnv("GOOGLE_SHEET_ID");
+  const TAB = reqEnv("TAB_NAME");
+  const LEAGUE = reqEnv("LEAGUE"); // "nfl" | "college-football"
+
+  // Auth to Sheets
+  const svc = JSON.parse(reqEnv("GOOGLE_SERVICE_ACCOUNT"));
+  const jwt = new google.auth.JWT({
+    email: svc.client_email,
+    key: svc.private_key,
     scopes: ["https://www.googleapis.com/auth/spreadsheets"],
   });
+  const sheets = google.sheets({ version: "v4", auth: jwt });
 
-  return google.sheets({ version: "v4", auth });
-}
+  // Get today's ESPN board
+  const boardUrl = `https://site.api.espn.com/apis/v2/sports/football/${LEAGUE}/scoreboard`;
+  const { data: board } = await axios.get(boardUrl, { timeout: 15000 });
 
-// ===== A1 Helpers =====
-const COL = { L: 12, M: 13, N: 14, O: 15, P: 16, Q: 17 };
-function a1(row, colIndex) {
-  let x = colIndex, s = "";
-  while (x) {
-    x--;
-    s = String.fromCharCode(65 + (x % 26)) + s;
-    x = Math.floor(x / 26);
+  const events = Array.isArray(board?.events) ? board.events : [];
+  const byId = new Map(events.map(ev => [String(ev?.id || ""), ev]));
+
+  if (byId.size === 0) {
+    console.log("[live] Scoreboard empty; nothing to do.");
+    return;
   }
-  return `${s}${row}`;
-}
 
-// ===== Determine if a game is live =====
-function isLiveStatus(s) {
-  const t = (s || "").toLowerCase().trim();
-  // Expanded detection: halftime, half, ht, mid, in-progress, etc.
-  return /(live|in[-\s]?progress|1st|2nd|3rd|4th|q1|q2|q3|q4|half|halftime|ht|mid|ot|overtime)/.test(t);
-}
+  // Read the Sheet rows we care about: A (id) through D (status)
+  const rangeRead = `${TAB}!A2:D`;
+  const readRes = await sheets.spreadsheets.values.get({
+    spreadsheetId: SHEET_ID,
+    range: rangeRead,
+    valueRenderOption: "UNFORMATTED_VALUE",
+  });
 
-// ===== Helper for numeric data =====
-function numOrBlank(x) {
-  if (x === null || x === undefined || x === "" || Number.isNaN(Number(x))) return "";
-  return Number(x);
-}
+  const rows = readRes.data.values || [];
+  if (rows.length === 0) {
+    console.log("[live] No rows to check.");
+    return;
+  }
 
-// ===== Main =====
-(async function main() {
-  try {
-    requireEnv("LEAGUE");
-    requireEnv("TAB_NAME");
+  const valueUpdates = []; // each element: {range, values}
 
-    const sheets = await getSheets();
+  // Process each sheet row
+  for (let r = 0; r < rows.length; r++) {
+    const excelRow = r + 2; // 1-based + header row
+    const [gameIdRaw] = rows[r];
+    const gameId = String(gameIdRaw || "").trim();
+    if (!gameId) continue;
 
-    const readRange = `${TAB}!A2:Q`;
-    const readRes = await sheets.spreadsheets.values.get({
-      spreadsheetId: SHEET_ID,
-      range: readRange,
-      valueRenderOption: "UNFORMATTED_VALUE",
+    const ev = byId.get(gameId);
+    if (!ev) continue; // not on today's board
+
+    const { state, text } = statusString(ev);
+
+    // 1) ALWAYS write Status (col D)
+    valueUpdates.push({
+      range: `${TAB}!D${excelRow}`,
+      values: [[text]],
     });
 
-    const rows = readRes.data.values || [];
-    if (!rows.length) {
-      console.log(`[${now()}] No rows found in ${TAB}.`);
-      return;
+    // 2) If IN or HALFTIME, write L..Q
+    if (state === "IN" || state === "HALFTIME") {
+      const comp = ev?.competitions?.[0] || {};
+      const odds = pickOdds(comp?.odds || ev?.odds || []);
+      const half = buildHalfScore(ev?.competitions);
+
+      const outRow = [
+        half,                       // L: Half Score
+        odds?.awaySpread ?? "",     // M: Live Away Spread
+        odds?.awayML ?? "",         // N: Live Away ML
+        odds?.homeSpread ?? "",     // O: Live Home Spread
+        odds?.homeML ?? "",         // P: Live Home ML
+        odds?.total ?? "",          // Q: Live Total
+      ];
+
+      valueUpdates.push({
+        range: `${TAB}!L${excelRow}:Q${excelRow}`,
+        values: [outRow],
+      });
     }
+  }
 
-    const updates = [];
+  if (valueUpdates.length === 0) {
+    console.log("[live] Nothing to update (no live rows or no matches).");
+    return;
+  }
 
-    for (let i = 0; i < rows.length; i++) {
-      const row = rows[i];
-      const rowNum = 2 + i;
-      const gameId = row[0];
-      const status = row[3];
-
-      if (!gameId || !isLiveStatus(status)) continue;
-
-      const url = ODDS_URL(LEAGUE, gameId);
-      let payload = null;
-      try {
-        payload = await safeGet(url);
-      } catch (err) {
-        console.warn(`[${now()}] Skipping row ${rowNum} (${gameId}): ${err.message}`);
-        continue;
-      }
-
-      if (!payload) continue;
-
-      const parsed = parseOddsPayload(payload);
-      if (!parsed) continue;
-
-      const { awaySpread, awayML, homeSpread, homeML, total } = parsed;
-
-      const writeRange = `${TAB}!${a1(rowNum, COL.M)}:${a1(rowNum, COL.Q)}`;
-      const values = [[
-        numOrBlank(awaySpread),
-        numOrBlank(awayML),
-        numOrBlank(homeSpread),
-        numOrBlank(homeML),
-        numOrBlank(total),
-      ]];
-
-      updates.push({ range: writeRange, values });
-    }
-
-    if (!updates.length) {
-      console.log(`[${now()}] Nothing to update (no live rows or no markets).`);
-      return;
-    }
-
+  // Batch write
+  // Break into chunks of ~100 to stay comfy with API limits
+  const chunkSize = 100;
+  for (let i = 0; i < valueUpdates.length; i += chunkSize) {
+    const chunk = valueUpdates.slice(i, i + chunkSize);
     await sheets.spreadsheets.values.batchUpdate({
       spreadsheetId: SHEET_ID,
       requestBody: {
-        valueInputOption: "RAW",
-        data: updates,
+        valueInputOption: "USER_ENTERED",
+        data: chunk,
       },
     });
-
-    console.log(`[${now()}] Updated ${updates.length} live rows on tab "${TAB}".`);
-  } catch (err) {
-    console.error(`Live updater fatal: ${err?.message || err}`, err?.response?.status ? `*** code: ${err.response.status} ***` : "");
-    process.exitCode = 1;
+    await sleep(250); // very small throttle
   }
-})();
+
+  console.log(`[live] Updated ${valueUpdates.length} range(s).`);
+})().catch((err) => {
+  // Make the error visible in Actions logs
+  const msg = (err?.response?.status)
+    ? `Live updater fatal: *** code: ${err.response.status} ***`
+    : `Live updater fatal: ${err?.message || err}`;
+  console.error(msg);
+  process.exit(1);
+});
