@@ -2,19 +2,33 @@ name: CFB Live (Daily Planner)
 
 on:
   schedule:
-    - cron: "*/5 16-23 * * 4-7"  # Thu–Sun evenings UTC
-    - cron: "*/5 0-6 * * 5-1"    # Fri–Mon early mornings UTC
+    # Evening windows (16:00–23:59 UTC)
+    - cron: "*/5 16-23 * * 4"   # Thursday
+    - cron: "*/5 16-23 * * 5"   # Friday
+    - cron: "*/5 16-23 * * 6"   # Saturday
+    - cron: "*/5 16-23 * * 0"   # Sunday
+    # Early-morning spillover (00:00–06:59 UTC)
+    - cron: "*/5 0-6 * * 5"     # Friday early morning
+    - cron: "*/5 0-6 * * 6"     # Saturday early morning
+    - cron: "*/5 0-6 * * 0"     # Sunday early morning
+    - cron: "*/5 0-6 * * 1"     # Monday early morning
   workflow_dispatch:
 
 jobs:
   live:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
         with:
           node-version: "20"
-      - run: npm i axios googleapis
+
+      - name: Install runtime deps
+        run: npm i axios googleapis
+
       - name: Run live updater (CFB)
         env:
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
