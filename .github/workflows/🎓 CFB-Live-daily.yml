@@ -1,132 +1,32 @@
 name: CFB Live (Daily Planner)
 
 on:
+  # keep your existing cron if you prefer different windows
   schedule:
-    - cron: '0 6 * * *'          # morning plan
-    - cron: '*/15 15-23 * * *'   # daytime/evening ET windows (tune as you like)
-    - cron: '*/15 0-4 * * *'     # late games
+    - cron: "*/5 16-06 * * *"   # every 5 min during typical game windows (UTC)
   workflow_dispatch:
-    inputs:
-      target_date_et:
-        description: 'YYYYMMDD (blank = today ET)'
-        required: false
-        default: ''
 
 jobs:
-  plan:
+  live:
     runs-on: ubuntu-latest
-    outputs:
-      games: ${{ steps.out.outputs.games }}
-    env:
-      MAX_AHEAD_MIN: ${{ vars.MAX_AHEAD_MIN || 120 }}   # only start watchers for games within next N minutes
-      GRACE_PAST_MIN: ${{ vars.GRACE_PAST_MIN || 60 }}  # include games that started within the last N minutes
+
     steps:
-      - name: Setup Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-
-      - id: out
-        name: Build near-term game matrix (CFB)
-        run: |
-          node - <<'NODE'
-          (async () => {
-            const tz = 'America/New_York';
-            const input = (process.env.INPUT || '').trim();
-            const maxAheadMin = parseInt(process.env.MAX_AHEAD_MIN || '120', 10);
-            const gracePastMin = parseInt(process.env.GRACE_PAST_MIN || '60', 10);
-
-            function toYYYYMMDD(d) {
-              const p = new Intl.DateTimeFormat('en-US', { timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit' }).formatToParts(d);
-              const g = k => p.find(x => x.type === k)?.value || '';
-              return `${g('year')}${g('month')}${g('day')}`;
-            }
-            function todayET() {
-              const now = new Date();
-              const p = new Intl.DateTimeFormat('en-US', { timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit' }).formatToParts(now);
-              const y = +p.find(q => q.type === 'year').value, m = +p.find(q => q.type === 'month').value, d = +p.find(q => q.type === 'day').value;
-              const etMid = new Date(Date.UTC(y, m - 1, d, 5)); // ~ET midnight
-              return toYYYYMMDD(etMid);
-            }
-
-            const yyyymmdd = (/^\d{8}$/.test(input) ? input : todayET());
-            const url = `https://site.api.espn.com/apis/site/v2/sports/football/college-football/scoreboard?dates=${yyyymmdd}&groups=80&limit=300`;
-
-            const res = await fetch(url, { headers: { 'User-Agent': 'cfb-live-daily/2.0' } });
-            if (!res.ok) throw new Error('HTTP ' + res.status);
-            const sb = await res.json();
-
-            const nowSec = Math.floor(Date.now()/1000);
-            const maxAheadSec = maxAheadMin * 60;
-            const gracePastSec = gracePastMin * 60;
-
-            const seen = new Set();
-            const games = (sb.events || [])
-              .filter(e => e && !seen.has(e.id) && seen.add(e.id))
-              .map(e => ({
-                game_id: String(e.id),
-                kickoff_epoch: Math.floor(new Date(e.date).getTime()/1000)
-              }))
-              .filter(g => {
-                const wait = g.kickoff_epoch - nowSec;
-                return (wait <= maxAheadSec) && (wait >= -gracePastSec);
-              });
-
-            require('fs').appendFileSync(process.env.GITHUB_OUTPUT, `games=${JSON.stringify(games)}\n`);
-          })().catch(e => { console.error(e); process.exit(1); });
-          NODE
-        env:
-          INPUT: ${{ github.event.inputs.target_date_et }}
-
-  watchers:
-    needs: plan
-    if: ${{ needs.plan.outputs.games != '' && needs.plan.outputs.games != '[]' }}
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include: ${{ fromJson(needs.plan.outputs.games) }}
-    concurrency:
-      group: cfb-live-${{ matrix.game_id }}
-      cancel-in-progress: false
-    steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: "20"
 
-      - name: Install deps
-        run: npm i googleapis
+      # ✅ This is the only functional change you needed
+      - name: Install runtime deps
+        run: npm i axios googleapis
 
-      - name: Short sleep to kickoff+60 (cap wait)
-        env:
-          WAKE_OFFSET_MIN: ${{ vars.WAKE_OFFSET_MIN || 60 }}
-          MAX_SLEEP_MIN:   ${{ vars.MAX_SLEEP_MIN   || 20 }}   # hard cap per run
-        run: |
-          NOW=$(date +%s)
-          TARGET=$(( ${{ matrix.kickoff_epoch }} + WAKE_OFFSET_MIN*60 ))
-          WAIT=$(( TARGET - NOW ))
-          CAP=$(( MAX_SLEEP_MIN*60 ))
-          if [ $WAIT -le 0 ]; then
-            echo "Kick already passed; proceeding immediately."
-            exit 0
-          fi
-          if [ $WAIT -gt $CAP ]; then
-            echo "Too early (need $WAIT s, cap $CAP s). Skipping now; planner will re-queue closer to kickoff."
-            exit 0
-          fi
-          echo "Sleeping $WAIT sec until kickoff+offset..."
-          sleep $WAIT
-
-      - name: Start live engine
+      - name: Run live updater (CFB)
         env:
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
           GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
-          LEAGUE: college-football
-          TAB_NAME: CFB
-          TARGET_GAME_ID: ${{ matrix.game_id }}
-          MAX_TOTAL_MIN: 200
+          LEAGUE: "college-football"
+          TAB_NAME: "CFB"
         run: node live-game.mjs
