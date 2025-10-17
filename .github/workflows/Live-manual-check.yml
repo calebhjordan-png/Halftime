@@ -15,7 +15,6 @@ on:
 jobs:
   run:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -25,7 +24,6 @@ jobs:
         with:
           node-version: "20"
 
-      # ✅ This is the only functional change you needed
       - name: Install runtime deps
         run: npm i axios googleapis
 
