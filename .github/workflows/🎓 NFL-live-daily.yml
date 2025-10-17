@@ -2,13 +2,14 @@ name: NFL Live (Daily Planner)
 
 on:
   schedule:
-    - cron: "*/5 16-23 * * *"   # every 5 min 16:00–23:59 UTC
-    - cron: "*/5 0-6 * * *"     # every 5 min 00:00–06:59 UTC
+    # Every 5 minutes during typical NFL windows: Thu-Mon US daytime/evening
+    - cron: "*/5 16-06 * * 4-1"   # Thu..Mon, 16:00–06:59 UTC (daytime/evening US)
   workflow_dispatch:
 
 jobs:
   live:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
