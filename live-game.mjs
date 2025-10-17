@@ -1,282 +1,280 @@
 // live-game.mjs
-// ──────────────────────────────────────────────────────────────────────────────
-// What it does (every run):
-// 1) Download today's ESPN scoreboard for the league (NFL or CFB).
-// 2) For each row in the Sheet tab (A: Game ID), if the game is on the board:
-//    - ALWAYS update Status (col D) with ESPN short detail (e.g., "Q2 10:53", "Halftime").
-//    - IF the state is IN or HALFTIME, also write Half Score + live odds to L..Q.
-// 3) Leaves odds blank when there is no live market yet (but Status still updates).
-//
-// Env needed (all are already used everywhere else in your repo):
-//   GOOGLE_SHEET_ID
-//   GOOGLE_SERVICE_ACCOUNT  (full JSON of the service account; same secret as other jobs)
-//   LEAGUE                  ("nfl" or "college-football")
-//   TAB_NAME                ("NFL" or "CFB")
-//
-// Columns used in the tab:
-//   A: Game ID  | B: Date | C: Week | D: Status | E: Matchup | ... | L: Half Score | M..Q live odds
-//
-// Dependencies: axios, googleapis
-// ──────────────────────────────────────────────────────────────────────────────
-
 import axios from "axios";
 import { google } from "googleapis";
 
-// ────────── Helpers
-const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-
+/* ----------------------- env & google auth ----------------------- */
 function reqEnv(name) {
   const v = process.env[name];
-  if (!v) throw new Error(`Missing required env: ${name}`);
+  if (!v) {
+    console.error(`Missing one or more required env vars. (${name})`);
+    process.exit(1);
+  }
   return v;
 }
 
-function toSafeNumber(v) {
-  if (v === null || v === undefined || v === "") return "";
-  const n = Number(v);
-  return Number.isFinite(n) ? n : "";
+const SHEET_ID = reqEnv("GOOGLE_SHEET_ID");
+const SA_JSON = JSON.parse(reqEnv("GOOGLE_SERVICE_ACCOUNT"));
+const LEAGUE = reqEnv("LEAGUE");               // "nfl" or "college-football"
+const TAB_NAME = reqEnv("TAB_NAME");           // "NFL" or "CFB"
+const MANUAL_GAME_ID = (process.env.GAME_ID || "").trim();  // optional tiny patch
+
+const scopes = ["https://www.googleapis.com/auth/spreadsheets"];
+const jwt = new google.auth.JWT(
+  SA_JSON.client_email,
+  null,
+  SA_JSON.private_key,
+  scopes
+);
+const sheets = google.sheets({ version: "v4", auth: jwt });
+
+/* ----------------------- helpers ----------------------- */
+const COLS = {
+  GAME_ID: 0,
+  DATE: 1,
+  WEEK: 2,
+  STATUS: 3,
+  MATCHUP: 4,
+  FINAL_SCORE: 5,
+  AWAY_SPREAD: 6,
+  AWAY_ML: 7,
+  HOME_SPREAD: 8,
+  HOME_ML: 9,
+  TOTAL: 10,
+
+  HALF_SCORE: 11,  // L
+  LIVE_AWAY_SPREAD: 12, // M
+  LIVE_AWAY_ML: 13,     // N
+  LIVE_HOME_SPREAD: 14, // O
+  LIVE_HOME_ML: 15,     // P
+  LIVE_TOTAL: 16        // Q
+};
+
+const ESPN_SPORT = LEAGUE === "nfl" ? "nfl" : "college-football";
+
+/**
+ * ESPN game summary endpoint
+ * ex: https://site.api.espn.com/apis/site/v2/sports/football/nfl/summary?event=401326625
+ */
+async function fetchSummary(gameId) {
+  const url = `https://site.api.espn.com/apis/site/v2/sports/football/${ESPN_SPORT}/summary?event=${gameId}`;
+  const { data } = await axios.get(url, { timeout: 10000 });
+  return data;
 }
 
-function pickOdds(oddsArray) {
-  if (!Array.isArray(oddsArray) || oddsArray.length === 0) return null;
+/**
+ * Best-effort odds fetch.
+ * Try competition odds endpoint (may 404), then fall back to scoreboard item odds if needed.
+ * Returns { spreadAway, spreadHome, mlAway, mlHome, total } or null if not available.
+ */
+async function fetchLiveOdds(gameId) {
+  // v2 odds (may 404 if market not up yet)
+  const oddsUrl = `https://sports.core.api.espn.com/v2/sports/football/${ESPN_SPORT}/events/${gameId}/competitions/${gameId}/odds`;
+  try {
+    const { data } = await axios.get(oddsUrl, { timeout: 10000, validateStatus: () => true });
+    if (data && data.items && data.items.length > 0) {
+      // pick first active “line” in items
+      const first = data.items[0];
+      // Safeguard value extraction
+      const mk = await axios.get(first.$ref || first.href || oddsUrl, { timeout: 10000, validateStatus: () => true }).then(r => r.data).catch(() => null);
+      if (mk) {
+        // different shapes exist; try to map robustly
+        const spreadAway = Number(mk.awayTeamOdds?.spread || mk.awayTeamOdds?.current?.spread ?? "");
+        const spreadHome = Number(mk.homeTeamOdds?.spread || mk.homeTeamOdds?.current?.spread ?? "");
+        const mlAway = Number(mk.awayTeamOdds?.moneyLine || mk.awayTeamOdds?.current?.moneyLine ?? "");
+        const mlHome = Number(mk.homeTeamOdds?.moneyLine || mk.homeTeamOdds?.current?.moneyLine ?? "");
+        const total = Number(mk.overUnder || mk.current?.overUnder ?? "");
 
-  // Prefer live odds first
-  const preferredBooks = [
-    "ESPN BET",
-    "Caesars",
-    "DraftKings",
-    "FanDuel",
-    "BetMGM",
-    "William Hill",
-  ];
-
-  // 1) filter anything that looks live/in play
-  const live = oddsArray.filter(
-    o =>
-      o?.live === true ||
-      o?.inPlay === true ||
-      o?.details?.toLowerCase?.().includes("live")
-  );
-
-  // 2) choose by book priority
-  const byBook = (list) => {
-    for (const name of preferredBooks) {
-      const m = list.find(o => (o?.provider?.name || o?.provider?.displayName || "").includes(name));
-      if (m) return m;
-    }
-    return list[0];
-  };
-
-  const chosen = byBook(live.length ? live : oddsArray);
-
-  // Normalize the common ESPN odds shape
-  // Some feeds include:
-  //   chosen.spread, chosen.overUnder
-  //   chosen.awayTeamOdds.moneyLine, chosen.homeTeamOdds.moneyLine
-  //   chosen.awayTeamOdds.spreadOdds, chosen.homeTeamOdds.spreadOdds
-  const awayOdds = chosen?.awayTeamOdds || {};
-  const homeOdds = chosen?.homeTeamOdds || {};
-
-  const spread = chosen?.spread ?? chosen?.pointSpread ?? "";
-  const ou = chosen?.overUnder ?? chosen?.total ?? "";
-
-  // Moneylines
-  const awayML =
-    awayOdds?.moneyLine ?? awayOdds?.moneyline ?? chosen?.awayMoneyLine ?? "";
-  const homeML =
-    homeOdds?.moneyLine ?? homeOdds?.moneyline ?? chosen?.homeMoneyLine ?? "";
-
-  // Spreads: if one spread is provided on the market, sign to away/home by favorite flag if available
-  let awaySpread = "";
-  let homeSpread = "";
-
-  if (spread !== "" && spread !== null && spread !== undefined) {
-    // If away is favorite, then awaySpread should be negative spread
-    const awayFav = !!awayOdds?.favorite;
-    const homeFav = !!homeOdds?.favorite;
-
-    if (awayFav && !homeFav) {
-      awaySpread = -Math.abs(Number(spread));
-      homeSpread = Math.abs(Number(spread));
-    } else if (homeFav && !awayFav) {
-      awaySpread = Math.abs(Number(spread));
-      homeSpread = -Math.abs(Number(spread));
-    } else {
-      // No favorite flag, try team-specific spreads if present
-      awaySpread =
-        awayOdds?.spread ?? awayOdds?.spreadOdds ?? awayOdds?.handicap ?? "";
-      homeSpread =
-        homeOdds?.spread ?? homeOdds?.spreadOdds ?? homeOdds?.handicap ?? "";
-
-      if (awaySpread === "" && homeSpread === "") {
-        // fallback: keep market spread but assign away negative by default
-        awaySpread = -Math.abs(Number(spread));
-        homeSpread = Math.abs(Number(spread));
+        const hasAny =
+          [spreadAway, spreadHome, mlAway, mlHome, total].some(v => Number.isFinite(v));
+        if (hasAny) {
+          return { spreadAway, spreadHome, mlAway, mlHome, total };
+        }
       }
     }
-  } else {
-    // maybe team odds carry the handicaps
-    awaySpread =
-      awayOdds?.spread ?? awayOdds?.spreadOdds ?? awayOdds?.handicap ?? "";
-    homeSpread =
-      homeOdds?.spread ?? homeOdds?.spreadOdds ?? homeOdds?.handicap ?? "";
+  } catch (err) {
+    if (axios.isAxiosError(err) && err.response?.status === 404) {
+      // graceful skip
+      return null;
+    }
+    throw err; // other errors bubble up
   }
+
+  // If we got here: no usable odds found
+  return null;
+}
+
+function parseHalftimeFromSummary(summary) {
+  try {
+    const comp = summary?.header?.competitions?.[0];
+    const st = comp?.status?.type || {};
+    const desc = String(st?.description || st?.detail || "").toLowerCase();
+    return desc.includes("halftime") || desc === "half";
+  } catch {
+    return false;
+  }
+}
+
+function currentScoreFromSummary(summary) {
+  try {
+    const comp = summary?.header?.competitions?.[0];
+    const a = comp?.competitors?.find(c => c?.homeAway === "away");
+    const h = comp?.competitors?.find(c => c?.homeAway === "home");
+    const as = Number(a?.score ?? 0);
+    const hs = Number(h?.score ?? 0);
+    if (Number.isFinite(as) && Number.isFinite(hs)) {
+      return `${as}-${hs}`;
+    }
+  } catch {}
+  return "";
+}
+
+/* ----------------------- sheets I/O ----------------------- */
+async function readRows() {
+  // Read everything we need up through column Q
+  const range = `${TAB_NAME}!A2:Q`;
+  const resp = await sheets.spreadsheets.values.get({
+    spreadsheetId: SHEET_ID,
+    range
+  });
+  return resp.data.values || [];
+}
+
+function makeRowUpdate(rowIndex0, columns) {
+  // rowIndex0 is zero-based from the A2 origin
+  // Build a single row update starting at column L (HALF_SCORE) through Q
+  const startCol = COLS.HALF_SCORE; // 11
+  const values = new Array(6).fill(""); // L..Q (6 cells)
+  values[0] = columns.halfScore ?? "";
+  values[1] = isFiniteNumber(columns.liveAwaySpread) ? Number(columns.liveAwaySpread) : "";
+  values[2] = isFiniteNumber(columns.liveAwayML) ? Number(columns.liveAwayML) : "";
+  values[3] = isFiniteNumber(columns.liveHomeSpread) ? Number(columns.liveHomeSpread) : "";
+  values[4] = isFiniteNumber(columns.liveHomeML) ? Number(columns.liveHomeML) : "";
+  values[5] = isFiniteNumber(columns.liveTotal) ? Number(columns.liveTotal) : "";
 
   return {
-    awaySpread: toSafeNumber(awaySpread),
-    homeSpread: toSafeNumber(homeSpread),
-    awayML: toSafeNumber(awayML),
-    homeML: toSafeNumber(homeML),
-    total: toSafeNumber(ou),
+    range: `${TAB_NAME}!L${rowIndex0 + 2}:Q${rowIndex0 + 2}`,
+    values: [values]
   };
 }
+const isFiniteNumber = (v) => typeof v === "number" && Number.isFinite(v);
 
-function buildHalfScore(comp) {
-  try {
-    const c = Array.isArray(comp) ? comp[0] : comp; // competitions[0]
-    const teams = c?.competitors || [];
-    const away = teams.find(t => (t?.homeAway || "").toLowerCase() === "away");
-    const home = teams.find(t => (t?.homeAway || "").toLowerCase() === "home");
+async function writeBatch(updates, statusPatches) {
+  const data = [];
 
-    const sumFirstTwo = (lines) =>
-      (Array.isArray(lines) ? lines.slice(0, 2) : [])
-        .map(x => Number(x?.value ?? x ?? 0))
-        .reduce((a, b) => a + (Number.isFinite(b) ? b : 0), 0);
-
-    const awayHalf = sumFirstTwo(away?.linescores);
-    const homeHalf = sumFirstTwo(home?.linescores);
-
-    if (Number.isFinite(awayHalf) && Number.isFinite(homeHalf)) {
-      return `${awayHalf}-${homeHalf}`;
-    }
-    return "";
-  } catch {
-    return "";
-  }
-}
-
-function statusString(event) {
-  const c = event?.competitions?.[0];
-  const s = (c?.status || event?.status);
-  const st = s?.type || {};
-  const state = (st?.state || "").toUpperCase(); // PRE / IN / POST
-  let text = st?.shortDetail || st?.detail || s?.displayClock || "";
-
-  // Normalize common cases
-  if (state === "IN" && /HALF/i.test(text)) text = "Halftime";
-  if (state === "POST") text = "Final";
-  return { state, text: text || "" };
-}
-
-// ────────── Main
-(async () => {
-  const SHEET_ID = reqEnv("GOOGLE_SHEET_ID");
-  const TAB = reqEnv("TAB_NAME");
-  const LEAGUE = reqEnv("LEAGUE"); // "nfl" | "college-football"
-
-  // Auth to Sheets
-  const svc = JSON.parse(reqEnv("GOOGLE_SERVICE_ACCOUNT"));
-  const jwt = new google.auth.JWT({
-    email: svc.client_email,
-    key: svc.private_key,
-    scopes: ["https://www.googleapis.com/auth/spreadsheets"],
-  });
-  const sheets = google.sheets({ version: "v4", auth: jwt });
-
-  // Get today's ESPN board
-  const boardUrl = `https://site.api.espn.com/apis/v2/sports/football/${LEAGUE}/scoreboard`;
-  const { data: board } = await axios.get(boardUrl, { timeout: 15000 });
-
-  const events = Array.isArray(board?.events) ? board.events : [];
-  const byId = new Map(events.map(ev => [String(ev?.id || ""), ev]));
-
-  if (byId.size === 0) {
-    console.log("[live] Scoreboard empty; nothing to do.");
-    return;
+  // Value updates L..Q
+  for (const u of updates) {
+    data.push({ range: u.range, values: u.values });
   }
 
-  // Read the Sheet rows we care about: A (id) through D (status)
-  const rangeRead = `${TAB}!A2:D`;
-  const readRes = await sheets.spreadsheets.values.get({
+  // Status patches (column D)
+  for (const s of statusPatches) {
+    data.push({
+      range: `${TAB_NAME}!D${s.row + 2}:D${s.row + 2}`,
+      values: [[s.value]]
+    });
+  }
+
+  if (data.length === 0) return;
+
+  await sheets.spreadsheets.values.batchUpdate({
     spreadsheetId: SHEET_ID,
-    range: rangeRead,
-    valueRenderOption: "UNFORMATTED_VALUE",
-  });
-
-  const rows = readRes.data.values || [];
-  if (rows.length === 0) {
-    console.log("[live] No rows to check.");
-    return;
-  }
-
-  const valueUpdates = []; // each element: {range, values}
-
-  // Process each sheet row
-  for (let r = 0; r < rows.length; r++) {
-    const excelRow = r + 2; // 1-based + header row
-    const [gameIdRaw] = rows[r];
-    const gameId = String(gameIdRaw || "").trim();
-    if (!gameId) continue;
-
-    const ev = byId.get(gameId);
-    if (!ev) continue; // not on today's board
-
-    const { state, text } = statusString(ev);
-
-    // 1) ALWAYS write Status (col D)
-    valueUpdates.push({
-      range: `${TAB}!D${excelRow}`,
-      values: [[text]],
-    });
-
-    // 2) If IN or HALFTIME, write L..Q
-    if (state === "IN" || state === "HALFTIME") {
-      const comp = ev?.competitions?.[0] || {};
-      const odds = pickOdds(comp?.odds || ev?.odds || []);
-      const half = buildHalfScore(ev?.competitions);
-
-      const outRow = [
-        half,                       // L: Half Score
-        odds?.awaySpread ?? "",     // M: Live Away Spread
-        odds?.awayML ?? "",         // N: Live Away ML
-        odds?.homeSpread ?? "",     // O: Live Home Spread
-        odds?.homeML ?? "",         // P: Live Home ML
-        odds?.total ?? "",          // Q: Live Total
-      ];
-
-      valueUpdates.push({
-        range: `${TAB}!L${excelRow}:Q${excelRow}`,
-        values: [outRow],
-      });
+    requestBody: {
+      valueInputOption: "USER_ENTERED",
+      data
     }
-  }
+  });
+}
 
-  if (valueUpdates.length === 0) {
-    console.log("[live] Nothing to update (no live rows or no matches).");
-    return;
-  }
+/* ----------------------- main ----------------------- */
+async function main() {
+  try {
+    const rows = await readRows();
+    if (!rows.length) {
+      console.log(`[${new Date().toISOString()}] Nothing to update (no rows).`);
+      return;
+    }
 
-  // Batch write
-  // Break into chunks of ~100 to stay comfy with API limits
-  const chunkSize = 100;
-  for (let i = 0; i < valueUpdates.length; i += chunkSize) {
-    const chunk = valueUpdates.slice(i, i + chunkSize);
-    await sheets.spreadsheets.values.batchUpdate({
-      spreadsheetId: SHEET_ID,
-      requestBody: {
-        valueInputOption: "USER_ENTERED",
-        data: chunk,
-      },
-    });
-    await sleep(250); // very small throttle
-  }
+    const updates = [];
+    const statusPatches = [];
 
-  console.log(`[live] Updated ${valueUpdates.length} range(s).`);
-})().catch((err) => {
-  // Make the error visible in Actions logs
-  const msg = (err?.response?.status)
-    ? `Live updater fatal: *** code: ${err.response.status} ***`
-    : `Live updater fatal: ${err?.message || err}`;
-  console.error(msg);
-  process.exit(1);
-});
+    for (let i = 0; i < rows.length; i++) {
+      const r = rows[i] || [];
+      const gameId = String(r[COLS.GAME_ID] || "").trim();
+      if (!gameId) continue;
+
+      // tiny patch: when a manual GAME_ID is provided, only work that row
+      if (MANUAL_GAME_ID && MANUAL_GAME_ID !== gameId) continue;
+
+      // Only consider games that are likely live / halftime candidates
+      const status = String(r[COLS.STATUS] || "").toLowerCase();
+
+      // We allow:
+      // - explicitly "half", "halftime"
+      // - “in progress” strings (script will check actual halftime via API)
+      const looksLive =
+        status.includes("half") ||
+        status.includes("in") ||
+        status.includes("q") ||
+        status.includes("pm") || // prefilled schedule might still be the kickoff time
+        status.includes("live");
+
+      if (!looksLive && !MANUAL_GAME_ID) continue;
+
+      // Pull ESPN summary (scores & halftime)
+      let summary;
+      try {
+        summary = await fetchSummary(gameId);
+      } catch (err) {
+        const code = axios.isAxiosError(err) ? err.response?.status : undefined;
+        console.log(`Summary fetch failed for ${gameId} (code=${code ?? "?"}). Skipping row ${i + 2}.`);
+        continue;
+      }
+
+      const isHalf = parseHalftimeFromSummary(summary);
+      const halfScore = currentScoreFromSummary(summary);
+
+      // Pull live odds (404-safe)
+      let odds = null;
+      try {
+        odds = await fetchLiveOdds(gameId);
+      } catch (err) {
+        const code = axios.isAxiosError(err) ? err.response?.status : undefined;
+        console.log(`Odds fetch error for ${gameId} (code=${code ?? "?"}). Treating as no market.`);
+      }
+
+      // If we have neither halftime nor odds and it wasn't a manual override, skip
+      if (!isHalf && !odds && !MANUAL_GAME_ID) continue;
+
+      // prepare values for L..Q
+      const patch = {
+        halfScore: halfScore || "",
+        liveAwaySpread: odds?.spreadAway,
+        liveAwayML: odds?.mlAway,
+        liveHomeSpread: odds?.spreadHome,
+        liveHomeML: odds?.mlHome,
+        liveTotal: odds?.total
+      };
+      updates.push(makeRowUpdate(i, patch));
+
+      // also patch status to "Half" if detected
+      if (isHalf && status !== "half" && status !== "halftime") {
+        statusPatches.push({ row: i, value: "Half" });
+      }
+    }
+
+    if (!updates.length && !statusPatches.length) {
+      console.log(`[${new Date().toISOString()}] Nothing to update (no halftime/odds found).`);
+      return;
+    }
+
+    await writeBatch(updates, statusPatches);
+    console.log(`[${new Date().toISOString()}] Updated ${updates.length} row(s)${statusPatches.length ? `, set ${statusPatches.length} status(es) to Half` : ""}.`);
+  } catch (err) {
+    const code = axios.isAxiosError(err) ? err.response?.status : undefined;
+    console.error(`Live updater fatal: *** code: ${code ?? "n/a"} ***`);
+    console.error(err?.stack || err?.message || String(err));
+    process.exit(1);
+  }
+}
+
+main();
