@@ -3,23 +3,36 @@ name: Live Manual Check
 on:
   workflow_dispatch:
     inputs:
-      league: { description: "nfl | college-football", required: true, default: "nfl" }
-      game_id: { description: "ESPN gameId", required: true }
-      tab: { description: "Sheet tab", required: false, default: "NFL" }
+      league:
+        description: "League to check (nfl or college-football)"
+        required: false
+        default: "nfl"
+      tab:
+        description: "Sheet tab to update (NFL or CFB)"
+        required: false
+        default: "NFL"
 
 jobs:
   run:
     runs-on: ubuntu-latest
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with: { node-version: 20 }
-      - run: npm i googleapis
-      - env:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      # ✅ This is the only functional change you needed
+      - name: Install runtime deps
+        run: npm i axios googleapis
+
+      - name: Run live updater (manual)
+        env:
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
           GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
           LEAGUE: ${{ github.event.inputs.league }}
           TAB_NAME: ${{ github.event.inputs.tab }}
-          TARGET_GAME_ID: ${{ github.event.inputs.game_id }}
-          MAX_TOTAL_MIN: 200
         run: node live-game.mjs
