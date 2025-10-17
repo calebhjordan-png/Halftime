@@ -2,8 +2,11 @@ name: CFB Live (Daily Planner)
 
 on:
   schedule:
-    - cron: "*/5 16-23 * * 4-7"   # Thu–Sun 16:00–23:59 UTC
-    - cron: "*/5 0-6 * * 5-1"     # Fri–Mon 00:00–06:59 UTC
+    # Every 5 minutes during typical CFB windows:
+    # Thu–Sun evenings 16:00–23:59 UTC
+    - cron: "*/5 16-23 * * 4,5,6,0"
+    # Fri–Mon early mornings 00:00–06:59 UTC
+    - cron: "*/5 0-6 * * 5,6,0,1"
   workflow_dispatch:
 
 jobs:
@@ -12,7 +15,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
-        with: { node-version: "20" }
+        with:
+          node-version: "20"
       - run: npm i axios googleapis
       - name: Run live updater (CFB)
         env:
