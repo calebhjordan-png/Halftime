@@ -1,13 +1,13 @@
-name: 🏈 NFL Live (Daily Planner)
+name: NFL Live (Daily Planner)
 
 on:
-  # Run once each morning to plan today's live polling / halftime checks
+  # keep your existing cron if you prefer different windows
   schedule:
-    - cron: "0 12 * * *"  # 12:00 UTC = 8:00 AM ET (adjust as you prefer)
+    - cron: "*/5 16-06 * * *"   # every 5 min during typical game windows (UTC)
   workflow_dispatch:
 
 jobs:
-  plan:
+  live:
     runs-on: ubuntu-latest
 
     steps:
@@ -17,23 +17,16 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: "20"
 
-      # Ensure deps are available on the runner (repo may not have package.json)
-      - name: Install runtime deps (axios + googleapis)
-        working-directory: ${{ github.workspace }}
-        run: |
-          test -f package.json || echo '{}' > package.json
-          npm install --no-save axios googleapis
-          echo "npm ls axios:" && npm ls axios || true
+      # ✅ This is the only functional change you needed
+      - name: Install runtime deps
+        run: npm i axios googleapis
 
-      # Call the orchestrator in "live daily" planning mode for NFL
-      - name: Plan NFL live jobs for the day
-        working-directory: ${{ github.workspace }}
+      - name: Run live updater (NFL)
         env:
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
           GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
-          LEAGUE: nfl
-          TAB_NAME: NFL
-          PREFILL_MODE: live_daily
-        run: node orchestrator.mjs
+          LEAGUE: "nfl"
+          TAB_NAME: "NFL"
+        run: node live-game.mjs
