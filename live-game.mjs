@@ -1,27 +1,27 @@
 // live-game.mjs
 // Updates only: Status (D), Half Score (L), Live odds (M..Q).
-// Leaves pregame columns untouched. Supports optional GAME_ID focus.
-// We try (in order): ESPN odds REST (prefer ESPN BET “live-ish” markets),
-// then any REST live market, then summary pools fallback.
+// Prefers ESPN BET "Live" markets via the Markets API (not the stale /odds feed).
+// Will NOT overwrite pregame columns (F..K). Supports optional GAME_ID focus.
 
 import axios from "axios";
 import { google } from "googleapis";
 
-/* ───────────── ENV ───────────── */
+/* ─────────────────────────────── ENV ─────────────────────────────── */
 const {
   GOOGLE_SHEET_ID,
   GOOGLE_SERVICE_ACCOUNT,
-  LEAGUE = "nfl",                                 // "nfl" | "college-football"
+  LEAGUE = "nfl", // "nfl" | "college-football"
   TAB_NAME = (LEAGUE === "nfl" ? "NFL" : "CFB"),
-  GAME_ID = "",                                   // optional: only update this game
-  MARKET_PREFERENCE = "2H,Second Half,Halftime,Live",
+  GAME_ID = "",   // optional: focus only one game id
+  // tokens used to accept a *live-ish* market label
+  MARKET_PREFERENCE = "live,in-play,inplay,2h,second half,halftime",
 } = process.env;
 
 for (const k of ["GOOGLE_SHEET_ID", "GOOGLE_SERVICE_ACCOUNT"]) {
   if (!process.env[k]) throw new Error(`Missing required env var: ${k}`);
 }
 
-/* ───────── Google Sheets bootstrap ───────── */
+/* ───────────────────── Google Sheets bootstrap ───────────────────── */
 const svc = JSON.parse(GOOGLE_SERVICE_ACCOUNT);
 const jwt = new google.auth.JWT(
   svc.client_email,
@@ -31,8 +31,8 @@ const jwt = new google.auth.JWT(
 );
 const sheets = google.sheets({ version: "v4", auth: jwt });
 
-/* ───────── Helpers ───────── */
-const norm = (s) => (s || "").toLowerCase();
+/* ───────────────────────────── Helpers ───────────────────────────── */
+const norm = s => (s || "").toLowerCase();
 
 function idxToA1(n0) {
   let n = n0 + 1, s = "";
@@ -56,7 +56,7 @@ function looksLiveStatus(s) {
   const x = norm(s);
   return /\bhalf\b/.test(x) || /\bin\s*progress\b/.test(x) || /\bq[1-4]\b/.test(x) || /\bot\b/.test(x) || /\blive\b/.test(x);
 }
-const isFinalCell = (s) => /^final$/i.test(String(s || ""));
+const isFinalCell = s => /^final$/i.test(String(s || ""));
 
 // ESPN status helpers
 function shortStatusFromEspn(statusObj) {
@@ -91,149 +91,112 @@ function parseHalfScore(summary) {
   return "";
 }
 
-// Preferred tokens list (order matters)
+/* ───────────────────────── ESPN fetchers ─────────────────────────── */
+
+// Summary (status + linescores)
+async function espnSummary(gameId) {
+  const url = `https://site.api.espn.com/apis/site/v2/sports/football/${LEAGUE}/summary?event=${gameId}`;
+  const { data } = await axios.get(url, { timeout: 15000 });
+  return data;
+}
+
+// Markets (ESPN BET live prices). Root returns an object with items (objects or $ref links).
+async function espnMarkets(gameId) {
+  const url = `https://sports.core.api.espn.com/v2/markets?sport=football&league=${LEAGUE}&event=${gameId}`;
+  const { data } = await axios.get(url, { timeout: 15000 });
+  return data;
+}
+
+// Helper: fetch JSON for $ref entries safely (returns {} on failure)
+async function fetchRefMaybe(ref) {
+  if (!ref || typeof ref !== "string") return {};
+  try {
+    const { data } = await axios.get(ref, { timeout: 12000 });
+    return data || {};
+  } catch { return {}; }
+}
+
+/* ─────────────── Live market selection & parsing ─────────────────── */
 function prefTokens(list = MARKET_PREFERENCE) {
   return (list || "")
     .split(",")
     .map(s => s.trim().toLowerCase())
     .filter(Boolean);
 }
-function textMatchesAny(text, tokens) {
-  const t = norm(text);
-  return tokens.some(tok => t.includes(tok));
+function labelMatchesPreferred(mk, tokens) {
+  const label = `${mk?.name || ""} ${mk?.displayName || ""} ${mk?.state || ""} ${mk?.period?.displayName || ""} ${mk?.period?.abbreviation || ""}`;
+  const l = norm(label);
+  if (/live/.test(l) || mk?.state === "LIVE" || mk?.inPlay === true) return true; // fast-path for "live"
+  return tokens.some(tok => l.includes(tok));
 }
 
-/* ───────── ESPN fetchers ───────── */
-async function espnSummary(gameId) {
-  const url = `https://site.api.espn.com/apis/site/v2/sports/football/${LEAGUE}/summary?event=${gameId}`;
-  const { data } = await axios.get(url, { timeout: 15000 });
-  return data;
-}
-async function espnOdds(gameId) {
-  const url = `https://sports.core.api.espn.com/v2/sports/football/${LEAGUE}/events/${gameId}/competitions/${gameId}/odds`;
-  const { data } = await axios.get(url, { timeout: 15000 });
-  return data;
-}
-
-// Fetch a single book detail via its $ref (common in ESPN odds REST)
-async function fetchBookByRef(ref) {
+// Dereference a market's first book (object or $ref) and extract odds
+async function extractFromMarket(market) {
+  const n = v => (v === null || v === undefined || v === "" ? "" : Number(v));
   try {
-    if (!ref) return null;
-    const { data } = await axios.get(ref, { timeout: 12000 });
-    return data;
+    const book0 = (market?.books && market.books[0]) || null;
+    const book = book0?.$ref ? await fetchRefMaybe(book0.$ref) : (book0 || {});
+    const aw = book?.awayTeamOdds || {};
+    const hm = book?.homeTeamOdds || {};
+
+    const spreadAway = n(aw?.current?.spread ?? aw?.spread ?? book?.current?.spread);
+    const spreadHome = n(hm?.current?.spread ?? hm?.spread ?? (spreadAway !== "" ? -spreadAway : ""));
+    const mlAway     = n(aw?.current?.moneyLine ?? aw?.moneyLine);
+    const mlHome     = n(hm?.current?.moneyLine ?? hm?.moneyLine);
+    const total      = n(book?.current?.total ?? book?.total);
+
+    const any = [spreadAway, spreadHome, mlAway, mlHome, total].some(v => v !== "");
+    return any ? { spreadAway, spreadHome, mlAway, mlHome, total } : undefined;
   } catch {
-    return null;
+    return undefined;
   }
 }
 
-// From a market object, load only books that look like ESPN BET (by provider name)
-async function fetchEspnBetBooks(market) {
-  try {
-    const books = Array.isArray(market?.books) ? market.books : [];
-    const out = [];
-    for (const b of books) {
-      // some odds payloads give full objects, many give { $ref: "..." }
-      const book = b?.$ref ? await fetchBookByRef(b.$ref) : b;
-      const providerName = (book?.provider?.name || "").toLowerCase();
-      if (providerName.includes("espn bet") || providerName.includes("espnbet")) {
-        out.push(book);
-      }
-    }
-    return out;
-  } catch {
-    return [];
-  }
-}
+// Given all markets, pick the best live spread/total/moneyline
+async function pickLiveFromMarkets(allMarkets, tokens) {
+  if (!Array.isArray(allMarkets) || !allMarkets.length) return undefined;
 
-// Parse a single book object into numbers (spread/ML/total)
-function extractFromBook(b) {
-  const n = (v) => (v === null || v === undefined || v === "" ? "" : Number(v));
-  const aw = b?.awayTeamOdds || {};
-  const hm = b?.homeTeamOdds || {};
-  const current = b?.current || {};
+  // Accept only live-ish markets
+  const candidates = allMarkets.filter(mk => labelMatchesPreferred(mk, tokens));
+  if (!candidates.length) return undefined;
 
-  const spreadAway = n(aw?.current?.spread ?? aw?.spread ?? current?.spread);
-  const spreadHome = n(hm?.current?.spread ?? hm?.spread ?? (spreadAway !== "" ? -spreadAway : ""));
-  const mlAway     = n(aw?.current?.moneyLine ?? aw?.moneyLine);
-  const mlHome     = n(hm?.current?.moneyLine ?? hm?.moneyLine);
-  const total      = n(b?.current?.total ?? b?.total);
-
-  return { spreadAway, spreadHome, mlAway, mlHome, total };
-}
-
-/* ───────── LIVE selection/parse from REST ───────── */
-
-// ASYNC (bug fix): we await book fetches inside
-async function chooseEspnBetLiveBook(markets, prefTokensArr) {
-  // market label indicates “live-ish” (2H / Halftime / Live / etc.)
-  const looksLiveMarket = (mk) => {
-    const label = `${mk?.name || ""} ${mk?.displayName || ""} ${mk?.period?.displayName || ""} ${mk?.period?.abbreviation || ""} ${mk?.state || ""}`;
-    return prefTokensArr.some((tok) => norm(label).includes(tok)) || norm(mk?.state) === "live";
+  // Prefer markets that "look" like spread/total/line
+  const looks = (mk, words) => {
+    const s = norm(`${mk?.name || ""} ${mk?.displayName || ""}`);
+    return words.some(w => s.includes(w));
   };
+  const choose = words => candidates.find(mk => looks(mk, words)) || candidates[0];
 
-  const preferred = markets.filter(looksLiveMarket);
-  const pool = preferred.length ? preferred : markets;
+  const mkSpread = choose(["spread", "line"]);
+  const mkTotal  = choose(["total", "over", "under"]);
 
-  // Within pool, require ESPN BET books and pick the first with usable numbers
-  for (const mk of pool) {
-    const books = await fetchEspnBetBooks(mk);
-    for (const b of books) {
-      const parsed = extractFromBook(b);
-      if ([parsed.spreadAway, parsed.spreadHome, parsed.mlAway, parsed.mlHome, parsed.total].some((v) => v !== "")) {
-        return parsed;
-      }
+  let spreadAway="", spreadHome="", mlAway="", mlHome="", total="";
+
+  if (mkSpread) {
+    const part = await extractFromMarket(mkSpread);
+    if (part) {
+      spreadAway = part.spreadAway ?? "";
+      spreadHome = part.spreadHome ?? "";
+      mlAway     = part.mlAway ?? mlAway;
+      mlHome     = part.mlHome ?? mlHome;
     }
   }
-  return undefined;
-}
-
-// Fallback: any REST market that is “live-ish”, any provider
-function liveFromOddsRESTAny(markets, prefTokensArr) {
-  const looksLiveMarket = (mk) => {
-    const label = `${mk?.name || ""} ${mk?.displayName || ""} ${mk?.period?.displayName || ""} ${mk?.period?.abbreviation || ""} ${mk?.state || ""}`;
-    return prefTokensArr.some((tok) => norm(label).includes(tok)) || norm(mk?.state) === "live";
-  };
-  const candidates = markets.filter(looksLiveMarket);
-  const pool = candidates.length ? candidates : markets;
-  for (const mk of pool) {
-    const b = (mk?.books && mk.books[0]) || null;
-    const book = b?.$ref ? null : b; // if $ref, we’d need to fetch; keep it simple for this fallback
-    if (book) {
-      const parsed = extractFromBook(book);
-      if ([parsed.spreadAway, parsed.spreadHome, parsed.mlAway, parsed.mlHome, parsed.total].some((v) => v !== "")) {
-        return parsed;
-      }
-    }
+  if (mkTotal) {
+    const part = await extractFromMarket(mkTotal);
+    if (part && part.total !== "") total = part.total;
   }
-  return undefined;
+
+  // If we still don't have ML but have *a* live market, try first live market's book for ML
+  if ((mlAway === "" && mlHome === "") && candidates.length) {
+    const any = await extractFromMarket(candidates[0]);
+    if (any) { mlAway = any.mlAway ?? ""; mlHome = any.mlHome ?? ""; }
+  }
+
+  const anyVal = [spreadAway, spreadHome, mlAway, mlHome, total].some(v => v !== "");
+  return anyVal ? { spreadAway, spreadHome, mlAway, mlHome, total } : undefined;
 }
 
-/* ───────── Fallback from summary pools ───────── */
-function liveFromSummaryPools(summary, tokens) {
-  const pools = [];
-  if (Array.isArray(summary?.pickcenter)) pools.push(...summary.pickcenter);
-  if (Array.isArray(summary?.odds))       pools.push(...summary.odds);
-  if (!pools.length) return undefined;
-
-  const labelOf = (p) => `${p?.details || ""} ${p?.name || ""} ${p?.period || ""}`; // e.g., "2nd Half Line"
-  // Try to find any pool that matches our tokens
-  const match = pools.find((p) => textMatchesAny(labelOf(p), tokens));
-  if (!match) return undefined;
-
-  const n = (v) => (v === null || v === undefined || v === "" ? "" : Number(v));
-  const aw = match?.awayTeamOdds || {};
-  const hm = match?.homeTeamOdds || {};
-  const spreadAway = n(aw?.spread);
-  const spreadHome = n(hm?.spread ?? (spreadAway !== "" ? -spreadAway : ""));
-  const mlAway     = n(aw?.moneyLine);
-  const mlHome     = n(hm?.moneyLine);
-  const total      = n(match?.overUnder ?? match?.total);
-
-  const any = [spreadAway, spreadHome, mlAway, mlHome, total].some((v) => v !== "");
-  return any ? { spreadAway, spreadHome, mlAway, mlHome, total } : undefined;
-}
-
-/* ───────── values/A1 helpers ───────── */
+/* ─────────────────────── values/A1 helpers ───────────────────────── */
 function makeValue(range, val) { return { range, values: [[val]] }; }
 function a1For(row0, col0, tab = TAB_NAME) {
   const row1 = row0 + 1;
@@ -264,7 +227,7 @@ function mapCols(header) {
   };
 }
 
-// Row selection: GAME_ID, already-live rows, or rows dated today (ET), ignoring Finals
+// Only row selection we want: GAME_ID, already-live rows, or rows with today’s date (ET) and not Final
 function chooseTargets(rows, col) {
   const targets = [];
   for (let r = 1; r < rows.length; r++) {
@@ -277,22 +240,14 @@ function chooseTargets(rows, col) {
 
     if (isFinalCell(status)) continue;
 
-    if (GAME_ID && id === GAME_ID) {
-      targets.push({ r, id, reason: "GAME_ID" });
-      continue;
-    }
-    if (looksLiveStatus(status)) {
-      targets.push({ r, id, reason: "live-like status" });
-      continue;
-    }
-    if (dateCell === todayKey) {
-      targets.push({ r, id, reason: "today" });
-    }
+    if (GAME_ID && id === GAME_ID) { targets.push({ r, id, reason: "GAME_ID" }); continue; }
+    if (looksLiveStatus(status))    { targets.push({ r, id, reason: "live-like status" }); continue; }
+    if (dateCell === todayKey)      { targets.push({ r, id, reason: "today" }); }
   }
   return targets;
 }
 
-/* ───────── MAIN ───────── */
+/* ─────────────────────────────── MAIN ────────────────────────────── */
 async function main() {
   try {
     const ts = new Date().toISOString();
@@ -310,7 +265,7 @@ async function main() {
       const currentStatus = values[t.r]?.[col.STATUS] || "";
       if (isFinalCell(currentStatus)) continue;
 
-      // 1) STATUS + HALF
+      // 1) STATUS + HALF from Summary
       let summary;
       try {
         summary = await espnSummary(t.id);
@@ -323,43 +278,47 @@ async function main() {
         }
         const half = parseHalfScore(summary);
         if (half) data.push(makeValue(a1For(t.r, col.HALF), half));
-        if (nowFinal) continue; // no live odds if Final
+        if (nowFinal) continue; // don't fetch live odds if Final
       } catch (e) {
         if (e?.response?.status !== 404) {
           console.log(`Summary warn ${t.id}:`, e?.message || e);
         }
       }
 
-      // 2) LIVE ODDS
-      let live = undefined;
-
-      // Try REST odds (prefer ESPN BET and live-ish markets)
+      // 2) LIVE LINES from Markets API (ESPN BET)
       try {
-        const odds = await espnOdds(t.id);
-        const markets = Array.isArray(odds?.items) ? odds.items : [];
-        if (markets.length) {
-          live = await chooseEspnBetLiveBook(markets, tokens);     // ESPN BET live-ish
-          if (!live) live = liveFromOddsRESTAny(markets, tokens);  // any book live-ish
+        const marketsRoot = await espnMarkets(t.id);
+        // items can be objects or $ref links; dereference *lightly* (we only need label + first book later)
+        const items = Array.isArray(marketsRoot?.items) ? marketsRoot.items : [];
+        const markets = [];
+        for (const itm of items) {
+          if (itm?.$ref) {
+            try {
+              const m = await fetchRefMaybe(itm.$ref);
+              if (m && Object.keys(m).length) markets.push(m);
+            } catch {}
+          } else if (itm) {
+            markets.push(itm);
+          }
+        }
+
+        const live = await pickLiveFromMarkets(markets, tokens);
+        if (live) {
+          const w = (c, v) => { if (v !== "" && Number.isFinite(Number(v))) data.push(makeValue(a1For(t.r, c), Number(v))); };
+          w(col.LA_S,  live.spreadAway);
+          w(col.LA_ML, live.mlAway);
+          w(col.LH_S,  live.spreadHome);
+          w(col.LH_ML, live.mlHome);
+          w(col.L_TOT, live.total);
+        } else {
+          console.log(`No live market accepted for ${t.id} (needs one of "${MARKET_PREFERENCE}") — left M..Q as-is.`);
         }
       } catch (e) {
-        if (e?.response?.status !== 404) console.log(`Odds REST warn ${t.id}:`, e?.message || e);
-      }
-
-      // Fallback to summary pools
-      if (!live && summary) {
-        const sLive = liveFromSummaryPools(summary, tokens);
-        if (sLive) live = sLive;
-      }
-
-      if (live) {
-        const w = (c, v) => { if (v !== "" && Number.isFinite(Number(v))) data.push(makeValue(a1For(t.r, c), Number(v))); };
-        w(col.LA_S,  live.spreadAway);
-        w(col.LA_ML, live.mlAway);
-        w(col.LH_S,  live.spreadHome);
-        w(col.LH_ML, live.mlHome);
-        w(col.L_TOT, live.total);
-      } else {
-        console.log(`No live market accepted for ${t.id} (needs live-ish token in "${MARKET_PREFERENCE}") — left M..Q as-is.`);
+        if (e?.response?.status === 404) {
+          console.log(`Markets 404 ${t.id} — no live markets, skipping M..Q.`);
+        } else {
+          console.log(`Markets warn ${t.id}:`, e?.message || e);
+        }
       }
     }
 
