@@ -1,5 +1,5 @@
 // orchestrator.mjs — Node 20+ ESM
-// npm deps: axios, googleapis
+// deps: npm i axios googleapis
 
 import axios from "axios";
 import { google } from "googleapis";
@@ -70,17 +70,32 @@ function pLimit(n) {
 const limit = pLimit(CONCURRENCY);
 
 function pad2(n){ return n<10 ? `0${n}` : `${n}`; }
-function fmtMMDDYY(d){ const t=new Date(d); return `${pad2(t.getMonth()+1)}/${pad2(t.getDate())}/${String(t.getFullYear()).slice(-2)}`; }
-function fmtDDMMYY(d){ const t=new Date(d); return `${pad2(t.getDate())}/${pad2(t.getMonth()+1)}/${String(t.getFullYear()).slice(-2)}`; }
-function fmtDate(d){ return DATE_FMT==="DD/MM/YY" ? fmtDDMMYY(d) : fmtMMDDYY(d); }
+
+/* ---- ET Date/Time helpers (fixes “next-day” issue) ---- */
+function fmtDateET(iso) {
+  if (!iso) return "";
+  const dt = new Date(iso);
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: "America/New_York",
+    month: "2-digit", day: "2-digit", year: "2-digit"
+  }).formatToParts(dt);
+  const mm = parts.find(p=>p.type==="month")?.value ?? "00";
+  const dd = parts.find(p=>p.type==="day")?.value ?? "00";
+  const yy = parts.find(p=>p.type==="year")?.value ?? "00";
+  // keep support for DATE_FMT toggle
+  return DATE_FMT === "DD/MM/YY" ? `${dd}/${mm}/${yy}` : `${mm}/${dd}/${yy}`;
+}
 
 function toLocalET(iso){
   try{
     const dt=new Date(iso);
-    return new Intl.DateTimeFormat("en-US",{hour:"numeric",minute:"2-digit",hour12:true,timeZone:"America/New_York"}).format(dt);
+    return new Intl.DateTimeFormat("en-US",{
+      hour:"numeric",minute:"2-digit",hour12:true,timeZone:"America/New_York"
+    }).format(dt);
   }catch{return "";}
 }
-function inferWeekTxt(league, wk){
+
+function inferWeekTxt(_league, wk){
   let n=null;
   if (typeof wk==="number") n=wk;
   else if (wk && typeof wk==="object" && wk.number!=null) n=wk.number;
@@ -128,13 +143,10 @@ const leaguePath = () => LEAGUE==="college-football" ? "football/college-footbal
 async function fetchScoreboard(){
   const url=`https://site.api.espn.com/apis/site/v2/sports/${leaguePath()}/scoreboard`;
   const params = {};
-
-  // ensure we get the full FBS slate for college football
   if (LEAGUE === "college-football") {
-    params.groups = "80";   // FBS
-    params.limit  = 300;    // plenty for full week
+    params.groups = "80";   // FBS group
+    params.limit  = 300;    // plenty for full slate
   }
-
   const { data } = await axios.get(url, { timeout: 15000, params });
   return data;
 }
@@ -193,7 +205,6 @@ function favoriteKeyFromOdds(o){
 }
 
 /* ===== A1 helpers ===== */
-function colA1(n){ let x=n,s=""; while(x>=0){s=String.fromCharCode((x%26)+65)+s; x=Math.floor(x/26)-1;} return s; }
 const val = v =>
   v==null || v==="" ? { userEnteredValue:{stringValue:""} } :
   (typeof v==="number" ? { userEnteredValue:{numberValue:v} } : { userEnteredValue:{stringValue:String(v)} });
@@ -328,7 +339,7 @@ async function main(){
       }
 
       // Keep Date/Week fresh only if the existing cell is blank (avoid stomping)
-      if ((r[COL.date] ?? "") === "" && comp?.date) setCell(row0, COL.date, fmtDate(comp.date));
+      if ((r[COL.date] ?? "") === "" && comp?.date) setCell(row0, COL.date, fmtDateET(comp.date));
       if ((r[COL.week] ?? "") === "" && weekTxt) setCell(row0, COL.week, weekTxt);
 
       // Never touch pre-existing Final Score unless we’re finalizing above
@@ -337,10 +348,10 @@ async function main(){
       const row0 = appendCursor;
       appendCursor += 1;
 
-      // Base cells
+      // Base cells (DATE IN ET)
       [
         [COL.gameId, gameId],
-        [COL.date, fmtDate(comp?.date || ev?.date)],
+        [COL.date, fmtDateET(comp?.date || ev?.date)],
         [COL.week, weekTxt],
         [COL.status, kickoffLabel || ""],
         [COL.matchup, matchupText],
