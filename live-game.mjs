@@ -1,28 +1,26 @@
 // live-game.mjs
-// Updates Status, Half Score, and Live Odds (M..Q) for live games.
-// Debug mode and GAME_ID filtering supported.
+// Updates: Status (D), Half Score (L), Live odds (M..Q).
+// Does NOT touch pregame (G..K). Optional GAME_ID to focus one row.
+// DEBUG_MODE=1 prints verbose fetch and market selection info.
 
 import axios from "axios";
 import { google } from "googleapis";
 
-/* ───────────── ENV ───────────── */
+/* ─────────────────────────────── ENV ─────────────────────────────── */
 const {
   GOOGLE_SHEET_ID,
   GOOGLE_SERVICE_ACCOUNT,
-  LEAGUE = "nfl",
-  TAB_NAME = LEAGUE === "nfl" ? "NFL" : "CFB",
+  LEAGUE = "nfl",                           // "nfl" | "college-football"
+  TAB_NAME = (LEAGUE === "nfl" ? "NFL" : "CFB"),
   GAME_ID = "",
-  MARKET_PREFERENCE = "live,in-play,inplay,2h,second half,halftime",
-  DEBUG_MODE = "",
+  DEBUG_MODE = "0",
 } = process.env;
 
-const DEBUG = String(DEBUG_MODE).trim() === "1" || !!GAME_ID;
+if (!GOOGLE_SHEET_ID) throw new Error("Missing GOOGLE_SHEET_ID");
+if (!GOOGLE_SERVICE_ACCOUNT) throw new Error("Missing GOOGLE_SERVICE_ACCOUNT");
+const DEBUG = String(DEBUG_MODE) === "1";
 
-for (const k of ["GOOGLE_SHEET_ID", "GOOGLE_SERVICE_ACCOUNT"]) {
-  if (!process.env[k]) throw new Error(`Missing required env var: ${k}`);
-}
-
-/* ───────── Google Sheets ───────── */
+/* ───────────────────── Google Sheets bootstrap ───────────────────── */
 const svc = JSON.parse(GOOGLE_SERVICE_ACCOUNT);
 const jwt = new google.auth.JWT(
   svc.client_email,
@@ -32,180 +30,219 @@ const jwt = new google.auth.JWT(
 );
 const sheets = google.sheets({ version: "v4", auth: jwt });
 
-/* ───────── Helpers ───────── */
+/* ───────────────────────────── Helpers ───────────────────────────── */
 const norm = (s) => (s || "").toLowerCase();
+const isFinalCell = (s) => /^final$/i.test(String(s || ""));
+const looksLiveStatus = (s) =>
+  /\bhalf\b/i.test(s) ||
+  /\bin\s*progress\b/i.test(s) ||
+  /\bq[1-4]\b/i.test(s) ||
+  /\bot\b/i.test(s) ||
+  /\blive\b/i.test(s);
 
 function idxToA1(n0) {
-  let n = n0 + 1,
-    s = "";
-  while (n > 0) {
-    n--;
-    s = String.fromCharCode(65 + (n % 26)) + s;
-    n = Math.floor(n / 26);
-  }
+  let n = n0 + 1, s = "";
+  while (n > 0) { n--; s = String.fromCharCode(65 + (n % 26)) + s; n = Math.floor(n / 26); }
   return s;
 }
+function a1For(row0, col0, tab = TAB_NAME) {
+  const row1 = row0 + 1;
+  const colA = idxToA1(col0);
+  return `${tab}!${colA}${row1}:${colA}${row1}`;
+}
+function makeValue(range, val) { return { range, values: [[val]] }; }
 
+// Today key in **US/Eastern** to match your sheet
 const todayKey = (() => {
   const parts = new Intl.DateTimeFormat("en-US", {
     timeZone: "America/New_York",
-    month: "2-digit",
-    day: "2-digit",
-    year: "2-digit",
+    month: "2-digit", day: "2-digit", year: "2-digit",
   }).formatToParts(new Date());
-  const mm = parts.find((p) => p.type === "month")?.value ?? "00";
-  const dd = parts.find((p) => p.type === "day")?.value ?? "00";
-  const yy = parts.find((p) => p.type === "year")?.value ?? "00";
+  const mm = parts.find(p => p.type === "month")?.value ?? "00";
+  const dd = parts.find(p => p.type === "day")?.value ?? "00";
+  const yy = parts.find(p => p.type === "year")?.value ?? "00";
   return `${mm}/${dd}/${yy}`;
 })();
 
-const looksLiveStatus = (s) =>
-  /\bhalf\b|\bin\s*progress\b|\bq[1-4]\b|\bot\b|\blive\b/i.test(s || "");
-const isFinalCell = (s) => /^final$/i.test(s || "");
-
-/* ───────── ESPN FETCHERS ───────── */
+/* ───────────────────────── ESPN fetchers ─────────────────────────── */
 async function espnSummary(gameId) {
   const url = `https://site.api.espn.com/apis/site/v2/sports/football/${LEAGUE}/summary?event=${gameId}`;
-  if (DEBUG) console.log(`🔎 Fetching summary: ${url}`);
+  DEBUG && console.log("🔎 summary:", url);
   const { data } = await axios.get(url, { timeout: 15000 });
   return data;
 }
-async function espnMarkets(gameId) {
-  const url = `https://sports.core.api.espn.com/v2/markets?sport=football&league=${LEAGUE}&event=${gameId}`;
-  if (DEBUG) console.log(`🔎 Fetching markets: ${url}`);
-  const { data } = await axios.get(url, { timeout: 15000 });
-  return data;
-}
-async function fetchRefMaybe(ref) {
-  if (!ref || typeof ref !== "string") return {};
-  try {
-    const { data } = await axios.get(ref, { timeout: 10000 });
-    return data || {};
-  } catch {
-    return {};
+
+// NEW: try competitions/{id}/odds first; fall back to events/{id}/competitions/{id}/odds
+async function espnOddsMarkets(gameId) {
+  const tryUrls = [
+    `https://sports.core.api.espn.com/v2/sports/football/${LEAGUE}/competitions/${gameId}/odds`,
+    `https://sports.core.api.espn.com/v2/sports/football/${LEAGUE}/events/${gameId}/competitions/${gameId}/odds`,
+  ];
+  for (const url of tryUrls) {
+    try {
+      DEBUG && console.log("🔎 odds:", url);
+      const { data } = await axios.get(url, { timeout: 15000 });
+      return data; // has .items (markets)
+    } catch (e) {
+      if (e?.response?.status === 404) {
+        DEBUG && console.log("   ↪️ 404 on", url);
+        continue;
+      }
+      throw e;
+    }
   }
+  const err = new Error("All odds endpoints returned 404");
+  err.code = 404;
+  throw err;
 }
 
-/* ───────── STATUS / HALF SCORE ───────── */
-const periodName = (n) =>
-  ({ 1: "1st", 2: "2nd", 3: "3rd", 4: "4th" }[n] || (n ? `Q${n}` : ""));
-
-function formatStatus(st) {
-  if (!st) return "";
-  const state = norm(st?.type?.state || st?.state || "");
-  const clock = st.displayClock || st.clock || "";
-  const period = st.period;
-  const detail =
-    st.type?.shortDetail || st.type?.detail || st.detail || st.description || "";
-
-  if (state === "inprogress" || state === "live" || /in\s*progress/i.test(detail))
-    return `${clock || ""} - ${periodName(period)}`;
-  if (state === "halftime") return "Halftime";
-  if (state === "endperiod" || /end of/i.test(detail))
-    return `End of ${periodName((period || 0) - 1)}`;
-  if (state === "final") return "Final";
-  if (state === "pre" || state === "scheduled")
-    return "Scheduled";
-  return detail || "In Progress";
+/* ───────────────────────── Status / half score ───────────────────── */
+function shortStatusFromEspn(statusObj) {
+  const t = statusObj?.type || {};
+  return t.shortDetail || t.detail || t.description || "In Progress";
 }
-
+function isFinalFromEspn(statusObj) {
+  return /final/i.test(String(statusObj?.type?.name || statusObj?.type?.description || ""));
+}
 function sumFirstTwoPeriods(linescores) {
-  if (!Array.isArray(linescores)) return null;
-  return linescores.slice(0, 2).reduce((a, p) => a + (Number(p?.value) || 0), 0);
+  if (!Array.isArray(linescores) || linescores.length === 0) return null;
+  const take = linescores.slice(0, 2);
+  let tot = 0;
+  for (const p of take) {
+    const v = Number(p?.value ?? p?.score ?? 0);
+    if (!Number.isFinite(v)) return null;
+    tot += v;
+  }
+  return tot;
 }
 function parseHalfScore(summary) {
   try {
     const comp = summary?.header?.competitions?.[0];
-    const home = comp?.competitors?.find((c) => c.homeAway === "home");
-    const away = comp?.competitors?.find((c) => c.homeAway === "away");
+    const home = comp?.competitors?.find(c => c.homeAway === "home");
+    const away = comp?.competitors?.find(c => c.homeAway === "away");
     const hHome = sumFirstTwoPeriods(home?.linescores);
     const hAway = sumFirstTwoPeriods(away?.linescores);
-    if (Number.isFinite(hHome) && Number.isFinite(hAway))
-      return `${hAway}-${hHome}`;
+    if (Number.isFinite(hHome) && Number.isFinite(hAway)) return `${hAway}-${hHome}`;
   } catch {}
   return "";
 }
 
-/* ───────── MARKETS ───────── */
-const prefTokens = (list = MARKET_PREFERENCE) =>
-  list.split(",").map((x) => x.trim().toLowerCase()).filter(Boolean);
+/* ───────────────────────── Live odds parsing ─────────────────────── */
+// Pull a simple number from nested props
+const N = (v) => (v === null || v === undefined || v === "" ? "" : Number(v));
 
-function labelMatchesPreferred(mk, tokens) {
-  const l = norm(
-    `${mk?.name || ""} ${mk?.displayName || ""} ${mk?.state || ""} ${
-      mk?.period?.displayName || ""
-    }`
-  );
-  return (
-    /live|inplay|in-play/.test(l) ||
-    mk?.state === "LIVE" ||
-    mk?.inPlay === true ||
-    tokens.some((tok) => l.includes(tok))
-  );
-}
-
-async function extractFromMarket(market) {
-  const book0 = (market?.books && market.books[0]) || null;
-  const book = book0?.$ref ? await fetchRefMaybe(book0.$ref) : book0 || {};
-  const n = (v) => (v == null || v === "" ? "" : Number(v));
+// Parse one market book into live numbers; return partials
+function parseBookToLive(book) {
   const aw = book?.awayTeamOdds || {};
   const hm = book?.homeTeamOdds || {};
-  return {
-    spreadAway: n(aw?.current?.spread ?? aw?.spread),
-    spreadHome: n(hm?.current?.spread ?? hm?.spread),
-    mlAway: n(aw?.current?.moneyLine ?? aw?.moneyLine),
-    mlHome: n(hm?.current?.moneyLine ?? hm?.moneyLine),
-    total: n(book?.current?.total ?? book?.total),
+  const out = {
+    spreadAway: N(aw?.current?.spread ?? aw?.spread ?? book?.current?.spread),
+    spreadHome: "", // fill below if needed
+    mlAway:     N(aw?.current?.moneyLine ?? aw?.moneyLine),
+    mlHome:     N(hm?.current?.moneyLine ?? hm?.moneyLine),
+    total:      N(book?.current?.total ?? book?.total),
   };
+  if (out.spreadAway !== "") {
+    out.spreadHome = N(hm?.current?.spread ?? hm?.spread ?? -out.spreadAway);
+  }
+  return out;
 }
 
-async function pickLiveFromMarkets(allMarkets, tokens, gameId) {
-  if (!Array.isArray(allMarkets) || !allMarkets.length) return undefined;
-  const liveMkts = allMarkets.filter((mk) => labelMatchesPreferred(mk, tokens));
-
-  if (DEBUG)
-    console.log(
-      `🎯 ${gameId}: found ${liveMkts.length}/${allMarkets.length} markets labeled live.`
-    );
-
-  const looks = (mk, words) =>
-    words.some((w) =>
-      norm(`${mk?.name || ""} ${mk?.displayName || ""}`).includes(w)
-    );
-
-  const mkSpread =
-    liveMkts.find((m) => looks(m, ["spread", "line"])) || liveMkts[0];
-  const mkTotal =
-    liveMkts.find((m) => looks(m, ["total", "over", "under"])) || liveMkts[0];
-
-  let final = {};
-  if (mkSpread) Object.assign(final, await extractFromMarket(mkSpread));
-  if (mkTotal) final.total = (await extractFromMarket(mkTotal))?.total || "";
-
-  if (
-    DEBUG &&
-    Object.values(final).some((v) => v !== "")
-  )
-    console.log("📊 Live market chosen:", JSON.stringify(final, null, 2));
-
-  return Object.values(final).some((v) => v !== "") ? final : undefined;
+// Merge two partials (e.g., one from spread, one from total)
+function mergeLive(a, b) {
+  const out = { ...a };
+  for (const k of ["spreadAway","spreadHome","mlAway","mlHome","total"]) {
+    if (out[k] === "" && b && b[k] !== "") out[k] = b[k];
+  }
+  return out;
 }
 
-/* ───────── SHEETS ───────── */
-const makeValue = (range, val) => ({ range, values: [[val]] });
-const a1 = (r, c) => `${TAB_NAME}!${idxToA1(c)}${r + 1}:${idxToA1(c)}${r + 1}`;
+function extractLiveFromMarkets(oddsPayload) {
+  const items = oddsPayload?.items || [];
+  if (!items.length) return undefined;
 
+  // Prefer any "live-ish" label if present, otherwise take the first two relevant books.
+  const looksLiveMarket = (mk) => {
+    const label = `${mk?.name || ""} ${mk?.displayName || ""} ${mk?.period?.displayName || ""} ${mk?.period?.abbreviation || ""}`.toLowerCase();
+    return /live|in-?game|2h|second half|halftime/.test(label);
+  };
+
+  const spreadish = (mk) => /spread|line/i.test(`${mk?.name || ""} ${mk?.displayName || ""}`);
+  const totalish  = (mk) => /total|over|under/i.test(`${mk?.name || ""} ${mk?.displayName || ""}`);
+
+  const liveCandidates = items.filter(looksLiveMarket);
+  const src = liveCandidates.length ? liveCandidates : items; // fall back if no live tags appear
+
+  let live = { spreadAway: "", spreadHome: "", mlAway: "", mlHome: "", total: "" };
+
+  // Choose a spread/line market
+  const mSpread = src.find(spreadish);
+  if (mSpread) {
+    const b = (mSpread.books && mSpread.books[0]) || {};
+    live = mergeLive(live, parseBookToLive(b));
+  }
+
+  // Choose a total market
+  const mTotal = src.find(totalish);
+  if (mTotal) {
+    const b = (mTotal.books && mTotal.books[0]) || {};
+    live = mergeLive(live, parseBookToLive(b));
+  }
+
+  // If nothing useful, bail
+  const any = ["spreadAway","spreadHome","mlAway","mlHome","total"].some(k => live[k] !== "");
+  return any ? live : undefined;
+}
+
+// Fallback from summary.pickcenter / summary.odds (very loose; just grab any with numbers)
+function extractLiveFromSummary(summary) {
+  const pools = [];
+  if (Array.isArray(summary?.pickcenter)) pools.push(...summary.pickcenter);
+  if (Array.isArray(summary?.odds))       pools.push(...summary.odds);
+  if (!pools.length) return undefined;
+
+  // Prefer ESPN BET if present, else first pool that has moneylines or spread/total
+  const score = (p) => {
+    let s = 0;
+    if (p?.awayTeamOdds?.moneyLine != null || p?.homeTeamOdds?.moneyLine != null) s += 2;
+    if (p?.awayTeamOdds?.spread != null || p?.homeTeamOdds?.spread != null) s += 1;
+    if (p?.overUnder != null || p?.total != null) s += 1;
+    // light boost if the details look live-ish
+    if (/live|in-?game|2nd|second half|halftime/i.test(`${p?.details || ""} ${p?.name || ""} ${p?.period || ""}`)) s += 3;
+    if ((p?.provider?.name || "").toUpperCase() === "ESPN BET") s += 1;
+    return s;
+  };
+
+  const best = pools
+    .slice()
+    .sort((a,b) => score(b) - score(a))[0];
+
+  if (!best) return undefined;
+
+  const aw = best?.awayTeamOdds || {};
+  const hm = best?.homeTeamOdds || {};
+  const live = {
+    spreadAway: N(aw?.spread),
+    spreadHome: N(hm?.spread ?? (aw?.spread != null ? -aw.spread : "")),
+    mlAway:     N(aw?.moneyLine),
+    mlHome:     N(hm?.moneyLine),
+    total:      N(best?.overUnder ?? best?.total),
+  };
+
+  const any = ["spreadAway","spreadHome","mlAway","mlHome","total"].some(k => live[k] !== "");
+  return any ? live : undefined;
+}
+
+/* ─────────────────────── values / columns map ────────────────────── */
 async function getValues() {
-  const res = await sheets.spreadsheets.values.get({
-    spreadsheetId: GOOGLE_SHEET_ID,
-    range: `${TAB_NAME}!A1:Q2000`,
-  });
+  const range = `${TAB_NAME}!A1:Q2000`;
+  const res = await sheets.spreadsheets.values.get({ spreadsheetId: GOOGLE_SHEET_ID, range });
   return res.data.values || [];
 }
 function mapCols(header) {
-  const lower = (s) => (s || "").trim().toLowerCase();
+  const lower = s => (s || "").trim().toLowerCase();
   const find = (name, fb) => {
-    const i = header.findIndex((h) => lower(h) === lower(name));
+    const i = header.findIndex(h => lower(h) === lower(name));
     return i >= 0 ? i : fb;
   };
   return {
@@ -220,101 +257,132 @@ function mapCols(header) {
     L_TOT: find("Live Total", 16),
   };
 }
+function chooseTargets(rows, col) {
+  const targets = [];
+  for (let r = 1; r < rows.length; r++) {
+    const row = rows[r] || [];
+    const id = (row[col.GAME_ID] || "").trim();
+    if (!id) continue;
 
-/* ───────── MAIN ───────── */
+    const dateCell = (row[col.DATE] || "").trim();
+    const status   = (row[col.STATUS] || "").trim();
+
+    if (isFinalCell(status)) continue;
+
+    if (GAME_ID && id === GAME_ID) {
+      targets.push({ r, id, reason: "GAME_ID" });
+      continue;
+    }
+    if (looksLiveStatus(status)) {
+      targets.push({ r, id, reason: "live-like status" });
+      continue;
+    }
+    if (dateCell === todayKey) {
+      targets.push({ r, id, reason: "today" });
+    }
+  }
+  return targets;
+}
+
+/* ─────────────────────────────── MAIN ────────────────────────────── */
 async function main() {
   const ts = new Date().toISOString();
+
   const values = await getValues();
-  if (values.length === 0) return console.log(`[${ts}] Sheet empty.`);
+  if (values.length === 0) {
+    console.log(`[${ts}] Sheet empty—nothing to do.`);
+    return;
+  }
   const col = mapCols(values[0]);
-  const rows = values.slice(1);
+  const targets = chooseTargets(values, col);
+  if (!targets.length) {
+    console.log(`[${ts}] Nothing to update.`);
+    return;
+  }
+  console.log(`[${ts}] Found ${targets.length} game(s) to update: ${targets.map(t => t.id).join(", ")}`);
 
-  const targets = rows
-    .map((r, i) => {
-      const id = (r[col.GAME_ID] || "").trim();
-      const date = (r[col.DATE] || "").trim();
-      const status = (r[col.STATUS] || "").trim();
-      if (!id) return null;
-      if (GAME_ID && id !== GAME_ID) return null;
-      if (isFinalCell(status)) return null;
-      if (looksLiveStatus(status) || date === todayKey)
-        return { r: i + 1, id };
-      return null;
-    })
-    .filter(Boolean);
-
-  if (!targets.length)
-    return console.log(`[${ts}] No matching targets (GAME_ID=${GAME_ID || "ALL"})`);
-
-  console.log(
-    `[${ts}] Found ${targets.length} game(s) to update: ${targets
-      .map((t) => t.id)
-      .join(", ")}`
-  );
-
-  const tokens = prefTokens(MARKET_PREFERENCE);
   const data = [];
 
   for (const t of targets) {
-    console.log(`\n=== 🏈 GAME ${t.id} ===`);
+    DEBUG && console.log(`\n=== 🏈 GAME ${t.id} ===`);
+
+    // 1) STATUS + HALF
     let summary;
     try {
       summary = await espnSummary(t.id);
-      const stObj =
-        summary?.header?.competitions?.[0]?.status || summary?.header?.status;
-      const newStatus = formatStatus(stObj);
-      const half = parseHalfScore(summary);
-
-      if (DEBUG) {
-        console.log("Status object:", stObj);
-        console.log(`→ Parsed status="${newStatus}", half="${half}"`);
+      const compStatus = summary?.header?.competitions?.[0]?.status;
+      const newStatus  = shortStatusFromEspn(compStatus);
+      const prevStatus = values[t.r]?.[col.STATUS] || "";
+      if (newStatus && newStatus !== prevStatus) {
+        data.push(makeValue(a1For(t.r, col.STATUS), newStatus));
       }
+      const half = parseHalfScore(summary);
+      if (half) data.push(makeValue(a1For(t.r, col.HALF), half));
 
-      if (newStatus) data.push(makeValue(a1(t.r, col.STATUS), newStatus));
-      if (half) data.push(makeValue(a1(t.r, col.HALF), half));
+      if (isFinalFromEspn(compStatus)) {
+        DEBUG && console.log("   ↪️ Final detected; skipping live odds.");
+        continue;
+      }
     } catch (e) {
-      console.log(`Summary fetch failed ${t.id}: ${e.message}`);
+      if (e?.response?.status !== 404) {
+        console.log(`Summary warn ${t.id}:`, e?.message || e);
+      }
     }
 
+    // 2) LIVE ODDS — markets first, summary fallback
+    let live = undefined;
+
     try {
-      const marketsRoot = await espnMarkets(t.id);
-      const items = Array.isArray(marketsRoot?.items) ? marketsRoot.items : [];
-      const markets = [];
-      for (const itm of items) {
-        if (itm?.$ref) {
-          const m = await fetchRefMaybe(itm.$ref);
-          if (m && Object.keys(m).length) markets.push(m);
-        } else markets.push(itm);
-      }
-      const live = await pickLiveFromMarkets(markets, tokens, t.id);
-      if (live) {
-        const write = (c, v) =>
-          v !== "" && Number.isFinite(Number(v))
-            ? data.push(makeValue(a1(t.r, c), Number(v)))
-            : null;
-        write(col.LA_S, live.spreadAway);
-        write(col.LA_ML, live.mlAway);
-        write(col.LH_S, live.spreadHome);
-        write(col.LH_ML, live.mlHome);
-        write(col.L_TOT, live.total);
-      } else {
-        console.log(`⚠️ No live market found for ${t.id}`);
-      }
+      const markets = await espnOddsMarkets(t.id);
+      live = extractLiveFromMarkets(markets);
+      DEBUG && console.log(live
+        ? `📊 markets extracted: ${JSON.stringify(live)}`
+        : "   ↪️ markets had no usable live numbers");
     } catch (e) {
-      console.log(`Markets fetch failed ${t.id}: ${e.message}`);
+      if (e?.code === 404 || e?.response?.status === 404) {
+        DEBUG && console.log("   ↪️ markets 404, will try summary pools");
+      } else {
+        console.log(`Markets fetch failed ${t.id}:`, e?.message || e);
+      }
+    }
+
+    if (!live && summary) {
+      const sLive = extractLiveFromSummary(summary);
+      live = sLive;
+      DEBUG && console.log(live
+        ? `📊 summary extracted: ${JSON.stringify(live)}`
+        : "   ↪️ summary pools had no usable live numbers");
+    }
+
+    if (live) {
+      const write = (c, v) => { if (v !== "" && Number.isFinite(Number(v))) data.push(makeValue(a1For(t.r, c), Number(v))); };
+      write(col.LA_S,  live.spreadAway);
+      write(col.LA_ML, live.mlAway);
+      write(col.LH_S,  live.spreadHome);
+      write(col.LH_ML, live.mlHome);
+      write(col.L_TOT, live.total);
+    } else {
+      DEBUG && console.log("   ↪️ no live odds chosen for this game.");
     }
   }
 
-  if (!data.length) return console.log(`No updates applied.`);
+  if (!data.length) {
+    console.log(`[${new Date().toISOString()}] Built 0 cell updates across ${targets.length} target(s).`);
+    return;
+  }
 
   await sheets.spreadsheets.values.batchUpdate({
     spreadsheetId: GOOGLE_SHEET_ID,
     requestBody: { valueInputOption: "USER_ENTERED", data },
   });
-  console.log(`✅ Updated ${data.length} cell(s).`);
+
+  console.log(
+    `✅ Updated ${data.length} cell(s).`
+  );
 }
 
-main().catch((err) => {
-  console.error("Fatal error:", err);
+main().catch(err => {
+  const code = err?.response?.status || err?.code || err?.message || err;
+  console.error("Live updater fatal:", "*** code:", code, "***");
   process.exit(1);
 });
