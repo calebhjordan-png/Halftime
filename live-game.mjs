@@ -1,7 +1,7 @@
 // live-game.mjs
-// Updates: Status (D), Score -> written to "Half Score" (L), Live odds (M..Q).
-// Leaves pregame columns untouched. Optional GAME_ID focus and verbose DEBUG_MODE.
-// Live odds preference: uses ESPN BET live block scraping (primary) with safe fallback to pools.
+// Updates: Status (D), CURRENT Score -> "Half Score" (L), Live odds (M..Q).
+// Leaves pregame columns untouched. Optional GAME_ID focus and DEBUG_MODE logging.
+// Live odds are scraped from the visible ESPN BET "LIVE ODDS" card ONLY when game is in progress.
 
 import axios from "axios";
 import { google } from "googleapis";
@@ -58,19 +58,25 @@ const todayKey = (() => {
   return `${mm}/${dd}/${yy}`;
 })();
 
-function looksLiveStatus(s) {
+function looksLiveStatusText(s) {
   const x = norm(s);
-  return /\bhalf\b/.test(x) || /\bin\s*progress\b/.test(x) || /\bq[1-4]\b/.test(x) || /\bot\b/.test(x) || /\blive\b/.test(x);
+  return /\bhalf\b/.test(x) || /\bq[1-4]\b/.test(x) || /\bot\b/.test(x) || /\d+:\d+\s*-\s*(1st|2nd|3rd|4th|ot)/i.test(s || "");
 }
 const isFinalCell = s => /^final$/i.test(String(s || ""));
 
-// ESPN status helpers
+// ESPN helpers
 function shortStatusFromEspn(statusObj) {
   const t = statusObj?.type || {};
   return t.shortDetail || t.detail || t.description || "In Progress";
 }
 function isFinalFromEspn(statusObj) {
   return /final/i.test(String(statusObj?.type?.name || statusObj?.type?.description || ""));
+}
+function isInProgressFromEspn(statusObj) {
+  const t = statusObj?.type || {};
+  const state = String(t.state || "").toLowerCase();       // "in", "pre", "post"
+  const desc = `${t.shortDetail || t.detail || t.description || ""}`;
+  return state === "in" || /halftime/i.test(desc) || /\b(1st|2nd|3rd|4th|ot)\b/i.test(desc);
 }
 
 /* ───────────────────────── ESPN fetchers ─────────────────────────── */
@@ -81,10 +87,7 @@ async function espnSummary(gameId) {
   return data;
 }
 
-/* ─────────────────────── Score (current) ───────────────────────────
-   Write CURRENT score (away-home) into "Half Score" column (L).
-   This uses header.competitions[0].competitors[].score which is
-   ESPN’s live total points. */
+/* ───────────────────────── Score (current) ───────────────────────── */
 function parseCurrentScore(summary) {
   try {
     const comp = summary?.header?.competitions?.[0];
@@ -99,116 +102,67 @@ function parseCurrentScore(summary) {
   return "";
 }
 
-/* ───────────────── Live odds (scrape + safe fallback) ────────────── */
-/** Pulls the ESPN game page HTML (for scraping the visible ESPN BET block). */
+/* ─────────────── Live odds: scrape ESPN BET live block only ───────── */
 async function fetchGameHtml(gameId) {
   const url = `https://www.espn.com/${LEAGUE.replace("college-", "college/")}/game/_/gameId/${gameId}`;
   const { data } = await axios.get(url, { timeout: 15000, responseType: "text" });
   return String(data || "");
 }
 
-/** Very simple scraper that extracts the *first LIVE* numbers that are NOT the pregame “CLOSE” row.
-    We read the ESPN BET grid in the visible “LIVE ODDS” card. */
+// Extract *live* numbers (skip the CLOSE row). Do not attempt unless game is live.
 function scrapeEspnBet(html) {
   if (!html) return undefined;
 
-  // crude block isolate
-  const startIdx = html.indexOf("ESPN BET SPORTSBOOK");
-  if (startIdx < 0) return undefined;
-  const chunk = html.slice(startIdx, startIdx + 20000); // enough to include the live card
+  // Locate the "LIVE ODDS" card area
+  const anchor = html.indexOf("ESPN BET SPORTSBOOK");
+  if (anchor < 0) return undefined;
+  const chunk = html.slice(anchor, anchor + 25000);
 
-  // remove CLOSE column hints: we’ll ignore the first numeric pair that follows “CLOSE”.
-  // Then look for SPREAD / TOTAL / ML button texts immediately to the right.
-  // Strategy: find all numbers that look like spreads/totals/ml; skip the very first pair after “CLOSE”.
-  // We’ll use specific anchored buttons that ESPN renders (u/o for totals, ± for spreads).
-
-  // Spread buttons typically look like +10.5 / -10.5
-  const spreadRe = />([+\-]\d+(?:\.\d)?)<\/button>/g;
+  // Collect spreads (+/-x.x)
+  const spreadRe = />\s*([+\-]\d+(?:\.\d)?)\s*<\/button>/g;
   const spreads = [];
   let m;
   while ((m = spreadRe.exec(chunk))) spreads.push(m[1]);
 
-  // Total buttons typically look like o44.5 / u44.5 (grab the numeric)
-  const totalRe = />[ou](\d+(?:\.\d)?)<\/button>/g;
+  // Collect totals (o/uX.X -> capture the numeric X.X)
+  const totalRe = />\s*[ou](\d+(?:\.\d)?)\s*<\/button>/g;
   const totals = [];
   while ((m = totalRe.exec(chunk))) totals.push(m[1]);
 
-  // ML buttons look like +500 / -900 / EVEN / OFF — we’ll grab the first two moneylines that aren’t “EVEN/OFF”
-  const mlRe = />([+\-]\d+|EVEN|OFF)<\/button>/g;
-  const mls = [];
-  while ((m = mlRe.exec(chunk))) mls.push(m[1]);
+  // Collect ML buttons (+500/-900/EVEN/OFF)
+  const mlRe = />\s*([+\-]\d+|EVEN|OFF)\s*<\/button>/g;
+  const allML = [];
+  while ((m = mlRe.exec(chunk))) allML.push(m[1]);
 
-  // Heuristic:
-  // - CLOSE row appears first; we skip the very first spread pair and very first total pair encountered.
-  // - Then we take the next pair as live (away first, home second).
-  const pickPair = (arr) => {
-    if (arr.length >= 4) {
-      // [pregameAway, pregameHome, liveAway, liveHome, ...]
-      return [arr[2], arr[3]];
-    }
-    if (arr.length >= 2) {
-      // If for some reason only two are available, treat them as live
-      return [arr[0], arr[1]];
-    }
+  // Heuristic: first pair is CLOSE; second pair is LIVE.
+  const pickPairAfterClose = (arr) => {
+    if (arr.length >= 4) return [arr[2], arr[3]];
     return [undefined, undefined];
   };
 
-  const [spreadAway, spreadHome] = pickPair(spreads);
-  const [totalAway, totalHome]   = pickPair(totals);     // totals are symmetric; we’ll use one numeric value
+  const [spreadAway, spreadHome] = pickPairAfterClose(spreads);
+  const [totalAway, totalHome]   = pickPairAfterClose(totals);
+
+  // ML: skip EVEN/OFF and take the second pair (indexes 2,3) when available
+  const usable = allML.filter(x => x !== "EVEN" && x !== "OFF");
   let mlAway, mlHome;
-  // Get two usable MLs (ignore EVEN/OFF if there are >2)
-  const usableMLs = mls.filter(x => x !== "EVEN" && x !== "OFF");
-  if (usableMLs.length >= 2) {
-    // Heuristic: later pair is more likely to be live
-    if (usableMLs.length >= 4) {
-      mlAway = usableMLs[2];
-      mlHome = usableMLs[3];
-    } else {
-      mlAway = usableMLs[0];
-      mlHome = usableMLs[1];
-    }
+  if (usable.length >= 4) {
+    mlAway = usable[2];
+    mlHome = usable[3];
   }
 
   const n = v => (v === null || v === undefined || v === "" ? "" : Number(v));
-
-  const result = {
+  const r = {
     spreadAway: n(spreadAway),
     spreadHome: n(spreadHome),
-    mlAway: mlAway === "EVEN" || mlAway === "OFF" ? "" : n(mlAway),
-    mlHome: mlHome === "EVEN" || mlHome === "OFF" ? "" : n(mlHome),
+    mlAway: mlAway ? n(mlAway) : "",
+    mlHome: mlHome ? n(mlHome) : "",
     total: totalAway ? n(totalAway) : totalHome ? n(totalHome) : "",
-  };
-
-  const any = [result.spreadAway, result.spreadHome, result.mlAway, result.mlHome, result.total]
-    .some(v => v !== "" && Number.isFinite(Number(v)));
-
-  return any ? result : undefined;
-}
-
-/** Fallback to summary pools (often pregame; used only if scraping fails AND values look live-ish). */
-function poolsFallback(summary) {
-  const pools = [];
-  if (Array.isArray(summary?.pickcenter)) pools.push(...summary.pickcenter);
-  if (Array.isArray(summary?.odds))       pools.push(...summary.odds);
-  if (!pools.length) return undefined;
-
-  // prefer entries that look “live-ish” (sometimes ESPN annotates)
-  const first = pools[0];
-  if (!first) return undefined;
-
-  const n = v => (v === null || v === undefined || v === "" ? "" : Number(v));
-  const aw = first?.awayTeamOdds || {};
-  const hm = first?.homeTeamOdds || {};
-  const r = {
-    spreadAway: n(aw?.spread),
-    spreadHome: n(hm?.spread ?? (aw?.spread !== undefined ? -aw.spread : "")),
-    mlAway: n(aw?.moneyLine),
-    mlHome: n(hm?.moneyLine),
-    total: n(first?.overUnder ?? first?.total),
   };
 
   const any = [r.spreadAway, r.spreadHome, r.mlAway, r.mlHome, r.total]
     .some(v => v !== "" && Number.isFinite(Number(v)));
+
   return any ? r : undefined;
 }
 
@@ -228,7 +182,7 @@ function mapCols(header) {
     GAME_ID: find("Game ID", 0),
     DATE: find("Date", 1),
     STATUS: find("Status", 3),
-    HALF: find("Half Score", 11),       // we now place CURRENT SCORE here
+    HALF: find("Half Score", 11),
     LA_S: find("Live Away Spread", 12),
     LA_ML: find("Live Away ML", 13),
     LH_S: find("Live Home Spread", 14),
@@ -237,7 +191,7 @@ function mapCols(header) {
   };
 }
 
-// Choose target rows: GAME_ID focus, live-ish status, or today's rows (not Final)
+// Target rows: keep status/score flowing for today's rows, but we only write odds for in-progress games.
 function chooseTargets(rows, col) {
   const targets = [];
   for (let r = 1; r < rows.length; r++) {
@@ -251,7 +205,7 @@ function chooseTargets(rows, col) {
     if (isFinalCell(status)) continue;
 
     if (GAME_ID && id === GAME_ID) { targets.push({ r, id, reason: "GAME_ID" }); continue; }
-    if (looksLiveStatus(status))     { targets.push({ r, id, reason: "live-like status" }); continue; }
+    if (looksLiveStatusText(status)) { targets.push({ r, id, reason: "live-like status" }); continue; }
     if (dateCell === todayKey)       { targets.push({ r, id, reason: "today" }); }
   }
   return targets;
@@ -276,64 +230,58 @@ async function main() {
       const currentStatus = values[t.r]?.[col.STATUS] || "";
       if (isFinalCell(currentStatus)) continue;
 
-      let summary;
-      try {
-        summary = await espnSummary(t.id);
+      let summary, statusObj, statusText, inProgress = false;
 
-        // STATUS
-        const compStatus = summary?.header?.competitions?.[0]?.status;
-        const newStatus  = shortStatusFromEspn(compStatus);
-        const nowFinal   = isFinalFromEspn(compStatus);
-        if (newStatus && newStatus !== currentStatus) {
-          data.push(makeValue(a1For(t.r, col.STATUS), newStatus));
+      // STATUS + SCORE
+      try {
+        summary   = await espnSummary(t.id);
+        statusObj = summary?.header?.competitions?.[0]?.status;
+        statusText = shortStatusFromEspn(statusObj);
+        inProgress = isInProgressFromEspn(statusObj);
+
+        if (statusText && statusText !== currentStatus) {
+          data.push(makeValue(a1For(t.r, col.STATUS), statusText));
         }
 
-        // SCORE -> write to "Half Score" column (L)
-        const scoreText = parseCurrentScore(summary); // e.g., "34-0"
+        const scoreText = parseCurrentScore(summary); // away-home
         if (scoreText) {
           data.push(makeValue(a1For(t.r, col.HALF), scoreText));
         }
 
-        if (nowFinal) {
-          // do not write live odds for finals
+        if (isFinalFromEspn(statusObj)) {
+          // Don't touch live odds once final.
           continue;
         }
       } catch (e) {
         console.log(`Summary warn ${t.id}:`, e?.message || e);
       }
 
-      // LIVE ODDS
-      let live = undefined;
+      // LIVE ODDS (only when actually live)
+      if (!inProgress) {
+        DEBUG && console.log(`   [odds] skipped (not in progress)`);
+        continue;
+      }
 
-      // 1) scrape live block from game page
       try {
         const html = await fetchGameHtml(t.id);
-        const scraped = scrapeEspnBet(html);
+        const live = scrapeEspnBet(html);
+
         if (DEBUG) {
-          const snippet = (html || "").slice(0, 200).replace(/\s+/g, " ");
-          console.log(`   [scrape] block length: ${html?.length || 0}`);
-          scraped && console.log(`   [found] live =>`, JSON.stringify(scraped));
+          console.log(`   [scrape] html length: ${html?.length || 0}`);
+          live ? console.log(`   [live] ${JSON.stringify(live)}`) : console.log("   [live] none");
         }
-        if (scraped) live = scraped;
+
+        if (live) {
+          const w = (c, v) => { if (v !== "" && Number.isFinite(Number(v))) data.push(makeValue(a1For(t.r, c), Number(v))); };
+          w(col.LA_S,  live.spreadAway);
+          w(col.LA_ML, live.mlAway);
+          w(col.LH_S,  live.spreadHome);
+          w(col.LH_ML, live.mlHome);
+          w(col.L_TOT, live.total);
+        }
+        // If scrape fails, we *do not* fall back to pools (to avoid pregame contamination).
       } catch (e) {
         DEBUG && console.log(`   [scrape] failed ${t.id}:`, e?.message || e);
-      }
-
-      // 2) fallback to pools if scrape failed
-      if (!live && summary) {
-        const p = poolsFallback(summary);
-        if (p) live = p;
-      }
-
-      if (live) {
-        const w = (c, v) => { if (v !== "" && Number.isFinite(Number(v))) data.push(makeValue(a1For(t.r, c), Number(v))); };
-        w(col.LA_S,  live.spreadAway);
-        w(col.LA_ML, live.mlAway);
-        w(col.LH_S,  live.spreadHome);
-        w(col.LH_ML, live.mlHome);
-        w(col.L_TOT, live.total);
-      } else {
-        DEBUG && console.log(`   ❌ no live odds found`);
       }
     }
 
