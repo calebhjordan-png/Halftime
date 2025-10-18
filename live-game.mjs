@@ -10,14 +10,13 @@ import { google } from "googleapis";
 const {
   GOOGLE_SHEET_ID,
   GOOGLE_SERVICE_ACCOUNT,
-  LEAGUE = "nfl",
+  LEAGUE = "nfl",                                             // "nfl" | "college-football"
   TAB_NAME = (LEAGUE === "nfl" ? "NFL" : "CFB"),
-  GAME_ID = "",              // optional: force a single game
-  MARKET_PREFERENCE = "2H,Second Half,Halftime,Live", // order we try
+  GAME_ID = "",                                               // optional: force a single game
+  MARKET_PREFERENCE = "2H,Second Half,Halftime,Live",         // order we try
 } = process.env;
 
-const REQUIRED = ["GOOGLE_SHEET_ID", "GOOGLE_SERVICE_ACCOUNT"];
-for (const k of REQUIRED) {
+for (const k of ["GOOGLE_SHEET_ID", "GOOGLE_SERVICE_ACCOUNT"]) {
   if (!process.env[k]) throw new Error(`Missing required env var: ${k}`);
 }
 
@@ -49,6 +48,17 @@ const todayKey = (() => {
 function shortStatusFromEspn(statusObj) {
   const t = statusObj?.type || {};
   return t.shortDetail || t.detail || t.description || "In Progress";
+}
+function isFinalFromEspn(statusObj) {
+  return /final/i.test(String(statusObj?.type?.name || statusObj?.type?.description || ""));
+}
+function looksLiveStatus(s) {
+  if (!s) return false;
+  const x = s.toLowerCase();
+  return /\bhalf\b/.test(x) || /\bin\s*progress\b/.test(x) || /\bq[1-4]\b/.test(x) || /\bot\b/.test(x) || /\blive\b/.test(x);
+}
+function isFinalCell(s) {
+  return /^final$/i.test(String(s || ""));
 }
 
 function sumFirstTwoPeriods(linescores) {
@@ -93,7 +103,7 @@ function pickMarket(markets, preferenceList) {
   if (!Array.isArray(markets) || markets.length === 0) return null;
 
   const norm = s => (s || "").toLowerCase();
-  const wants = preferenceList
+  const wants = (preferenceList || "")
     .split(",")
     .map(s => s.trim().toLowerCase())
     .filter(Boolean);
@@ -109,15 +119,11 @@ function pickMarket(markets, preferenceList) {
     if (m) return m;
   }
 
-  // Fallback: any spread/total-ish market
-  const fallback = markets.find(mk =>
-    norm(mk?.name).includes("spread") ||
-    norm(mk?.displayName).includes("spread") ||
-    norm(mk?.name).includes("total") ||
-    norm(mk?.displayName).includes("total") ||
-    norm(mk?.name).includes("line") ||
-    norm(mk?.displayName).includes("line")
-  );
+  // Fallback: anything that smells like spread/total/line
+  const fallback = markets.find(mk => {
+    const s = norm(mk?.name) + " " + norm(mk?.displayName);
+    return s.includes("spread") || s.includes("total") || s.includes("line") || s.includes("over") || s.includes("under");
+  });
   return fallback || markets[0];
 }
 
@@ -126,16 +132,12 @@ function extractLiveNumbers(oddsPayload, preference = MARKET_PREFERENCE) {
     const markets = oddsPayload?.items || [];
     if (markets.length === 0) return undefined;
 
-    // We look for two buckets: spread and total. Each via preferred market first.
-    const prefList = preference || "2H,Second Half,Halftime,Live";
-
     const choose = (typeWords) => {
-      // Try to pick a market that includes the type word (spread/total)
       const typed = markets.filter(mk => {
-        const s = (mk?.name || mk?.displayName || "").toLowerCase();
+        const s = ((mk?.name || "") + " " + (mk?.displayName || "")).toLowerCase();
         return typeWords.some(w => s.includes(w));
       });
-      return pickMarket(typed.length ? typed : markets, prefList);
+      return pickMarket(typed.length ? typed : markets, preference);
     };
 
     const mSpread = choose(["spread", "line"]);
@@ -197,12 +199,6 @@ function mapCols(header) {
   };
 }
 
-function looksLiveStatus(s) {
-  if (!s) return false;
-  const x = s.toLowerCase();
-  return /\bhalf\b/.test(x) || /\bin\s*progress\b/.test(x) || /\bq[1-4]\b/.test(x) || /\bot\b/.test(x) || /\blive\b/.test(x);
-}
-
 function chooseTargets(rows, col) {
   const targets = [];
   for (let r = 1; r < rows.length; r++) {
@@ -212,6 +208,9 @@ function chooseTargets(rows, col) {
 
     const dateCell = (row[col.DATE] || "").trim();        // MM/DD/YY
     const status = (row[col.STATUS] || "").trim();
+
+    // Skip finals outright
+    if (isFinalCell(status)) continue;
 
     if (GAME_ID && id === GAME_ID) {
       targets.push({ r, id, reason: "GAME_ID" });
@@ -224,7 +223,7 @@ function chooseTargets(rows, col) {
     }
 
     // Also include rows scheduled for today (helps catch rows where status never moved off kickoff time)
-    if (dateCell === todayKey && status.toLowerCase() !== "final") {
+    if (dateCell === todayKey) {
       targets.push({ r, id, reason: "today" });
     }
   }
@@ -251,22 +250,44 @@ async function main() {
     const data = [];
 
     for (const t of targets) {
-      // 1) STATUS + HALF
-      let statusText = values[t.r]?.[col.STATUS] || "";
+      const currentStatus = values[t.r]?.[col.STATUS] || "";
+      // If Status is Final, skip entirely (defense-in-depth)
+      if (isFinalCell(currentStatus)) continue;
+
+      // 1) STATUS + HALF (from summary)
+      let statusText = currentStatus;
       let halfScore = "";
 
       try {
         const sum = await espnSummary(t.id);
-        statusText = shortStatusFromEspn(sum?.header?.competitions?.[0]?.status) || statusText || "In Progress";
-        halfScore = parseHalfScore(sum) || "";
+        const compStatus = sum?.header?.competitions?.[0]?.status;
+        const newStatus = shortStatusFromEspn(compStatus);
+        const nowFinal  = isFinalFromEspn(compStatus);
+
+        // Only push a Status update if it changed
+        if (newStatus && newStatus !== currentStatus) {
+          statusText = newStatus;
+          data.push(makeValue(a1For(t.r, col.STATUS), statusText));
+        }
+
+        // Only write Half Score if we have one
+        const hs = parseHalfScore(sum);
+        if (hs) {
+          halfScore = hs;
+          data.push(makeValue(a1For(t.r, col.HALF), halfScore));
+        }
+
+        // If ESPN says Final, we stop writing live odds for this row in this run
+        if (nowFinal) {
+          // (No live odds write; Orchestrator will handle final-grade on next pass)
+          continue;
+        }
       } catch (e) {
         if (e?.response?.status !== 404) {
           console.log(`Summary warn ${t.id}:`, e?.message || e);
         }
+        // If summary missing, we can still attempt odds below.
       }
-
-      data.push(makeValue(a1For(t.r, col.STATUS), statusText));
-      if (halfScore) data.push(makeValue(a1For(t.r, col.HALF), halfScore));
 
       // 2) LIVE ODDS (2H preferred)
       try {
