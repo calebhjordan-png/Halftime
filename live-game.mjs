@@ -1,5 +1,5 @@
 // live-game.mjs
-// Updates: Status (D), Half Score (L), Live odds (M..Q).
+// Updates: Status (D), Half Score (L as current score away-home), Live odds (M..Q).
 // Leaves pregame columns untouched. Optional GAME_ID focus.
 // Live odds source order: ESPN REST (if any) → ESPN summary pools (if “Live-ish”) → ESPN BET text scraper.
 
@@ -67,30 +67,6 @@ function shortStatusFromEspn(statusObj) {
 }
 function isFinalFromEspn(statusObj) {
   return /final/i.test(String(statusObj?.type?.name || statusObj?.type?.description || ""));
-}
-
-// Half score from first two period linescores
-function sumFirstTwoPeriods(linescores) {
-  if (!Array.isArray(linescores) || linescores.length === 0) return null;
-  const take = linescores.slice(0, 2);
-  let tot = 0;
-  for (const p of take) {
-    const v = Number(p?.value ?? p?.score ?? 0);
-    if (!Number.isFinite(v)) return null;
-    tot += v;
-  }
-  return tot;
-}
-function parseHalfScore(summary) {
-  try {
-    const comp = summary?.header?.competitions?.[0];
-    const home = comp?.competitors?.find(c => c.homeAway === "home");
-    const away = comp?.competitors?.find(c => c.homeAway === "away");
-    const hHome = sumFirstTwoPeriods(home?.linescores);
-    const hAway = sumFirstTwoPeriods(away?.linescores);
-    if (Number.isFinite(hHome) && Number.isFinite(hAway)) return `${hAway}-${hHome}`; // away-first
-  } catch {}
-  return "";
 }
 
 /* ───────────────────────── ESPN fetchers ─────────────────────────── */
@@ -310,7 +286,7 @@ async function main() {
       const currentStatus = values[t.r]?.[col.STATUS] || "";
       if (isFinalCell(currentStatus)) continue;
 
-      // 1) SUMMARY (status + half score)
+      // 1) SUMMARY (status + CURRENT score -> "Half Score" col)
       let summary;
       try {
         summary = await espnSummary(t.id);
@@ -323,8 +299,19 @@ async function main() {
         if (newStatus && newStatus !== currentStatus) {
           data.push(makeValue(a1For(t.r, col.STATUS), newStatus));
         }
-        const half = parseHalfScore(summary);
-        if (half) data.push(makeValue(a1For(t.r, col.HALF), half));
+
+        // CURRENT score (away-home) written into Half Score column
+        try {
+          const comp = summary?.header?.competitions?.[0];
+          const home = comp?.competitors?.find(c => c.homeAway === "home");
+          const away = comp?.competitors?.find(c => c.homeAway === "away");
+          const hs = String(home?.score ?? "").trim();
+          const as = String(away?.score ?? "").trim();
+          if (hs !== "" && as !== "" && !Number.isNaN(+hs) && !Number.isNaN(+as)) {
+            data.push(makeValue(a1For(t.r, col.HALF), `${as}-${hs}`));
+          }
+        } catch {}
+
         if (nowFinal) continue;
       } catch (e) {
         log("   summary warn:", e?.message || e);
