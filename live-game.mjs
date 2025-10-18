@@ -1,6 +1,6 @@
 // live-game.mjs
-// Updates: Status (D), Half Score (L), Live odds (M..Q).
-// ESPN Summary for clock/status, ESPN Markets for live lines.
+// Updates: Status (D), Half Score (L), and Live odds (M..Q) without touching pregame.
+// Debug envs: DEBUG_STATUS=1, DEBUG_LIVE=1 (optionally GAME_ID=... to isolate logs)
 
 import axios from "axios";
 import { google } from "googleapis";
@@ -13,11 +13,16 @@ const {
   TAB_NAME = (LEAGUE === "nfl" ? "NFL" : "CFB"),
   GAME_ID = "",
   MARKET_PREFERENCE = "live,in-play,inplay,2h,second half,halftime",
+  DEBUG_STATUS = "",
+  DEBUG_LIVE = "",
 } = process.env;
 
 for (const k of ["GOOGLE_SHEET_ID", "GOOGLE_SERVICE_ACCOUNT"]) {
   if (!process.env[k]) throw new Error(`Missing required env var: ${k}`);
 }
+
+const dbgS = Boolean(String(DEBUG_STATUS).trim());
+const dbgL = Boolean(String(DEBUG_LIVE).trim());
 
 /* ───────── Google Sheets ───────── */
 const svc = JSON.parse(GOOGLE_SERVICE_ACCOUNT);
@@ -75,13 +80,11 @@ async function espnSummary(gameId) {
   const { data } = await axios.get(url, { timeout: 15000 });
   return data;
 }
-
 async function espnMarkets(gameId) {
   const url = `https://sports.core.api.espn.com/v2/markets?sport=football&league=${LEAGUE}&event=${gameId}`;
   const { data } = await axios.get(url, { timeout: 15000 });
   return data;
 }
-
 async function fetchRefMaybe(ref) {
   if (!ref || typeof ref !== "string") return {};
   try {
@@ -93,10 +96,12 @@ async function fetchRefMaybe(ref) {
 }
 
 /* ===== Status + Half ===== */
+function periodName(n) {
+  return { 1: "1st", 2: "2nd", 3: "3rd", 4: "4th" }[n] || (n ? `Q${n}` : "");
+}
+
 function formatStatusFromObj(st) {
   if (!st) return "";
-
-  // ESPN can put these fields on either header.status or competitions[0].status
   const type = st.type || {};
   const stateRaw =
     type.state || type.name || st.state || st.name || type.id || "";
@@ -107,10 +112,6 @@ function formatStatusFromObj(st) {
   const clock = st.displayClock || st.clock || "";
   const periodNum = st.period ?? st.periodNumber;
 
-  const periodName = (n) =>
-    ({ 1: "1st", 2: "2nd", 3: "3rd", 4: "4th" }[n] || (n ? `Q${n}` : ""));
-
-  // Scheduled / pre
   if (state === "pre" || state === "scheduled") {
     try {
       const iso =
@@ -129,7 +130,6 @@ function formatStatusFromObj(st) {
     return detail || "Scheduled";
   }
 
-  // In progress (ESPN uses: "in", "inprogress", "live")
   if (
     state === "in" ||
     state === "inprogress" ||
@@ -142,19 +142,15 @@ function formatStatusFromObj(st) {
     return "In Progress";
   }
 
-  // Halftime
   if (state === "halftime" || /halftime/i.test(detail)) return "Halftime";
 
-  // End of period (ESPN sometimes uses endperiod / endofperiod)
   if (state === "endperiod" || state === "endofperiod" || /end of/i.test(detail)) {
     const p = periodName((periodNum || 0) - 1) || periodName(periodNum);
     return p ? `End of ${p}` : detail || "End of period";
   }
 
-  // Final
   if (state === "final" || /final/i.test(detail)) return "Final";
 
-  // Fallback to detail
   return detail || "";
 }
 
@@ -169,20 +165,29 @@ function sumFirstTwoPeriods(linescores) {
   }
   return tot;
 }
-function parseHalfScore(summary) {
+function parseHalfScore(summary, gameId) {
   try {
     const comp = summary?.header?.competitions?.[0];
     const home = comp?.competitors?.find((c) => c.homeAway === "home");
     const away = comp?.competitors?.find((c) => c.homeAway === "away");
     const hHome = sumFirstTwoPeriods(home?.linescores);
     const hAway = sumFirstTwoPeriods(away?.linescores);
+    if (dbgS) {
+      console.log(
+        `DEBUG[half] ${gameId}: linescores away=${JSON.stringify(
+          away?.linescores
+        )} home=${JSON.stringify(home?.linescores)} -> ${hAway}-${hHome}`
+      );
+    }
     if (Number.isFinite(hHome) && Number.isFinite(hAway)) return `${hAway}-${hHome}`;
-  } catch {}
+  } catch (e) {
+    if (dbgS) console.log(`DEBUG[half] ${gameId} error:`, e?.message || e);
+  }
   return "";
 }
 
 /* ===== Markets ===== */
-const normTokens = (list = MARKET_PREFERENCE) =>
+const prefTokens = (list = MARKET_PREFERENCE) =>
   list.split(",").map((x) => x.trim().toLowerCase()).filter(Boolean);
 
 function labelMatchesPreferred(mk, tokens) {
@@ -191,7 +196,10 @@ function labelMatchesPreferred(mk, tokens) {
       mk?.period?.displayName || ""
     }`
   );
+  // hard "live" signal
   if (/live/.test(l) || mk?.state === "LIVE" || mk?.inPlay === true) return true;
+  // accept open/in-progress states too (helps when label lacks "live")
+  if (mk?.state && /open|live|in[- ]?play/i.test(mk.state)) return true;
   return tokens.some((tok) => l.includes(tok));
 }
 
@@ -202,25 +210,43 @@ async function extractFromMarket(market) {
     const book = book0?.$ref ? await fetchRefMaybe(book0.$ref) : book0 || {};
     const aw = book?.awayTeamOdds || {};
     const hm = book?.homeTeamOdds || {};
-
-    const spreadAway = n(aw?.current?.spread ?? aw?.spread ?? book?.current?.spread);
-    const spreadHome = n(
-      hm?.current?.spread ?? hm?.spread ?? (spreadAway !== "" ? -spreadAway : "")
-    );
-    const mlAway = n(aw?.current?.moneyLine ?? aw?.moneyLine);
-    const mlHome = n(hm?.current?.moneyLine ?? hm?.moneyLine);
-    const total = n(book?.current?.total ?? book?.total);
-
-    const any = [spreadAway, spreadHome, mlAway, mlHome, total].some((v) => v !== "");
-    return any ? { spreadAway, spreadHome, mlAway, mlHome, total } : undefined;
+    return {
+      spreadAway: n(aw?.current?.spread ?? aw?.spread ?? book?.current?.spread),
+      spreadHome: n(
+        hm?.current?.spread ?? hm?.spread ?? (aw?.current?.spread != null || aw?.spread != null
+          ? -(aw?.current?.spread ?? aw?.spread)
+          : "")
+      ),
+      mlAway: n(aw?.current?.moneyLine ?? aw?.moneyLine),
+      mlHome: n(hm?.current?.moneyLine ?? hm?.moneyLine),
+      total: n(book?.current?.total ?? book?.total),
+      _book: {
+        aw, hm, cur: book?.current || {},
+      }
+    };
   } catch {
     return undefined;
   }
 }
 
-async function pickLiveFromMarkets(allMarkets, tokens) {
+async function pickLiveFromMarkets(allMarkets, tokens, gameId) {
   if (!Array.isArray(allMarkets) || !allMarkets.length) return undefined;
+
+  if (dbgL) {
+    console.log(`DEBUG[mkts] ${gameId}: found ${allMarkets.length} market(s).`);
+  }
+
   const liveMkts = allMarkets.filter((mk) => labelMatchesPreferred(mk, tokens));
+  if (dbgL) {
+    for (const mk of liveMkts) {
+      const firstBook = mk?.books?.[0] || {};
+      const tag = `${mk?.name || ""} | ${mk?.displayName || ""} | state=${mk?.state || ""} | period=${mk?.period?.displayName || ""}`;
+      console.log(`DEBUG[mkts] ${gameId}: candidate → ${tag}${firstBook?.$ref ? " (book ref)" : ""}`);
+      if (firstBook && !firstBook.$ref) {
+        console.log("DEBUG[mkts]    firstBook:", JSON.stringify(firstBook));
+      }
+    }
+  }
   if (!liveMkts.length) return undefined;
 
   const looks = (mk, words) => {
@@ -228,26 +254,29 @@ async function pickLiveFromMarkets(allMarkets, tokens) {
     return words.some((w) => s.includes(w));
   };
   const choose = (words) => liveMkts.find((mk) => looks(mk, words)) || liveMkts[0];
+
   const mkSpread = choose(["spread", "line"]);
   const mkTotal = choose(["total", "over", "under"]);
 
-  let spreadAway = "",
-    spreadHome = "",
-    mlAway = "",
-    mlHome = "",
-    total = "";
+  let live = { spreadAway: "", spreadHome: "", mlAway: "", mlHome: "", total: "" };
+
   if (mkSpread) {
     const part = await extractFromMarket(mkSpread);
-    if (part) ({ spreadAway, spreadHome, mlAway, mlHome } = part);
+    if (dbgL) {
+      console.log(`DEBUG[mkts] ${gameId}: picked SPREAD market "${mkSpread?.displayName || mkSpread?.name}" →`, part);
+    }
+    if (part) Object.assign(live, part);
   }
   if (mkTotal) {
     const part = await extractFromMarket(mkTotal);
-    if (part && part.total !== "") total = part.total;
+    if (dbgL) {
+      console.log(`DEBUG[mkts] ${gameId}: picked TOTAL market "${mkTotal?.displayName || mkTotal?.name}" →`, part);
+    }
+    if (part && part.total !== "") live.total = part.total;
   }
 
-  return [spreadAway, spreadHome, mlAway, mlHome, total].some((v) => v !== "")
-    ? { spreadAway, spreadHome, mlAway, mlHome, total }
-    : undefined;
+  const any = [live.spreadAway, live.spreadHome, live.mlAway, live.mlHome, live.total].some((v) => v !== "");
+  return any ? live : undefined;
 }
 
 /* ===== Sheets ===== */
@@ -255,6 +284,11 @@ function makeValue(range, val) {
   return { range, values: [[val]] };
 }
 function a1For(row0, col0, tab = TAB_NAME) {
+  const row1 = row0 + 1;
+  const colA = idxToA1(col0);
+  return `${tab}!${colA}${row1}:${${colA}${row1}}`; // eslint shutup — template clarifier
+}
+function a1Cell(row0, col0, tab = TAB_NAME) {
   const row1 = row0 + 1;
   const colA = idxToA1(col0);
   return `${tab}!${colA}${row1}:${colA}${row1}`;
@@ -318,14 +352,14 @@ async function main() {
     const targets = chooseTargets(values, col);
     if (targets.length === 0) return console.log(`[${ts}] Nothing to update.`);
 
-    const tokens = normTokens(MARKET_PREFERENCE);
+    const tokens = prefTokens(MARKET_PREFERENCE);
     const data = [];
 
     for (const t of targets) {
       const curStatus = values[t.r]?.[col.STATUS] || "";
       if (isFinalCell(curStatus)) continue;
 
-      // 1) STATUS + HALF (robust: try both header.status and competitions[0].status)
+      // 1) STATUS + HALF
       let summary;
       try {
         summary = await espnSummary(t.id);
@@ -333,7 +367,7 @@ async function main() {
         const stObj =
           comp.status ||
           summary?.header?.status ||
-          comp?.statusType || // rare alt
+          comp?.statusType ||
           {};
         const statusText =
           formatStatusFromObj(stObj) ||
@@ -342,16 +376,20 @@ async function main() {
           comp?.status?.type?.detail ||
           "";
 
-        const half = parseHalfScore(summary);
+        const half = parseHalfScore(summary, t.id);
+
+        if (dbgS) {
+          console.log(`DEBUG[status] ${t.id}: raw state=${stObj?.type?.state || stObj?.state || ""}, clock=${stObj?.displayClock || ""}, period=${stObj?.period ?? ""}, shortDetail=${stObj?.type?.shortDetail || ""} -> "${statusText}"`);
+        }
 
         if (statusText && statusText !== curStatus)
-          data.push(makeValue(a1For(t.r, col.STATUS), statusText));
-        if (half) data.push(makeValue(a1For(t.r, col.HALF), half));
+          data.push(makeValue(a1Cell(t.r, col.STATUS), statusText));
+        if (half) data.push(makeValue(a1Cell(t.r, col.HALF), half));
       } catch (e) {
         console.log(`Summary warn ${t.id}:`, e?.message || e);
       }
 
-      // 2) LIVE ODDS (unchanged)
+      // 2) LIVE ODDS
       try {
         const marketsRoot = await espnMarkets(t.id);
         const items = Array.isArray(marketsRoot?.items) ? marketsRoot.items : [];
@@ -364,17 +402,19 @@ async function main() {
             markets.push(itm);
           }
         }
-        const live = await pickLiveFromMarkets(markets, tokens);
+        const live = await pickLiveFromMarkets(markets, tokens, t.id);
         if (live) {
           const w = (c, v) => {
             if (v !== "" && Number.isFinite(Number(v)))
-              data.push(makeValue(a1For(t.r, c), Number(v)));
+              data.push(makeValue(a1Cell(t.r, c), Number(v)));
           };
           w(col.LA_S, live.spreadAway);
           w(col.LA_ML, live.mlAway);
           w(col.LH_S, live.spreadHome);
           w(col.LH_ML, live.mlHome);
           w(col.L_TOT, live.total);
+        } else if (dbgL) {
+          console.log(`DEBUG[mkts] ${t.id}: no acceptable live market after filtering.`);
         }
       } catch (e) {
         console.log(`Markets warn ${t.id}:`, e?.message || e);
