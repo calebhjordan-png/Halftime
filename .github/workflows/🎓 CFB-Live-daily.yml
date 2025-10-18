@@ -12,11 +12,24 @@ on:
     - cron: "*/5 0-6 * * 6"     # Saturday early morning
     - cron: "*/5 0-6 * * 0"     # Sunday early morning
     - cron: "*/5 0-6 * * 1"     # Monday early morning
+
+  # Manual run with optional GAME_ID focus and DEBUG output
   workflow_dispatch:
+    inputs:
+      game_id:
+        description: "Optional ESPN game id to focus on (e.g. 401754371)"
+        required: false
+        default: ""
+      debug:
+        description: "Enable verbose debug logging"
+        type: boolean
+        required: false
+        default: false
 
 jobs:
   live:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -35,4 +48,7 @@ jobs:
           GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
           LEAGUE: "college-football"
           TAB_NAME: "CFB"
+          # Debug + single-game focus only when manually triggered
+          GAME_ID: ${{ inputs.game_id }}
+          DEBUG_MODE: ${{ inputs.debug && '1' || '' }}
         run: node live-game.mjs
