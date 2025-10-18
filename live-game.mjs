@@ -1,6 +1,5 @@
 // live-game.mjs
 // Status (D), Half Score (L), Live odds (M..Q) from ESPN BET widget.
-// Pregame columns untouched. Supports GAME_ID focus + DEBUG_MODE logs.
 
 import axios from "axios";
 import { google } from "googleapis";
@@ -106,69 +105,78 @@ const BROWSER_HEADERS = {
 };
 
 async function fetchGameHtml(gameId) {
-  const url = `https://www.espn.com/${LEAGUE.replace("college-football","college-football")}/game/_/gameId/${gameId}`;
+  // Same path for NFL/CFB structure with league segment
+  const url = `https://www.espn.com/${LEAGUE}/game/_/gameId/${gameId}`;
   const { data } = await axios.get(url, { timeout: 15000, headers: BROWSER_HEADERS });
   return String(data || "");
 }
 
 /* ───────────────────── ESPN BET widget parser ────────────────────── */
-/**
- * Strategy: pull the LIVE ODDS block, strip tags → text, then carve out:
- *   SPREAD section (between "SPREAD" and "TOTAL")
- *   TOTAL section  (between "TOTAL"  and "ML")
- *   ML section     (after   "ML")
- * Extraction rules:
- *   - Spread: prefer values with a decimal (.5 etc). First two are away/home.
- *   - Total:  look for o##.# and u##.# → use the numeric part.
- *   - ML:     first two tokens like +900 / -180 / OFF → OFF => empty.
- */
 function decodeEntities(txt) {
   return txt
     .replace(/&nbsp;|&#160;/g, " ")
     .replace(/&minus;|&#8722;|−/g, "-")
     .replace(/&plus;|&#43;/g, "+")
     .replace(/&amp;/g, "&")
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
     .replace(/\u00A0/g, " ");
 }
 
-function toText(html) {
-  // Remove scripts/styles, then tags
+function stripTags(html) {
   let t = html.replace(/<script[\s\S]*?<\/script>/gi, "")
-              .replace(/<style[\s\S]*?<\/style>/gi, "");
-  t = t.replace(/<[^>]+>/g, " ");
+              .replace(/<style[\s\S]*?<\/style>/gi, "")
+              .replace(/<[^>]+>/g, " ");
   t = decodeEntities(t);
-  // Collapse whitespace
   return t.replace(/\s+/g, " ").trim();
 }
 
+function findLiveOddsBlock(html) {
+  if (!html) return "";
+  // Try multiple patterns; ESPN tweaks wrappers frequently
+  const tries = [
+    /ESPN BET SPORTSBOOK[\s\S]{0,16000}?LIVE ODDS[\s\S]{0,16000}?Odds by ESPN BET/i,
+    /LIVE ODDS[\s\S]{0,16000}?Odds by ESPN BET/i,
+    /LIVE ODDS[\s\S]{0,16000}?All Live Odds on ESPN BET Sportsbook/i
+  ];
+  for (const rx of tries) {
+    const m = html.match(rx);
+    if (m) return m[0];
+  }
+  return "";
+}
+
 function parseEspnBetWidget(html) {
-  if (!html) return undefined;
-  const blockMatch = html.match(/ESPN BET SPORTSBOOK[\s\S]{0,12000}?LIVE ODDS[\s\S]{0,12000}?Note: Odds and lines subject to change\./i);
-  const block = blockMatch ? blockMatch[0] : "";
+  const block = findLiveOddsBlock(html);
   log("   [scrape] block length:", block.length);
   if (!block) return undefined;
 
-  const text = toText(block);
-  if (DBG) log("   [text] snippet:", text.slice(0, 300), "...");
+  const text = stripTags(block);
+  if (DBG) log("   [text] snippet:", text.slice(0, 260), "...");
 
-  // Sections
-  const spreadSec = (text.match(/SPREAD([\s\S]*?)TOTAL/) || [])[1] || "";
-  const totalSec  = (text.match(/TOTAL([\s\S]*?)ML/)    || [])[1] || "";
-  const mlSec     = (text.match(/ML([\s\S]*)$/)        || [])[1] || "";
+  // Extract sections by anchors
+  const sIdx = text.indexOf("SPREAD");
+  const tIdx = text.indexOf("TOTAL", sIdx + 6);
+  const mIdx = text.indexOf("ML", tIdx + 5);
+  if (sIdx === -1 || tIdx === -1 || mIdx === -1) {
+    log("   [warn] anchors missing (SPREAD/TOTAL/ML)");
+    return undefined;
+  }
+  const spreadSec = text.slice(sIdx + 6, tIdx);
+  const totalSec  = text.slice(tIdx + 5, mIdx);
+  const mlSec     = text.slice(mIdx + 2);
 
-  // Spreads: prefer values with a decimal to dodge -110 juice.
-  const spreadVals = [...spreadSec.matchAll(/[+−-]\d{1,2}\.\d/g)].map(m => m[0].replace("−","-"));
+  // Spreads: first two signed decimals like +21.5 / -21.5
+  const spreadVals = [...spreadSec.matchAll(/[+−-]\d{1,2}(?:\.\d)?/g)]
+    .map(m => m[0].replace("−","-"))
+    .filter(x => /\./.test(x)); // prefer lines, not -110
   const spreadAway = spreadVals[0] || "";
   const spreadHome = spreadVals[1] || "";
 
-  // Totals: capture o##.# and u##.#; use the numeric part (prefer whichever exists)
+  // Totals: look for o##.# / u##.#
   const oMatch = totalSec.match(/o(\d{1,2}(?:\.\d)?)/i);
   const uMatch = totalSec.match(/u(\d{1,2}(?:\.\d)?)/i);
   const total = oMatch ? Number(oMatch[1]) : (uMatch ? Number(uMatch[1]) : "");
 
-  // Moneylines: first two tokens like +900 / -2000 / OFF
+  // Moneylines: first two tokens like +900 / -180 / OFF
   const mlTokens = [...mlSec.matchAll(/([+−-]\d{2,4}|OFF)/g)].map(m => m[1].replace("−","-"));
   const mlAway = mlTokens[0] && mlTokens[0] !== "OFF" ? Number(mlTokens[0]) : "";
   const mlHome = mlTokens[1] && mlTokens[1] !== "OFF" ? Number(mlTokens[1]) : "";
@@ -180,7 +188,6 @@ function parseEspnBetWidget(html) {
     log("   [found] spreadAway:", spreadAway, "spreadHome:", spreadHome, "total:", total, "mlAway:", mlAway, "mlHome:", mlHome);
   }
 
-  const toNum = v => v === "" ? "" : Number(v);
   const live = {
     spreadAway: spreadAway ? Number(spreadAway) : "",
     spreadHome: spreadHome ? Number(spreadHome) : "",
@@ -230,14 +237,16 @@ function chooseTargets(rows, col) {
     const id = (row[col.GAME_ID] || "").trim();
     if (!id) continue;
 
+    // If GAME_ID is provided, hard-filter to that single id
+    if (GAME_ID) {
+      if (id === GAME_ID) targets.push({ r, id, reason: "GAME_ID" });
+      continue;
+    }
+
     const dateCell = (row[col.DATE] || "").trim();
     const status   = (row[col.STATUS] || "").trim();
     if (isFinalCell(status)) continue;
 
-    if (GAME_ID && id === GAME_ID) {
-      targets.push({ r, id, reason: "GAME_ID" });
-      continue;
-    }
     if (looksLiveStatus(status)) {
       targets.push({ r, id, reason: "live-like status" });
       continue;
@@ -285,7 +294,7 @@ async function main() {
         console.log(`   summary warn ${t.id}:`, e?.message || e);
       }
 
-      // ESPN BET LIVE ODDS
+      // ESPN BET LIVE ODDS (from game page HTML)
       try {
         const html = await fetchGameHtml(t.id);
         const live = parseEspnBetWidget(html);
