@@ -1,5 +1,5 @@
 // live-game.mjs
-// Status (D), Half Score (L), Live odds (M..Q) from ESPN BET widget.
+// Updates: Status (D), Half Score (L), Live odds (M..Q) by scraping ESPN BET widget.
 
 import axios from "axios";
 import { google } from "googleapis";
@@ -82,7 +82,7 @@ function parseHalfScore(summary) {
     const away = comp?.competitors?.find(c => c.homeAway === "away");
     const hHome = sumFirstTwoPeriods(home?.linescores);
     const hAway = sumFirstTwoPeriods(away?.linescores);
-    if (Number.isFinite(hHome) && Number.isFinite(hAway)) return `${hAway}-${hHome}`;
+    if (Number.isFinite(hHome) && Number.isFinite(hAway)) return `${hAway}-${hHome}`; // away-first
   } catch {}
   return "";
 }
@@ -105,7 +105,6 @@ const BROWSER_HEADERS = {
 };
 
 async function fetchGameHtml(gameId) {
-  // Same path for NFL/CFB structure with league segment
   const url = `https://www.espn.com/${LEAGUE}/game/_/gameId/${gameId}`;
   const { data } = await axios.get(url, { timeout: 15000, headers: BROWSER_HEADERS });
   return String(data || "");
@@ -131,11 +130,10 @@ function stripTags(html) {
 
 function findLiveOddsBlock(html) {
   if (!html) return "";
-  // Try multiple patterns; ESPN tweaks wrappers frequently
   const tries = [
-    /ESPN BET SPORTSBOOK[\s\S]{0,16000}?LIVE ODDS[\s\S]{0,16000}?Odds by ESPN BET/i,
-    /LIVE ODDS[\s\S]{0,16000}?Odds by ESPN BET/i,
-    /LIVE ODDS[\s\S]{0,16000}?All Live Odds on ESPN BET Sportsbook/i
+    /ESPN BET SPORTSBOOK[\s\S]{0,18000}?LIVE ODDS[\s\S]{0,18000}?Odds by ESPN BET/i,
+    /LIVE ODDS[\s\S]{0,18000}?Odds by ESPN BET/i,
+    /LIVE ODDS[\s\S]{0,18000}?All Live Odds on ESPN BET Sportsbook/i
   ];
   for (const rx of tries) {
     const m = html.match(rx);
@@ -144,57 +142,71 @@ function findLiveOddsBlock(html) {
   return "";
 }
 
+// Heuristic extraction that is tolerant to markup/case changes
 function parseEspnBetWidget(html) {
   const block = findLiveOddsBlock(html);
   log("   [scrape] block length:", block.length);
   if (!block) return undefined;
 
   const text = stripTags(block);
-  if (DBG) log("   [text] snippet:", text.slice(0, 260), "...");
+  if (DBG) log("   [text] snippet:", text.slice(0, 220), "...");
 
-  // Extract sections by anchors
-  const sIdx = text.indexOf("SPREAD");
-  const tIdx = text.indexOf("TOTAL", sIdx + 6);
-  const mIdx = text.indexOf("ML", tIdx + 5);
-  if (sIdx === -1 || tIdx === -1 || mIdx === -1) {
-    log("   [warn] anchors missing (SPREAD/TOTAL/ML)");
-    return undefined;
-  }
-  const spreadSec = text.slice(sIdx + 6, tIdx);
-  const totalSec  = text.slice(tIdx + 5, mIdx);
-  const mlSec     = text.slice(mIdx + 2);
+  // Locate the "Close Spread Total ML" header case-insensitively
+  const hdr = text.search(/close\s+spread\s+total\s+ml/i);
+  const noteIdx = text.search(/note:\s*odds/i);
+  const body = hdr >= 0
+    ? text.slice(hdr)
+    : (noteIdx > 0 ? text.slice(0, noteIdx) : text);
 
-  // Spreads: first two signed decimals like +21.5 / -21.5
-  const spreadVals = [...spreadSec.matchAll(/[+−-]\d{1,2}(?:\.\d)?/g)]
-    .map(m => m[0].replace("−","-"))
-    .filter(x => /\./.test(x)); // prefer lines, not -110
-  const spreadAway = spreadVals[0] || "";
-  const spreadHome = spreadVals[1] || "";
+  if (DBG) log("   [body] snippet:", body.slice(0, 220), "...");
 
-  // Totals: look for o##.# / u##.#
-  const oMatch = totalSec.match(/o(\d{1,2}(?:\.\d)?)/i);
-  const uMatch = totalSec.match(/u(\d{1,2}(?:\.\d)?)/i);
+  // Totals: first oXX.X or uXX.X
+  const oMatch = body.match(/\bo(\d{1,2}(?:\.\d)?)\b/i);
+  const uMatch = body.match(/\bu(\d{1,2}(?:\.\d)?)\b/i);
   const total = oMatch ? Number(oMatch[1]) : (uMatch ? Number(uMatch[1]) : "");
 
-  // Moneylines: first two tokens like +900 / -180 / OFF
-  const mlTokens = [...mlSec.matchAll(/([+−-]\d{2,4}|OFF)/g)].map(m => m[1].replace("−","-"));
-  const mlAway = mlTokens[0] && mlTokens[0] !== "OFF" ? Number(mlTokens[0]) : "";
-  const mlHome = mlTokens[1] && mlTokens[1] !== "OFF" ? Number(mlTokens[1]) : "";
+  // Spreads: signed numbers within realistic range, prefer ones with .5
+  const spreadCandidates = [...body.matchAll(/(?<!\d)([+\-]\d{1,2}(?:\.\d)?)(?!\d)/g)]
+    .map(m => m[1])
+    .filter(v => {
+      const num = Number(v);
+      if (!Number.isFinite(num)) return false;
+      if (Math.abs(num) > 50) return false;
+      // exclude common juice prices (no decimals, >= 3 digits)
+      if (!/\./.test(v) && Math.abs(num) >= 100) return false;
+      return true;
+    });
+
+  // Prefer .5 lines; if we have more than 2, keep the first two
+  const spreadsPref = spreadCandidates.sort((a,b) => (/\./.test(b)?1:0) - (/\./.test(a)?1:0));
+  const spreadAway = spreadsPref[0] ? Number(spreadsPref[0]) : "";
+  const spreadHome = spreadsPref[1] ? Number(spreadsPref[1]) : "";
+
+  // Moneylines: after the first total occurrence, grab tokens that look like ML
+  let afterTotalStart = body.length;
+  const firstTotalPos = Math.min(
+    oMatch ? body.indexOf(oMatch[0]) : Infinity,
+    uMatch ? body.indexOf(uMatch[0]) : Infinity
+  );
+  if (firstTotalPos !== Infinity) afterTotalStart = firstTotalPos;
+
+  const mlTail = body.slice(afterTotalStart);
+  const mlTokens = [...mlTail.matchAll(/\b(EVEN|OFF|[+\-]\d{3,4}|[+\-]130)\b/g)].map(m => m[1]);
+  // Filter out likely juice (-110/-115/-120/-125) but keep -130 since ML can be -130
+  const badJuice = new Set(["-105","-110","-115","-120","-125"]);
+  const mlClean = mlTokens.filter(t => t === "EVEN" || t === "OFF" || !badJuice.has(t));
+
+  const parseML = v => (v === "EVEN" || v === "OFF") ? "" : Number(v);
+  const mlAway = mlClean[0] ? parseML(mlClean[0]) : "";
+  const mlHome = mlClean[1] ? parseML(mlClean[1]) : "";
 
   if (DBG) {
-    log("   [sections] spread:", spreadSec.slice(0,120));
-    log("   [sections] total :", totalSec.slice(0,120));
-    log("   [sections] ml    :", mlSec.slice(0,120));
-    log("   [found] spreadAway:", spreadAway, "spreadHome:", spreadHome, "total:", total, "mlAway:", mlAway, "mlHome:", mlHome);
+    log("   [found] spreads:", spreadAway, spreadHome);
+    log("   [found] total  :", total);
+    log("   [found] ML     :", mlAway, mlHome);
   }
 
-  const live = {
-    spreadAway: spreadAway ? Number(spreadAway) : "",
-    spreadHome: spreadHome ? Number(spreadHome) : "",
-    mlAway,
-    mlHome,
-    total: total === "" ? "" : Number(total),
-  };
+  const live = { spreadAway, spreadHome, mlAway, mlHome, total };
   const any = Object.values(live).some(v => v !== "");
   return any ? live : undefined;
 }
@@ -237,7 +249,7 @@ function chooseTargets(rows, col) {
     const id = (row[col.GAME_ID] || "").trim();
     if (!id) continue;
 
-    // If GAME_ID is provided, hard-filter to that single id
+    // If GAME_ID provided, hard-filter to it
     if (GAME_ID) {
       if (id === GAME_ID) targets.push({ r, id, reason: "GAME_ID" });
       continue;
@@ -294,7 +306,7 @@ async function main() {
         console.log(`   summary warn ${t.id}:`, e?.message || e);
       }
 
-      // ESPN BET LIVE ODDS (from game page HTML)
+      // ESPN BET LIVE ODDS via HTML scrape
       try {
         const html = await fetchGameHtml(t.id);
         const live = parseEspnBetWidget(html);
