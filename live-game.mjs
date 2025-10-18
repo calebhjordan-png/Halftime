@@ -1,7 +1,7 @@
 // live-game.mjs
 // Updates only: Status (D), Half Score (L), Live odds (M..Q).
 // Leaves pregame columns untouched. Optional GAME_ID to focus a single row.
-// In DEBUG_MODE prints a full dump of candidate markets found in Summary.
+// If DEBUG_MODE=1, prints detailed market discovery (summary pools + page scrape).
 
 import axios from "axios";
 import { google } from "googleapis";
@@ -101,7 +101,7 @@ async function espnSummary(gameId) {
 }
 
 async function espnOddsREST(gameId) {
-  // ESPN's REST odds sometimes return 404 for college; keep for completeness.
+  // NFL often works; CFB usually 404s. We log and move on.
   const v1 = `https://sports.core.api.espn.com/v2/sports/football/${LEAGUE}/competitions/${gameId}/odds`;
   const v2 = `https://sports.core.api.espn.com/v2/sports/football/${LEAGUE}/events/${gameId}/competitions/${gameId}/odds`;
   try {
@@ -137,30 +137,18 @@ function dumpPools(summary) {
   if (!DEBUG) return pools;
 
   if (!pools.length) {
-    console.log("   (no pools found in summary)");
+    console.log("📋 pools: (none in summary)");
     return pools;
   }
 
-  const rows = pools.map(p => {
-    const prov = p?.provider?.name || p?.provider || "";
+  console.log("📋 pools (provider | label | aSpr hSpr aML hML total | hit?):");
+  pools.forEach(p => {
+    const prov  = p?.provider?.name || p?.provider || "";
     const label = [p?.details, p?.name, p?.period].filter(Boolean).join(" | ");
     const a = p?.awayTeamOdds || {};
     const h = p?.homeTeamOdds || {};
-    return {
-      provider: prov,
-      label,
-      spreadAway: a?.spread ?? "",
-      spreadHome: h?.spread ?? "",
-      mlAway: a?.moneyLine ?? "",
-      mlHome: h?.moneyLine ?? "",
-      total: p?.overUnder ?? p?.total ?? "",
-      tokenHit: isTokenHit(label),
-    };
-  });
-
-  console.log("📋 pools (provider | label | aSpr hSpr aML hML total | hit?):");
-  rows.forEach(r => {
-    console.log(`   - ${r.provider} | ${r.label} | ${r.spreadAway} ${r.spreadHome} ${r.mlAway} ${r.mlHome} ${r.total} | ${r.tokenHit}`);
+    const tot = p?.overUnder ?? p?.total ?? "";
+    console.log(`   - ${prov} | ${label} | ${a?.spread ?? ""} ${h?.spread ?? ""} ${a?.moneyLine ?? ""} ${h?.moneyLine ?? ""} ${tot} | ${isTokenHit(label)}`);
   });
 
   return pools;
@@ -169,20 +157,7 @@ function dumpPools(summary) {
 function pickPool(pools) {
   if (!pools.length) return undefined;
 
-  // 1) prefer “live-ish” label + preferred book
-  for (const book of PREF_BOOKS) {
-    const hit = pools.find(p => {
-      const prov = (p?.provider?.name || p?.provider || "").toUpperCase();
-      const label = [p?.details, p?.name, p?.period].filter(Boolean).join(" ");
-      return prov.includes(book) && isTokenHit(label);
-    });
-    if (hit) return hit;
-  }
-  // 2) any “live-ish” label
-  const anyLive = pools.find(p => isTokenHit([p?.details, p?.name, p?.period].filter(Boolean).join(" ")));
-  if (anyLive) return anyLive;
-
-  // 3) if game status is live we’ll still accept a pool with current numbers
+  // helper
   const hasNumbers = p => {
     const a = p?.awayTeamOdds || {};
     const h = p?.homeTeamOdds || {};
@@ -193,7 +168,20 @@ function pickPool(pools) {
     );
   };
 
-  // prefer preferred books with numbers
+  // 1) prefer live-ish label + preferred book
+  for (const book of PREF_BOOKS) {
+    const hit = pools.find(p => {
+      const prov = (p?.provider?.name || p?.provider || "").toUpperCase();
+      const label = [p?.details, p?.name, p?.period].filter(Boolean).join(" ");
+      return prov.includes(book) && isTokenHit(label) && hasNumbers(p);
+    });
+    if (hit) return hit;
+  }
+  // 2) any live-ish label
+  const anyLive = pools.find(p => isTokenHit([p?.details, p?.name, p?.period].filter(Boolean).join(" ")) && hasNumbers(p));
+  if (anyLive) return anyLive;
+
+  // 3) fallback: any preferred book with numbers
   for (const book of PREF_BOOKS) {
     const hit = pools.find(p => {
       const prov = (p?.provider?.name || p?.provider || "").toUpperCase();
@@ -202,7 +190,7 @@ function pickPool(pools) {
     if (hit) return hit;
   }
 
-  // 4) last fallback: first pool that has numbers
+  // 4) last resort: first pool that has numbers
   return pools.find(hasNumbers);
 }
 
@@ -218,6 +206,65 @@ function numbersFromPool(pool) {
   const total      = n(pool?.overUnder ?? pool?.total);
   const any = [spreadAway, spreadHome, mlAway, mlHome, total].some(v => v !== "");
   return any ? { spreadAway, spreadHome, mlAway, mlHome, total } : undefined;
+}
+
+/* ─────────────── HTML fallback: scrape LIVE ODDS module ──────────── */
+async function scrapeGamePageLiveOdds(gameId) {
+  // ESPNs game page embeds the LIVE ODDS widget as plain text in buttons.
+  // We’ll pull the page and parse numbers around that section.
+  const url = `https://www.espn.com/${LEAGUE === "college-football" ? "college-football" : "nfl"}/game/_/gameId/${gameId}`;
+  try {
+    const { data: html } = await axios.get(url, { timeout: 15000 });
+    if (DEBUG) console.log("🔎 page:", url);
+
+    // Limit to the LIVE ODDS block to avoid false positives
+    const liveBlockMatch = html.match(/ESPN BET SPORTSBOOK[\s\S]*?LIVE ODDS[\s\S]*?<\/section>/i) ||
+                           html.match(/LIVE ODDS[\s\S]*?<\/section>/i) ||
+                           html.match(/LIVE ODDS[\s\S]*?Odds by ESPN BET/i);
+    const block = liveBlockMatch ? liveBlockMatch[0] : html;
+
+    // Totals often shown as o41.5 / u41.5 (take any number after o/u)
+    const totMatch = block.match(/\b[o|u]\s?(\d+(?:\.\d+)?)/i);
+    const total = totMatch ? Number(totMatch[1]) : "";
+
+    // Moneylines: +550 / -1000 style; capture the biggest abs values near the block
+    const mlMatches = [...block.matchAll(/([+-]\d{3,5})\b/g)].map(m => Number(m[1]));
+    let mlAway = "", mlHome = "";
+    if (mlMatches.length >= 2) {
+      // heuristic: usually two MLs; assign the positive to away if both present
+      // Try to keep sign: pick min (most negative) and max (most positive)
+      const min = Math.min(...mlMatches);
+      const max = Math.max(...mlMatches);
+      // many pages list away first; we’ll prefer (+) as away if present
+      mlAway = mlMatches.find(v => v > 0) ?? max;
+      mlHome = mlMatches.find(v => v < 0) ?? min;
+    }
+
+    // Spreads: +13.5 / -13.5 style; take the magnitude number and assign signs
+    const sprMatches = [...block.matchAll(/([+-]\d+(?:\.\d+)?)(?:\s*<\/|[\s<])/g)].map(m => Number(m[1]));
+    // Filter out MLs accidentally captured (mls are 3+ digits; spreads usually <= 2 digits before decimal)
+    const spreadsOnly = sprMatches.filter(v => Math.abs(v) < 1000);
+
+    let spreadAway = "", spreadHome = "";
+    if (spreadsOnly.length >= 2) {
+      // Usually shows both sides; assign the (+) to away if present
+      const pos = spreadsOnly.find(v => v > 0);
+      const neg = spreadsOnly.find(v => v < 0);
+      if (pos != null && neg != null) {
+        spreadAway = pos;
+        spreadHome = neg;
+      }
+    }
+
+    const gotAny = [spreadAway, spreadHome, mlAway, mlHome, total].some(v => v !== "");
+    if (DEBUG) {
+      console.log("   [scrape] spreads:", spreadAway, "/", spreadHome, " ML:", mlAway, "/", mlHome, " total:", total);
+    }
+    return gotAny ? { spreadAway, spreadHome, mlAway, mlHome, total } : undefined;
+  } catch (e) {
+    if (DEBUG) console.log("   [scrape] failed:", e?.response?.status || e?.message || e);
+    return undefined;
+  }
 }
 
 /* ─────────────────────── values/A1 helpers ───────────────────────── */
@@ -251,9 +298,9 @@ function mapCols(header) {
   };
 }
 
-// Only row selection we want:
+// Row selection:
 // - If GAME_ID is set, ONLY rows with that id.
-// - Else: rows that look live OR have today's date and are not Final.
+// - Else: rows live-ish OR with today's date (ET) and not Final.
 function chooseTargets(rows, col) {
   const targets = [];
   const focus = String(GAME_ID || "").trim();
@@ -296,8 +343,7 @@ async function main() {
 
     const listIds = targets.map(t => t.id);
     console.log(`[${ts}] Found ${targets.length} game(s) to update: ${listIds.join(", ")}`);
-
-    if (targets.length === 0) { return; }
+    if (targets.length === 0) return;
 
     const data = [];
 
@@ -315,55 +361,43 @@ async function main() {
         const newStatus  = shortStatusFromEspn(compStatus);
         const nowFinal   = isFinalFromEspn(compStatus);
 
-        if (DEBUG) {
-          console.log("   status text:", JSON.stringify(newStatus));
-        }
+        if (DEBUG) console.log("   status text:", JSON.stringify(newStatus));
+        if (newStatus && newStatus !== currentStatus) data.push(makeValue(a1For(t.r, col.STATUS), newStatus));
 
-        if (newStatus && newStatus !== currentStatus) {
-          data.push(makeValue(a1For(t.r, col.STATUS), newStatus));
-        }
         const half = parseHalfScore(summary);
         if (DEBUG && half) console.log("   half score:", half);
         if (half) data.push(makeValue(a1For(t.r, col.HALF), half));
 
-        if (nowFinal) {
-          if (DEBUG) console.log("   final detected — skipping live odds.");
-          continue;
-        }
+        if (nowFinal) { if (DEBUG) console.log("   final detected — skipping live odds."); continue; }
       } catch (e) {
-        if (e?.response?.status !== 404) {
-          console.log(`Summary warn ${t.id}:`, e?.message || e);
-        }
+        if (e?.response?.status !== 404) console.log(`Summary warn ${t.id}:`, e?.message || e);
       }
 
-      // 2) LIVE ODDS — colleges often 404 on REST; rely on Summary pools.
-      // Still try REST first (for completeness)
-      try {
-        const rest = await espnOddsREST(t.id);
-        if (DEBUG && rest?.items?.length) {
-          console.log(`   REST odds items: ${rest.items.length} (not used for CFB if 404s)`);
-        }
-      } catch { /* already logged in espnOddsREST */ }
+      // 2) Try REST odds quickly (NFL-friendly; often 404 for CFB)
+      try { await espnOddsREST(t.id); } catch {}
 
-      // Pull from Summary pools and pick best
+      // 3) Summary pools
       let live = undefined;
-      let chosen = undefined;
-
       const pools = dumpPools(summary);
       if (pools.length) {
-        chosen = pickPool(pools);
+        const chosen = pickPool(pools);
         live = numbersFromPool(chosen);
+        if (DEBUG) {
+          if (chosen) {
+            const prov = chosen?.provider?.name || chosen?.provider || "";
+            const label = [chosen?.details, chosen?.name, chosen?.period].filter(Boolean).join(" | ");
+            console.log(`   chosen pool: ${prov} | ${label}`);
+            console.log(`   → numbers: ${JSON.stringify(live)}`);
+          } else {
+            console.log("   no suitable summary pool.");
+          }
+        }
       }
 
-      if (DEBUG) {
-        if (chosen) {
-          const prov = chosen?.provider?.name || chosen?.provider || "";
-          const label = [chosen?.details, chosen?.name, chosen?.period].filter(Boolean).join(" | ");
-          console.log(`   ✅ chosen pool: ${prov} | ${label}`);
-          console.log(`   → numbers: ${JSON.stringify(live)}`);
-        } else {
-          console.log("   ❌ no pool chosen (no suitable labels/numbers).");
-        }
+      // 4) Fallback: scrape the LIVE ODDS module on the game page
+      if (!live) {
+        const scraped = await scrapeGamePageLiveOdds(t.id);
+        if (scraped) live = scraped;
       }
 
       if (live) {
@@ -373,13 +407,12 @@ async function main() {
         w(col.LH_S,  live.spreadHome);
         w(col.LH_ML, live.mlHome);
         w(col.L_TOT, live.total);
+      } else if (DEBUG) {
+        console.log("   ❌ no live numbers found from any source this run.");
       }
     }
 
-    if (!data.length) {
-      console.log(`✅ Nothing to write this run.`);
-      return;
-    }
+    if (!data.length) { console.log(`✅ Nothing to write this run.`); return; }
 
     await sheets.spreadsheets.values.batchUpdate({
       spreadsheetId: GOOGLE_SHEET_ID,
