@@ -36,14 +36,19 @@ function idxToA1(n0) {
   while (n > 0) { n--; s = String.fromCharCode(65 + (n % 26)) + s; n = Math.floor(n / 26); }
   return s;
 }
+// Build today's key in **US/Eastern** to match the sheet
 const todayKey = (() => {
-  // Sheet uses MM/DD/YY; build UTC today in that format
   const d = new Date();
-  const mm = String(d.getUTCMonth() + 1).padStart(2, "0");
-  const dd = String(d.getUTCDate()).padStart(2, "0");
-  const yy = String(d.getUTCFullYear()).slice(-2);
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: "America/New_York",
+    month: "2-digit", day: "2-digit", year: "2-digit",
+  }).formatToParts(d);
+  const mm = parts.find(p => p.type === "month")?.value ?? "00";
+  const dd = parts.find(p => p.type === "day")?.value ?? "00";
+  const yy = parts.find(p => p.type === "year")?.value ?? "00";
   return `${mm}/${dd}/${yy}`;
 })();
+
 
 function shortStatusFromEspn(statusObj) {
   const t = statusObj?.type || {};
