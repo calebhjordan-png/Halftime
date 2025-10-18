@@ -1,8 +1,8 @@
 // live-game.mjs
 // Updates only: Status (D), Half Score (L), Live odds (M..Q).
 // Leaves pregame columns untouched. Supports optional GAME_ID focus.
-// Prefers halftime markets (2H / Second Half / Halftime) but will fall back to
-// generic live/game markets (Game Line / Line / Game) when ESPN omits explicit “Live” labels.
+// Prefers halftime markets (2H / Second Half / Halftime) with fallback
+// to generic "Live" or "Game Lines" markets when that's all ESPN exposes.
 
 import axios from "axios";
 import { google } from "googleapis";
@@ -14,7 +14,7 @@ const {
   LEAGUE = "nfl",                                 // "nfl" | "college-football"
   TAB_NAME = (LEAGUE === "nfl" ? "NFL" : "CFB"),
   GAME_ID = "",                                   // optional: only update this game
-  MARKET_PREFERENCE = "2H,Second Half,Halftime,Live", // you can still override
+  MARKET_PREFERENCE = "2H,Second Half,Halftime,Live",
 } = process.env;
 
 for (const k of ["GOOGLE_SHEET_ID", "GOOGLE_SERVICE_ACCOUNT"]) {
@@ -103,25 +103,19 @@ async function espnOdds(gameId) {
 }
 
 /* ─────────────── Live market selection & parsing ─────────────────── */
-// Always include baseline live-like keywords even if MARKET_PREFERENCE is narrow
+// tokens we consider “live-ish” (first wins)
 function prefTokens(list = MARKET_PREFERENCE) {
-  const base = [
-    "2h", "second half", "halftime", "live", "in game", "in-game",
-    "game line", "game", "line", "spread", "total"
-  ];
-  const extra = (list || "")
+  return (list || "")
     .split(",")
     .map(s => s.trim().toLowerCase())
     .filter(Boolean);
-  const uniq = new Set([...base, ...extra]);
-  return Array.from(uniq);
 }
 function textMatchesAny(text, tokens) {
   const t = norm(text);
   return tokens.some(tok => t.includes(tok));
 }
 
-// Extract from odds REST (accept preferred tokens first; fallback to generic Game/Line/Spread/Total)
+// Extract from odds REST (accept preferred tokens; if none, accept "Game Lines"/"Game")
 function liveFromOddsREST(oddsPayload, tokens) {
   const items = oddsPayload?.items || [];
   if (!items.length) return undefined;
@@ -129,30 +123,38 @@ function liveFromOddsREST(oddsPayload, tokens) {
   const firstBook = m => (m?.books?.[0] || {});
   const n = v => (v === null || v === undefined || v === "" ? "" : Number(v));
 
-  const chooseTyped = (words) => {
-    // Step 1: explicitly live/2H/halftime/in-game labeled markets
-    let candidates = items.filter(mk => {
-      const label = `${mk?.name || ""} ${mk?.displayName || ""} ${mk?.period?.displayName || ""} ${mk?.period?.abbreviation || ""}`;
-      return textMatchesAny(label, tokens);
+  // Build candidates: first try preferred tokens
+  let candidates = items.filter(mk => {
+    const label = `${mk?.name || ""} ${mk?.displayName || ""} ${mk?.period?.displayName || ""} ${mk?.period?.abbreviation || ""}`;
+    return textMatchesAny(label, tokens);
+  });
+
+  // If nothing matched preferences, try common live label “Game Lines / Game”
+  if (!candidates.length) {
+    candidates = items.filter(mk => {
+      const lbl = norm(`${mk?.name || ""} ${mk?.displayName || ""}`);
+      return lbl.includes("game lines") || lbl.includes("game line") || lbl.includes("game");
     });
-    // Step 2: fallback to anything that looks like a generic Game/Line/Spread/Total market
-    if (!candidates.length) {
-      candidates = items.filter(mk => {
-        const label = norm(`${mk?.name || ""} ${mk?.displayName || ""}`);
-        return /\b(game|line|spread|total)\b/.test(label);
-      });
-    }
-    const typed = candidates.filter(mk => {
+  }
+
+  // If still nothing, fall back to anything that smells like spread/total/line
+  if (!candidates.length) {
+    candidates = items.filter(mk => {
+      const s = norm(`${mk?.name || ""} ${mk?.displayName || ""}`);
+      return s.includes("spread") || s.includes("total") || s.includes("line") || s.includes("over") || s.includes("under");
+    });
+  }
+  if (!candidates.length) return undefined;
+
+  // Within the candidate set, prefer a spread market and a total market
+  const pickTyped = (list, words) =>
+    list.find(mk => {
       const s = norm(`${mk?.name || ""} ${mk?.displayName || ""}`);
       return words.some(w => s.includes(w));
-    });
-    return typed[0] || candidates[0];
-  };
+    }) || list[0];
 
-  const mSpread = chooseTyped(["spread", "line"]);
-  const mTotal  = chooseTyped(["total", "over", "under"]);
-
-  if (!mSpread && !mTotal) return undefined;
+  const mSpread = pickTyped(candidates, ["spread", "line"]);
+  const mTotal  = pickTyped(candidates, ["total", "over", "under"]);
 
   let spreadAway = "", spreadHome = "", mlAway = "", mlHome = "", total = "";
 
@@ -174,19 +176,16 @@ function liveFromOddsREST(oddsPayload, tokens) {
   return any ? { spreadAway, spreadHome, mlAway, mlHome, total } : undefined;
 }
 
-// Fallback: extract from summary pools (pickcenter/odds), again allowing generic labels
+// Fallback: extract from summary pools (pickcenter/odds), accept tokens or “Game Line”
 function liveFromSummaryPools(summary, tokens) {
   const pools = [];
   if (Array.isArray(summary?.pickcenter)) pools.push(...summary.pickcenter);
   if (Array.isArray(summary?.odds))       pools.push(...summary.odds);
   if (!pools.length) return undefined;
 
-  const labelOf = p => `${p?.details || ""} ${p?.name || ""} ${p?.period || ""}`; // e.g., "2nd Half Line", "Game Line"
-  // Prefer matches with our tokens, else accept a generic Game/Line/Spread/Total
+  const labelOf = p => `${p?.details || ""} ${p?.name || ""} ${p?.period || ""}`; // ESPN often uses "Game Line"
   let match = pools.find(p => textMatchesAny(labelOf(p), tokens));
-  if (!match) {
-    match = pools.find(p => /\b(game|line|spread|total)\b/i.test(labelOf(p)));
-  }
+  if (!match) match = pools.find(p => /\b(game line|game lines|game|line|lines)\b/i.test(labelOf(p)));
   if (!match) return undefined;
 
   const n = v => (v === null || v === undefined || v === "" ? "" : Number(v));
@@ -303,17 +302,17 @@ async function main() {
       // 2) LIVE ODDS
       let live = undefined;
 
-      // Try REST odds first (prefer live/2H labels, fallback to Game/Line/etc.)
+      // Try REST odds first (with debug of available market names)
       try {
         const odds = await espnOdds(t.id);
+        const names = (odds?.items || []).map(m => `${m?.name || ""}/${m?.displayName || ""}`).slice(0, 10);
+        if (names.length) console.log(`Markets for ${t.id}:`, names.join(" | "));
         live = liveFromOddsREST(odds, tokens);
-        // Optional debug:
-        // console.log(`Markets for ${t.id}:`, (odds?.items || []).map(m => `${m.name || ""} / ${m.displayName || ""}`).slice(0,6));
       } catch (e) {
         if (e?.response?.status !== 404) console.log(`Odds REST warn ${t.id}:`, e?.message || e);
       }
 
-      // Fallback to summary pools
+      // Fallback to summary pools (pickcenter/odds), accepting tokens or “Game Line”
       if (!live && summary) {
         const sLive = liveFromSummaryPools(summary, tokens);
         if (sLive) live = sLive;
@@ -327,7 +326,7 @@ async function main() {
         w(col.LH_ML, live.mlHome);
         w(col.L_TOT, live.total);
       } else {
-        console.log(`No live market accepted for ${t.id} (tokens="${MARKET_PREFERENCE}") — left M..Q as-is.`);
+        console.log(`No live market accepted for ${t.id} (pref="${MARKET_PREFERENCE}" + Game Lines fallback).`);
       }
     }
 
