@@ -1,6 +1,6 @@
 // live-game.mjs
-// Updates: Status (D), Half Score (L), and Live odds (M..Q) without touching pregame.
-// Debug envs: DEBUG_STATUS=1, DEBUG_LIVE=1 (optionally GAME_ID=... to isolate logs)
+// Updates Status, Half Score, and Live Odds (M..Q) for live games.
+// Debug mode and GAME_ID filtering supported.
 
 import axios from "axios";
 import { google } from "googleapis";
@@ -9,20 +9,18 @@ import { google } from "googleapis";
 const {
   GOOGLE_SHEET_ID,
   GOOGLE_SERVICE_ACCOUNT,
-  LEAGUE = "nfl", // "nfl" | "college-football"
-  TAB_NAME = (LEAGUE === "nfl" ? "NFL" : "CFB"),
+  LEAGUE = "nfl",
+  TAB_NAME = LEAGUE === "nfl" ? "NFL" : "CFB",
   GAME_ID = "",
   MARKET_PREFERENCE = "live,in-play,inplay,2h,second half,halftime",
-  DEBUG_STATUS = "",
-  DEBUG_LIVE = "",
+  DEBUG_MODE = "",
 } = process.env;
+
+const DEBUG = String(DEBUG_MODE).trim() === "1" || !!GAME_ID;
 
 for (const k of ["GOOGLE_SHEET_ID", "GOOGLE_SERVICE_ACCOUNT"]) {
   if (!process.env[k]) throw new Error(`Missing required env var: ${k}`);
 }
-
-const dbgS = Boolean(String(DEBUG_STATUS).trim());
-const dbgL = Boolean(String(DEBUG_LIVE).trim());
 
 /* ───────── Google Sheets ───────── */
 const svc = JSON.parse(GOOGLE_SERVICE_ACCOUNT);
@@ -48,7 +46,6 @@ function idxToA1(n0) {
   return s;
 }
 
-// Today key in US/Eastern (MM/DD/YY)
 const todayKey = (() => {
   const parts = new Intl.DateTimeFormat("en-US", {
     timeZone: "America/New_York",
@@ -62,131 +59,74 @@ const todayKey = (() => {
   return `${mm}/${dd}/${yy}`;
 })();
 
-function looksLiveStatus(s) {
-  const x = norm(s);
-  return (
-    /\bhalf\b/.test(x) ||
-    /\bin\s*progress\b/.test(x) ||
-    /\bq[1-4]\b/.test(x) ||
-    /\bot\b/.test(x) ||
-    /\blive\b/.test(x)
-  );
-}
-const isFinalCell = (s) => /^final$/i.test(String(s || ""));
+const looksLiveStatus = (s) =>
+  /\bhalf\b|\bin\s*progress\b|\bq[1-4]\b|\bot\b|\blive\b/i.test(s || "");
+const isFinalCell = (s) => /^final$/i.test(s || "");
 
-/* ===== ESPN fetchers ===== */
+/* ───────── ESPN FETCHERS ───────── */
 async function espnSummary(gameId) {
   const url = `https://site.api.espn.com/apis/site/v2/sports/football/${LEAGUE}/summary?event=${gameId}`;
+  if (DEBUG) console.log(`🔎 Fetching summary: ${url}`);
   const { data } = await axios.get(url, { timeout: 15000 });
   return data;
 }
 async function espnMarkets(gameId) {
   const url = `https://sports.core.api.espn.com/v2/markets?sport=football&league=${LEAGUE}&event=${gameId}`;
+  if (DEBUG) console.log(`🔎 Fetching markets: ${url}`);
   const { data } = await axios.get(url, { timeout: 15000 });
   return data;
 }
 async function fetchRefMaybe(ref) {
   if (!ref || typeof ref !== "string") return {};
   try {
-    const { data } = await axios.get(ref, { timeout: 12000 });
+    const { data } = await axios.get(ref, { timeout: 10000 });
     return data || {};
   } catch {
     return {};
   }
 }
 
-/* ===== Status + Half ===== */
-function periodName(n) {
-  return { 1: "1st", 2: "2nd", 3: "3rd", 4: "4th" }[n] || (n ? `Q${n}` : "");
-}
+/* ───────── STATUS / HALF SCORE ───────── */
+const periodName = (n) =>
+  ({ 1: "1st", 2: "2nd", 3: "3rd", 4: "4th" }[n] || (n ? `Q${n}` : ""));
 
-function formatStatusFromObj(st) {
+function formatStatus(st) {
   if (!st) return "";
-  const type = st.type || {};
-  const stateRaw =
-    type.state || type.name || st.state || st.name || type.id || "";
-  const state = norm(stateRaw);
-  const detail =
-    type.shortDetail || type.detail || type.description || st.detail || "";
-
+  const state = norm(st?.type?.state || st?.state || "");
   const clock = st.displayClock || st.clock || "";
-  const periodNum = st.period ?? st.periodNumber;
+  const period = st.period;
+  const detail =
+    st.type?.shortDetail || st.type?.detail || st.detail || st.description || "";
 
-  if (state === "pre" || state === "scheduled") {
-    try {
-      const iso =
-        st.startDate || st.date || st.gameTime || st.gameDate || undefined;
-      if (iso) {
-        const dt = new Date(iso);
-        const et = new Intl.DateTimeFormat("en-US", {
-          timeZone: "America/New_York",
-          hour: "numeric",
-          minute: "2-digit",
-          hour12: true,
-        }).format(dt);
-        return et;
-      }
-    } catch {}
-    return detail || "Scheduled";
-  }
-
-  if (
-    state === "in" ||
-    state === "inprogress" ||
-    state === "live" ||
-    /in[-\s]?progress/i.test(detail)
-  ) {
-    const p = periodName(periodNum);
-    if (clock && p) return `${clock} - ${p}`;
-    if (detail) return detail;
-    return "In Progress";
-  }
-
-  if (state === "halftime" || /halftime/i.test(detail)) return "Halftime";
-
-  if (state === "endperiod" || state === "endofperiod" || /end of/i.test(detail)) {
-    const p = periodName((periodNum || 0) - 1) || periodName(periodNum);
-    return p ? `End of ${p}` : detail || "End of period";
-  }
-
-  if (state === "final" || /final/i.test(detail)) return "Final";
-
-  return detail || "";
+  if (state === "inprogress" || state === "live" || /in\s*progress/i.test(detail))
+    return `${clock || ""} - ${periodName(period)}`;
+  if (state === "halftime") return "Halftime";
+  if (state === "endperiod" || /end of/i.test(detail))
+    return `End of ${periodName((period || 0) - 1)}`;
+  if (state === "final") return "Final";
+  if (state === "pre" || state === "scheduled")
+    return "Scheduled";
+  return detail || "In Progress";
 }
 
 function sumFirstTwoPeriods(linescores) {
-  if (!Array.isArray(linescores) || linescores.length === 0) return null;
-  const take = linescores.slice(0, 2);
-  let tot = 0;
-  for (const p of take) {
-    const v = Number(p?.value ?? p?.score ?? 0);
-    if (!Number.isFinite(v)) return null;
-    tot += v;
-  }
-  return tot;
+  if (!Array.isArray(linescores)) return null;
+  return linescores.slice(0, 2).reduce((a, p) => a + (Number(p?.value) || 0), 0);
 }
-function parseHalfScore(summary, gameId) {
+function parseHalfScore(summary) {
   try {
     const comp = summary?.header?.competitions?.[0];
     const home = comp?.competitors?.find((c) => c.homeAway === "home");
     const away = comp?.competitors?.find((c) => c.homeAway === "away");
     const hHome = sumFirstTwoPeriods(home?.linescores);
     const hAway = sumFirstTwoPeriods(away?.linescores);
-    if (dbgS) {
-      console.log(
-        `DEBUG[half] ${gameId}: linescores away=${JSON.stringify(
-          away?.linescores
-        )} home=${JSON.stringify(home?.linescores)} -> ${hAway}-${hHome}`
-      );
-    }
-    if (Number.isFinite(hHome) && Number.isFinite(hAway)) return `${hAway}-${hHome}`;
-  } catch (e) {
-    if (dbgS) console.log(`DEBUG[half] ${gameId} error:`, e?.message || e);
-  }
+    if (Number.isFinite(hHome) && Number.isFinite(hAway))
+      return `${hAway}-${hHome}`;
+  } catch {}
   return "";
 }
 
-/* ===== Markets ===== */
+/* ───────── MARKETS ───────── */
 const prefTokens = (list = MARKET_PREFERENCE) =>
   list.split(",").map((x) => x.trim().toLowerCase()).filter(Boolean);
 
@@ -196,106 +136,70 @@ function labelMatchesPreferred(mk, tokens) {
       mk?.period?.displayName || ""
     }`
   );
-  // hard "live" signal
-  if (/live/.test(l) || mk?.state === "LIVE" || mk?.inPlay === true) return true;
-  // accept open/in-progress states too (helps when label lacks "live")
-  if (mk?.state && /open|live|in[- ]?play/i.test(mk.state)) return true;
-  return tokens.some((tok) => l.includes(tok));
+  return (
+    /live|inplay|in-play/.test(l) ||
+    mk?.state === "LIVE" ||
+    mk?.inPlay === true ||
+    tokens.some((tok) => l.includes(tok))
+  );
 }
 
 async function extractFromMarket(market) {
-  const n = (v) => (v === null || v === undefined || v === "" ? "" : Number(v));
-  try {
-    const book0 = (market?.books && market.books[0]) || null;
-    const book = book0?.$ref ? await fetchRefMaybe(book0.$ref) : book0 || {};
-    const aw = book?.awayTeamOdds || {};
-    const hm = book?.homeTeamOdds || {};
-    return {
-      spreadAway: n(aw?.current?.spread ?? aw?.spread ?? book?.current?.spread),
-      spreadHome: n(
-        hm?.current?.spread ?? hm?.spread ?? (aw?.current?.spread != null || aw?.spread != null
-          ? -(aw?.current?.spread ?? aw?.spread)
-          : "")
-      ),
-      mlAway: n(aw?.current?.moneyLine ?? aw?.moneyLine),
-      mlHome: n(hm?.current?.moneyLine ?? hm?.moneyLine),
-      total: n(book?.current?.total ?? book?.total),
-      _book: {
-        aw, hm, cur: book?.current || {},
-      }
-    };
-  } catch {
-    return undefined;
-  }
+  const book0 = (market?.books && market.books[0]) || null;
+  const book = book0?.$ref ? await fetchRefMaybe(book0.$ref) : book0 || {};
+  const n = (v) => (v == null || v === "" ? "" : Number(v));
+  const aw = book?.awayTeamOdds || {};
+  const hm = book?.homeTeamOdds || {};
+  return {
+    spreadAway: n(aw?.current?.spread ?? aw?.spread),
+    spreadHome: n(hm?.current?.spread ?? hm?.spread),
+    mlAway: n(aw?.current?.moneyLine ?? aw?.moneyLine),
+    mlHome: n(hm?.current?.moneyLine ?? hm?.moneyLine),
+    total: n(book?.current?.total ?? book?.total),
+  };
 }
 
 async function pickLiveFromMarkets(allMarkets, tokens, gameId) {
   if (!Array.isArray(allMarkets) || !allMarkets.length) return undefined;
-
-  if (dbgL) {
-    console.log(`DEBUG[mkts] ${gameId}: found ${allMarkets.length} market(s).`);
-  }
-
   const liveMkts = allMarkets.filter((mk) => labelMatchesPreferred(mk, tokens));
-  if (dbgL) {
-    for (const mk of liveMkts) {
-      const firstBook = mk?.books?.[0] || {};
-      const tag = `${mk?.name || ""} | ${mk?.displayName || ""} | state=${mk?.state || ""} | period=${mk?.period?.displayName || ""}`;
-      console.log(`DEBUG[mkts] ${gameId}: candidate → ${tag}${firstBook?.$ref ? " (book ref)" : ""}`);
-      if (firstBook && !firstBook.$ref) {
-        console.log("DEBUG[mkts]    firstBook:", JSON.stringify(firstBook));
-      }
-    }
-  }
-  if (!liveMkts.length) return undefined;
 
-  const looks = (mk, words) => {
-    const s = norm(`${mk?.name || ""} ${mk?.displayName || ""}`);
-    return words.some((w) => s.includes(w));
-  };
-  const choose = (words) => liveMkts.find((mk) => looks(mk, words)) || liveMkts[0];
+  if (DEBUG)
+    console.log(
+      `🎯 ${gameId}: found ${liveMkts.length}/${allMarkets.length} markets labeled live.`
+    );
 
-  const mkSpread = choose(["spread", "line"]);
-  const mkTotal = choose(["total", "over", "under"]);
+  const looks = (mk, words) =>
+    words.some((w) =>
+      norm(`${mk?.name || ""} ${mk?.displayName || ""}`).includes(w)
+    );
 
-  let live = { spreadAway: "", spreadHome: "", mlAway: "", mlHome: "", total: "" };
+  const mkSpread =
+    liveMkts.find((m) => looks(m, ["spread", "line"])) || liveMkts[0];
+  const mkTotal =
+    liveMkts.find((m) => looks(m, ["total", "over", "under"])) || liveMkts[0];
 
-  if (mkSpread) {
-    const part = await extractFromMarket(mkSpread);
-    if (dbgL) {
-      console.log(`DEBUG[mkts] ${gameId}: picked SPREAD market "${mkSpread?.displayName || mkSpread?.name}" →`, part);
-    }
-    if (part) Object.assign(live, part);
-  }
-  if (mkTotal) {
-    const part = await extractFromMarket(mkTotal);
-    if (dbgL) {
-      console.log(`DEBUG[mkts] ${gameId}: picked TOTAL market "${mkTotal?.displayName || mkTotal?.name}" →`, part);
-    }
-    if (part && part.total !== "") live.total = part.total;
-  }
+  let final = {};
+  if (mkSpread) Object.assign(final, await extractFromMarket(mkSpread));
+  if (mkTotal) final.total = (await extractFromMarket(mkTotal))?.total || "";
 
-  const any = [live.spreadAway, live.spreadHome, live.mlAway, live.mlHome, live.total].some((v) => v !== "");
-  return any ? live : undefined;
+  if (
+    DEBUG &&
+    Object.values(final).some((v) => v !== "")
+  )
+    console.log("📊 Live market chosen:", JSON.stringify(final, null, 2));
+
+  return Object.values(final).some((v) => v !== "") ? final : undefined;
 }
 
-/* ===== Sheets ===== */
-function makeValue(range, val) {
-  return { range, values: [[val]] };
-}
-function a1For(row0, col0, tab = TAB_NAME) {
-  const row1 = row0 + 1;
-  const colA = idxToA1(col0);
-  return `${tab}!${colA}${row1}:${${colA}${row1}}`; // eslint shutup — template clarifier
-}
-function a1Cell(row0, col0, tab = TAB_NAME) {
-  const row1 = row0 + 1;
-  const colA = idxToA1(col0);
-  return `${tab}!${colA}${row1}:${colA}${row1}`;
-}
+/* ───────── SHEETS ───────── */
+const makeValue = (range, val) => ({ range, values: [[val]] });
+const a1 = (r, c) => `${TAB_NAME}!${idxToA1(c)}${r + 1}:${idxToA1(c)}${r + 1}`;
+
 async function getValues() {
-  const range = `${TAB_NAME}!A1:Q2000`;
-  const res = await sheets.spreadsheets.values.get({ spreadsheetId: GOOGLE_SHEET_ID, range });
+  const res = await sheets.spreadsheets.values.get({
+    spreadsheetId: GOOGLE_SHEET_ID,
+    range: `${TAB_NAME}!A1:Q2000`,
+  });
   return res.data.values || [];
 }
 function mapCols(header) {
@@ -317,122 +221,100 @@ function mapCols(header) {
   };
 }
 
-function chooseTargets(rows, col) {
-  const targets = [];
-  for (let r = 1; r < rows.length; r++) {
-    const row = rows[r] || [];
-    const id = (row[col.GAME_ID] || "").trim();
-    if (!id) continue;
-    const dateCell = (row[col.DATE] || "").trim();
-    const status = (row[col.STATUS] || "").trim();
-
-    if (isFinalCell(status)) continue;
-    if (GAME_ID && id === GAME_ID) {
-      targets.push({ r, id, reason: "GAME_ID" });
-      continue;
-    }
-    if (looksLiveStatus(status)) {
-      targets.push({ r, id, reason: "live-like status" });
-      continue;
-    }
-    if (dateCell === todayKey) {
-      targets.push({ r, id, reason: "today" });
-    }
-  }
-  return targets;
-}
-
-/* ===== MAIN ===== */
+/* ───────── MAIN ───────── */
 async function main() {
-  try {
-    const ts = new Date().toISOString();
-    const values = await getValues();
-    if (values.length === 0) return console.log(`[${ts}] Sheet empty—nothing to do.`);
-    const col = mapCols(values[0]);
-    const targets = chooseTargets(values, col);
-    if (targets.length === 0) return console.log(`[${ts}] Nothing to update.`);
+  const ts = new Date().toISOString();
+  const values = await getValues();
+  if (values.length === 0) return console.log(`[${ts}] Sheet empty.`);
+  const col = mapCols(values[0]);
+  const rows = values.slice(1);
 
-    const tokens = prefTokens(MARKET_PREFERENCE);
-    const data = [];
+  const targets = rows
+    .map((r, i) => {
+      const id = (r[col.GAME_ID] || "").trim();
+      const date = (r[col.DATE] || "").trim();
+      const status = (r[col.STATUS] || "").trim();
+      if (!id) return null;
+      if (GAME_ID && id !== GAME_ID) return null;
+      if (isFinalCell(status)) return null;
+      if (looksLiveStatus(status) || date === todayKey)
+        return { r: i + 1, id };
+      return null;
+    })
+    .filter(Boolean);
 
-    for (const t of targets) {
-      const curStatus = values[t.r]?.[col.STATUS] || "";
-      if (isFinalCell(curStatus)) continue;
+  if (!targets.length)
+    return console.log(`[${ts}] No matching targets (GAME_ID=${GAME_ID || "ALL"})`);
 
-      // 1) STATUS + HALF
-      let summary;
-      try {
-        summary = await espnSummary(t.id);
-        const comp = summary?.header?.competitions?.[0] || {};
-        const stObj =
-          comp.status ||
-          summary?.header?.status ||
-          comp?.statusType ||
-          {};
-        const statusText =
-          formatStatusFromObj(stObj) ||
-          formatStatusFromObj(summary?.header?.status) ||
-          comp?.status?.type?.shortDetail ||
-          comp?.status?.type?.detail ||
-          "";
+  console.log(
+    `[${ts}] Found ${targets.length} game(s) to update: ${targets
+      .map((t) => t.id)
+      .join(", ")}`
+  );
 
-        const half = parseHalfScore(summary, t.id);
+  const tokens = prefTokens(MARKET_PREFERENCE);
+  const data = [];
 
-        if (dbgS) {
-          console.log(`DEBUG[status] ${t.id}: raw state=${stObj?.type?.state || stObj?.state || ""}, clock=${stObj?.displayClock || ""}, period=${stObj?.period ?? ""}, shortDetail=${stObj?.type?.shortDetail || ""} -> "${statusText}"`);
-        }
+  for (const t of targets) {
+    console.log(`\n=== 🏈 GAME ${t.id} ===`);
+    let summary;
+    try {
+      summary = await espnSummary(t.id);
+      const stObj =
+        summary?.header?.competitions?.[0]?.status || summary?.header?.status;
+      const newStatus = formatStatus(stObj);
+      const half = parseHalfScore(summary);
 
-        if (statusText && statusText !== curStatus)
-          data.push(makeValue(a1Cell(t.r, col.STATUS), statusText));
-        if (half) data.push(makeValue(a1Cell(t.r, col.HALF), half));
-      } catch (e) {
-        console.log(`Summary warn ${t.id}:`, e?.message || e);
+      if (DEBUG) {
+        console.log("Status object:", stObj);
+        console.log(`→ Parsed status="${newStatus}", half="${half}"`);
       }
 
-      // 2) LIVE ODDS
-      try {
-        const marketsRoot = await espnMarkets(t.id);
-        const items = Array.isArray(marketsRoot?.items) ? marketsRoot.items : [];
-        const markets = [];
-        for (const itm of items) {
-          if (itm?.$ref) {
-            const m = await fetchRefMaybe(itm.$ref);
-            if (m && Object.keys(m).length) markets.push(m);
-          } else if (itm) {
-            markets.push(itm);
-          }
-        }
-        const live = await pickLiveFromMarkets(markets, tokens, t.id);
-        if (live) {
-          const w = (c, v) => {
-            if (v !== "" && Number.isFinite(Number(v)))
-              data.push(makeValue(a1Cell(t.r, c), Number(v)));
-          };
-          w(col.LA_S, live.spreadAway);
-          w(col.LA_ML, live.mlAway);
-          w(col.LH_S, live.spreadHome);
-          w(col.LH_ML, live.mlHome);
-          w(col.L_TOT, live.total);
-        } else if (dbgL) {
-          console.log(`DEBUG[mkts] ${t.id}: no acceptable live market after filtering.`);
-        }
-      } catch (e) {
-        console.log(`Markets warn ${t.id}:`, e?.message || e);
-      }
+      if (newStatus) data.push(makeValue(a1(t.r, col.STATUS), newStatus));
+      if (half) data.push(makeValue(a1(t.r, col.HALF), half));
+    } catch (e) {
+      console.log(`Summary fetch failed ${t.id}: ${e.message}`);
     }
 
-    if (!data.length)
-      return console.log(`[${new Date().toISOString()}] Built 0 updates across ${targets.length} games.`);
-
-    await sheets.spreadsheets.values.batchUpdate({
-      spreadsheetId: GOOGLE_SHEET_ID,
-      requestBody: { valueInputOption: "USER_ENTERED", data },
-    });
-    console.log(`[${ts}] Updated ${targets.length} row(s). ${data.length} cells written.`);
-  } catch (err) {
-    console.error("Live updater fatal:", err);
-    process.exit(1);
+    try {
+      const marketsRoot = await espnMarkets(t.id);
+      const items = Array.isArray(marketsRoot?.items) ? marketsRoot.items : [];
+      const markets = [];
+      for (const itm of items) {
+        if (itm?.$ref) {
+          const m = await fetchRefMaybe(itm.$ref);
+          if (m && Object.keys(m).length) markets.push(m);
+        } else markets.push(itm);
+      }
+      const live = await pickLiveFromMarkets(markets, tokens, t.id);
+      if (live) {
+        const write = (c, v) =>
+          v !== "" && Number.isFinite(Number(v))
+            ? data.push(makeValue(a1(t.r, c), Number(v)))
+            : null;
+        write(col.LA_S, live.spreadAway);
+        write(col.LA_ML, live.mlAway);
+        write(col.LH_S, live.spreadHome);
+        write(col.LH_ML, live.mlHome);
+        write(col.L_TOT, live.total);
+      } else {
+        console.log(`⚠️ No live market found for ${t.id}`);
+      }
+    } catch (e) {
+      console.log(`Markets fetch failed ${t.id}: ${e.message}`);
+    }
   }
+
+  if (!data.length) return console.log(`No updates applied.`);
+
+  await sheets.spreadsheets.values.batchUpdate({
+    spreadsheetId: GOOGLE_SHEET_ID,
+    requestBody: { valueInputOption: "USER_ENTERED", data },
+  });
+  console.log(`✅ Updated ${data.length} cell(s).`);
 }
 
-main();
+main().catch((err) => {
+  console.error("Fatal error:", err);
+  process.exit(1);
+});
