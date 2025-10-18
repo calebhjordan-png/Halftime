@@ -128,12 +128,17 @@ const leaguePath = () => LEAGUE==="college-football" ? "football/college-footbal
 async function fetchScoreboard(){
   const url=`https://site.api.espn.com/apis/site/v2/sports/${leaguePath()}/scoreboard`;
   const params = {};
+
+  // 👇 This ensures we get the full FBS schedule, not just Top 25
   if (LEAGUE === "college-football") {
-    params.groups = "80";   // FBS only
-    params.limit  = 300;    // plenty
+    params.groups = "80";   // FBS group
+    params.limit  = 300;    // plenty for full slate
   }
-  const {data}=await axios.get(url,{ timeout:15000, params });
+
+  const { data } = await axios.get(url, { timeout: 15000, params });
   return data;
+}
+
 }
 
 function pickProvider(oddsArr){
@@ -387,3 +392,4 @@ main().catch(err => {
   console.error("Orchestrator fatal:", err?.response?.status ? `HTTP ${err.response.status}` : err);
   process.exit(1);
 });
+
