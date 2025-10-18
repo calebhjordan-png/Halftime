@@ -1,7 +1,7 @@
 // live-game.mjs
 // Updates only: Status (D), Half Score (L), Live odds (M..Q).
 // Leaves pregame columns untouched. Supports optional GAME_ID focus.
-// Pulls "live-ish" odds by expanding ESPN v2 odds links ($ref).
+// Live odds pulled from ESPN BET (Core Markets API), with fallbacks.
 
 import axios from "axios";
 import { google } from "googleapis";
@@ -10,10 +10,10 @@ import { google } from "googleapis";
 const {
   GOOGLE_SHEET_ID,
   GOOGLE_SERVICE_ACCOUNT,
-  LEAGUE = "nfl",                                   // "nfl" | "college-football"
+  LEAGUE = "nfl",                                 // "nfl" | "college-football"
   TAB_NAME = (LEAGUE === "nfl" ? "NFL" : "CFB"),
-  GAME_ID = "",                                     // optional: only update this game
-  MARKET_PREFERENCE = "2H,Second Half,Halftime,Live,In-Game",
+  GAME_ID = "",                                   // optional: only update this game
+  MARKET_PREFERENCE = "2H,Second Half,Halftime,Live",
 } = process.env;
 
 for (const k of ["GOOGLE_SHEET_ID", "GOOGLE_SERVICE_ACCOUNT"]) {
@@ -31,9 +31,21 @@ const jwt = new google.auth.JWT(
 const sheets = google.sheets({ version: "v4", auth: jwt });
 
 /* ───────────────────────────── Helpers ───────────────────────────── */
+const norm = (s) => (s || "").toLowerCase();
+const tokensFromPref = (list = MARKET_PREFERENCE) =>
+  (list || "")
+    .split(",")
+    .map((s) => s.trim().toLowerCase())
+    .filter(Boolean);
+
 function idxToA1(n0) {
-  let n = n0 + 1, s = "";
-  while (n > 0) { n--; s = String.fromCharCode(65 + (n % 26)) + s; n = Math.floor(n / 26); }
+  let n = n0 + 1,
+    s = "";
+  while (n > 0) {
+    n--;
+    s = String.fromCharCode(65 + (n % 26)) + s;
+    n = Math.floor(n / 26);
+  }
   return s;
 }
 
@@ -41,22 +53,29 @@ function idxToA1(n0) {
 const todayKey = (() => {
   const parts = new Intl.DateTimeFormat("en-US", {
     timeZone: "America/New_York",
-    month: "2-digit", day: "2-digit", year: "2-digit",
+    month: "2-digit",
+    day: "2-digit",
+    year: "2-digit",
   }).formatToParts(new Date());
-  const mm = parts.find(p => p.type === "month")?.value ?? "00";
-  const dd = parts.find(p => p.type === "day")?.value ?? "00";
-  const yy = parts.find(p => p.type === "year")?.value ?? "00";
+  const mm = parts.find((p) => p.type === "month")?.value ?? "00";
+  const dd = parts.find((p) => p.type === "day")?.value ?? "00";
+  const yy = parts.find((p) => p.type === "year")?.value ?? "00";
   return `${mm}/${dd}/${yy}`;
 })();
 
-const norm = s => (s || "").toLowerCase();
 function looksLiveStatus(s) {
   const x = norm(s);
-  return /\bhalf\b/.test(x) || /\bin\s*progress\b/.test(x) || /\bq[1-4]\b/.test(x) || /\bot\b/.test(x) || /\blive\b/.test(x);
+  return (
+    /\bhalf\b/.test(x) ||
+    /\bin\s*progress\b/.test(x) ||
+    /\bq[1-4]\b/.test(x) ||
+    /\bot\b/.test(x) ||
+    /\blive\b/.test(x)
+  );
 }
-const isFinalCell = s => /^final$/i.test(String(s || ""));
+const isFinalCell = (s) => /^final$/i.test(String(s || ""));
 
-// ESPN status helpers
+// status helpers (from /summary)
 function shortStatusFromEspn(statusObj) {
   const t = statusObj?.type || {};
   return t.shortDetail || t.detail || t.description || "In Progress";
@@ -80,8 +99,8 @@ function sumFirstTwoPeriods(linescores) {
 function parseHalfScore(summary) {
   try {
     const comp = summary?.header?.competitions?.[0];
-    const home = comp?.competitors?.find(c => c.homeAway === "home");
-    const away = comp?.competitors?.find(c => c.homeAway === "away");
+    const home = comp?.competitors?.find((c) => c.homeAway === "home");
+    const away = comp?.competitors?.find((c) => c.homeAway === "away");
     const hHome = sumFirstTwoPeriods(home?.linescores);
     const hAway = sumFirstTwoPeriods(away?.linescores);
     if (Number.isFinite(hHome) && Number.isFinite(hAway)) return `${hAway}-${hHome}`; // away-first
@@ -90,175 +109,156 @@ function parseHalfScore(summary) {
 }
 
 /* ───────────────────────── ESPN fetchers ─────────────────────────── */
-const AX = axios.create({ timeout: 15000 });
+const SPORT = "football";
+const LCODE = LEAGUE; // "nfl" | "college-football"
 
+// Basic safe fetch with timeout & cache-buster support
+async function getJson(url, params = {}, timeout = 15000) {
+  const { data } = await axios.get(url, {
+    timeout,
+    params,
+    headers: { "User-Agent": "halftime-updater/1.0" },
+  });
+  return data;
+}
+
+// /summary (cache-busted)
 async function espnSummary(gameId) {
-  const url = `https://site.api.espn.com/apis/site/v2/sports/football/${LEAGUE}/summary?event=${gameId}`;
-  const { data } = await AX.get(url);
-  return data;
+  const url = `https://site.api.espn.com/apis/site/v2/sports/${SPORT}/${LCODE}/summary`;
+  return getJson(url, { event: gameId, _cb: Date.now() });
 }
 
-// IMPORTANT: v2 odds returns a collection of links. We must follow $ref to expand.
-async function espnOddsRoot(gameId) {
-  const url = `https://sports.core.api.espn.com/v2/sports/football/${LEAGUE}/events/${gameId}/competitions/${gameId}/odds?region=us&lang=en`;
-  const { data } = await AX.get(url);
-  return data; // { items: [ { $ref }, ... ] } typically
-}
+// ESPN Core Markets (ESPN BET source)
+// 1) list markets for event
+// 2) dereference items -> market objects
+// 3) dereference books for provider "ESPN BET"
+async function coreMarketsForEvent(gameId) {
+  const base = `https://sports.core.api.espn.com/v2/markets`;
+  const list = await getJson(base, { sport: SPORT, league: LCODE, event: gameId, region: "us", lang: "en" });
 
-// Safe JSON fetcher for $ref links with a small per-game budget
-async function deref(url) {
-  const { data } = await AX.get(url);
-  return data;
-}
+  const items = Array.isArray(list?.items) ? list.items : [];
+  const deref = async (ref) => {
+    if (!ref) return null;
+    if (typeof ref === "string") return getJson(ref);
+    if (ref.$ref) return getJson(ref.$ref);
+    return ref;
+  };
 
-/* ─────────────── Live market selection & parsing ─────────────────── */
-const wantTokens = (list = MARKET_PREFERENCE) =>
-  (list || "")
-    .split(",")
-    .map(s => s.trim().toLowerCase())
-    .filter(Boolean);
-
-const labelOfMarket = (m) =>
-  `${m?.name || ""} ${m?.displayName || ""} ${m?.period?.displayName || ""} ${m?.period?.abbreviation || ""}`;
-
-function matchesTokens(text, tokens) {
-  const t = norm(text);
-  return tokens.some(tok => t.includes(tok));
-}
-
-const N_BUDGET = 10; // max follow requests per game to keep it light
-
-async function expandOddsMarkets(oddsRoot) {
-  // Returns a list of fully-expanded market objects with books -> teamOdds.
-  const items = oddsRoot?.items || [];
-  if (!items.length) return [];
-
+  // deref every market
   const markets = [];
-  let budget = N_BUDGET;
-
   for (const it of items) {
-    if (budget <= 0) break;
-    const ref = it?.$ref || it?.ref || it?.href;
-    if (!ref) continue;
-
-    let market;
-    try {
-      market = await deref(ref); // market object
-      budget--;
-    } catch { continue; }
-
-    // expand books
-    let books = market?.books;
-    if (books?.$ref) {
-      if (budget <= 0) break;
-      try {
-        const coll = await deref(books.$ref); // collection
-        budget--;
-        const expanded = [];
-        for (const bi of coll?.items || []) {
-          if (budget <= 0) break;
-          const bref = bi?.$ref || bi?.ref || bi?.href;
-          if (!bref) continue;
-          try {
-            const book = await deref(bref);
-            budget--;
-            // expand away/home odds if they’re links
-            const expandTeamOdds = async (key) => {
-              const t = book?.[key];
-              if (t && t.$ref) {
-                if (budget <= 0) return t; // out of budget, leave as-is
-                const td = await deref(t.$ref);
-                budget--;
-                return td;
-              }
-              return t || {};
-            };
-            const awayTeamOdds = await expandTeamOdds("awayTeamOdds");
-            const homeTeamOdds = await expandTeamOdds("homeTeamOdds");
-            expanded.push({ ...book, awayTeamOdds, homeTeamOdds });
-          } catch { /* ignore */ }
-        }
-        books = expanded;
-      } catch { /* ignore collection fetch errors */ }
-    } else if (Array.isArray(books)) {
-      // best effort: ensure sublinks (rare in this layout)
-      // leave as-is
-    }
-
-    markets.push({ ...market, books: Array.isArray(books) ? books : [] });
-    if (budget <= 0) break;
+    const mk = await deref(it);
+    if (mk) markets.push(mk);
   }
-
   return markets;
 }
 
-function pickLiveFromExpanded(markets, tokens) {
-  if (!markets.length) return undefined;
+async function fetchEspnBetBooks(market) {
+  // books can be array of refs or a single ref
+  const booksField = market?.books;
+  if (!booksField) return [];
 
-  // Filter to markets whose label matches tokens; otherwise fall back to anything sensible.
-  const liveCands = markets.filter(m => matchesTokens(labelOfMarket(m), tokens));
-  const pool = liveCands.length ? liveCands : markets;
+  const refs = [];
+  if (Array.isArray(booksField)) refs.push(...booksField);
+  else refs.push(booksField);
 
-  const looks = (m, words) => words.some(w => norm(`${m?.name || ""} ${m?.displayName || ""}`).includes(w));
-  const choose = (words) => {
-    const typed = pool.filter(m => looks(m, words));
-    return (typed[0] || pool[0]);
-  };
-
-  const mSpread = choose(["spread", "line"]);
-  const mTotal  = choose(["total", "over", "under"]);
-
-  const firstBook = (m) => (m?.books && m.books[0]) || null;
-  const n = (v) => (v === null || v === undefined || v === "" ? "" : Number(v));
-
-  let spreadAway="", spreadHome="", mlAway="", mlHome="", total="";
-
-  if (mSpread) {
-    const b = firstBook(mSpread) || {};
-    const aw = b.awayTeamOdds || {};
-    const hm = b.homeTeamOdds || {};
-    spreadAway = n(aw?.current?.spread ?? aw?.spread ?? b?.current?.spread);
-    spreadHome = n(hm?.current?.spread ?? hm?.spread ?? (spreadAway !== "" ? -spreadAway : ""));
-    mlAway     = n(aw?.current?.moneyLine ?? aw?.moneyLine);
-    mlHome     = n(hm?.current?.moneyLine ?? hm?.moneyLine);
+  const books = [];
+  for (const r of refs) {
+    const b = await (typeof r === "string" ? getJson(r) : r.$ref ? getJson(r.$ref) : r);
+    if (b) books.push(b);
   }
-  if (mTotal) {
-    const b = firstBook(mTotal) || {};
-    total = n(b?.current?.total ?? b?.total);
-  }
-
-  const any = [spreadAway, spreadHome, mlAway, mlHome, total].some(v => v !== "");
-  return any ? { spreadAway, spreadHome, mlAway, mlHome, total } : undefined;
+  // Keep only ESPN BET
+  return books.filter((b) => norm(b?.provider?.name) === "espn bet" || norm(b?.provider?.id) === "espnbet");
 }
 
-// Fallback: extract from summary pools (pickcenter/odds), again with token filter if possible
-function liveFromSummaryPools(summary, tokens) {
-  const pools = [];
-  if (Array.isArray(summary?.pickcenter)) pools.push(...summary.pickcenter);
-  if (Array.isArray(summary?.odds))       pools.push(...summary.odds);
-  if (!pools.length) return undefined;
+// Robust number getter (first numeric)
+function num(...candidates) {
+  for (const v of candidates) {
+    if (v === "" || v === null || v === undefined) continue;
+    const n = Number(v);
+    if (Number.isFinite(n)) return n;
+  }
+  return "";
+}
 
-  const labelOf = p => `${p?.details || ""} ${p?.name || ""} ${p?.period || ""}`;
-  const liveish = pools.filter(p => matchesTokens(labelOf(p), tokens));
-  const pick = (liveish[0] || pools[0]);
-  if (!pick) return undefined;
+// Try to extract spread/ML/total from a book object that might have different shapes
+function extractFromBook(book) {
+  // Common (odds tree) shape
+  const aw = book?.awayTeamOdds || {};
+  const hm = book?.homeTeamOdds || {};
+  const spreadAway =
+    num(aw?.current?.spread, aw?.spread, book?.current?.spread);
+  const spreadHome =
+    num(hm?.current?.spread, hm?.spread, spreadAway !== "" ? -spreadAway : "");
+  const mlAway = num(aw?.current?.moneyLine, aw?.moneyLine);
+  const mlHome = num(hm?.current?.moneyLine, hm?.moneyLine);
+  const total = num(book?.current?.total, book?.total, book?.overUnder);
 
-  const n = v => (v === null || v === undefined || v === "" ? "" : Number(v));
-  const aw = pick?.awayTeamOdds || {};
-  const hm = pick?.homeTeamOdds || {};
+  // If this yielded anything, use it
+  if ([spreadAway, spreadHome, mlAway, mlHome, total].some((v) => v !== "")) {
+    return { spreadAway, spreadHome, mlAway, mlHome, total };
+  }
 
-  const spreadAway = n(aw?.spread);
-  const spreadHome = n(hm?.spread ?? (spreadAway !== "" ? -spreadAway : ""));
-  const mlAway     = n(aw?.moneyLine);
-  const mlHome     = n(hm?.moneyLine);
-  const total      = n(pick?.overUnder ?? pick?.total);
+  // Alternative: outcome-based payloads
+  // book.outcomes = [{type:'spread'|'total'|'moneyline', team:{...}, price:{american}, point}]
+  const outcomes = Array.isArray(book?.outcomes) ? book.outcomes : [];
+  if (outcomes.length) {
+    let sA = "", sH = "", mA = "", mH = "", tT = "";
 
-  const any = [spreadAway, spreadHome, mlAway, mlHome, total].some(v => v !== "");
-  return any ? { spreadAway, spreadHome, mlAway, mlHome, total } : undefined;
+    for (const o of outcomes) {
+      const t = norm(o?.type || o?.betType || "");
+      const side = norm(o?.side || o?.team?.homeAway || "");
+      if (t.includes("spread")) {
+        if (side === "away") sA = num(sA, o?.point);
+        if (side === "home") sH = num(sH, o?.point);
+      } else if (t.includes("money")) {
+        const am = num(o?.price?.american, o?.price);
+        if (side === "away") mA = num(mA, am);
+        if (side === "home") mH = num(mH, am);
+      } else if (t.includes("total") || t.includes("over/under")) {
+        tT = num(tT, o?.point);
+      }
+    }
+    if ([sA, sH, mA, mH, tT].some((v) => v !== "")) {
+      // if only one spread is present, mirror sign
+      if (sA !== "" && sH === "") sH = -sA;
+      if (sH !== "" && sA === "") sA = -sH;
+      return { spreadAway: sA, spreadHome: sH, mlAway: mA, mlHome: mH, total: tT };
+    }
+  }
+
+  return { spreadAway: "", spreadHome: "", mlAway: "", mlHome: "", total: "" };
+}
+
+// Choose the best ESPN BET market/book for LIVE numbers
+function chooseEspnBetLiveBook(markets, prefTokensArr) {
+  // Filter to markets whose label hints at live/2H/etc
+  const looksLiveMarket = (mk) => {
+    const label = `${mk?.name || ""} ${mk?.displayName || ""} ${mk?.period?.displayName || ""} ${mk?.period?.abbreviation || ""}`;
+    return prefTokensArr.some((tok) => norm(label).includes(tok)) || norm(mk?.state) === "live";
+  };
+
+  const preferred = markets.filter(looksLiveMarket);
+  const pool = preferred.length ? preferred : markets;
+
+  // Within pool, require ESPN BET books and pick first with extractable numbers
+  for (const mk of pool) {
+    // eslint-disable-next-line no-await-in-loop
+    const books = await fetchEspnBetBooks(mk);
+    for (const b of books) {
+      const parsed = extractFromBook(b);
+      if ([parsed.spreadAway, parsed.spreadHome, parsed.mlAway, parsed.mlHome, parsed.total].some((v) => v !== "")) {
+        return parsed;
+      }
+    }
+  }
+  return undefined;
 }
 
 /* ─────────────────────── values/A1 helpers ───────────────────────── */
-function makeValue(range, val) { return { range, values: [[val]] }; }
+function makeValue(range, val) {
+  return { range, values: [[val]] };
+}
 function a1For(row0, col0, tab = TAB_NAME) {
   const row1 = row0 + 1;
   const colA = idxToA1(col0);
@@ -266,15 +266,18 @@ function a1For(row0, col0, tab = TAB_NAME) {
 }
 async function getValues() {
   const range = `${TAB_NAME}!A1:Q2000`;
-  const res = await sheets.spreadsheets.values.get({ spreadsheetId: GOOGLE_SHEET_ID, range });
+  const res = await sheets.spreadsheets.values.get({
+    spreadsheetId: GOOGLE_SHEET_ID,
+    range,
+  });
   return res.data.values || [];
 }
 function mapCols(header) {
-  const lower = s => (s || "").trim().toLowerCase();
+  const lower = (s) => (s || "").trim().toLowerCase();
   const find = (name, fb) => {
-    const i = header.findIndex(h => lower(h) === lower(name));
+    const i = header.findIndex((h) => lower(h) === lower(name));
     return i >= 0 ? i : fb;
-  };
+    };
   return {
     GAME_ID: find("Game ID", 0),
     DATE: find("Date", 1),
@@ -296,8 +299,8 @@ function chooseTargets(rows, col) {
     const id = (row[col.GAME_ID] || "").trim();
     if (!id) continue;
 
-    const dateCell = (row[col.DATE] || "").trim();   // MM/DD/YY
-    const status   = (row[col.STATUS] || "").trim();
+    const dateCell = (row[col.DATE] || "").trim(); // MM/DD/YY
+    const status = (row[col.STATUS] || "").trim();
 
     if (isFinalCell(status)) continue;
 
@@ -321,13 +324,19 @@ async function main() {
   try {
     const ts = new Date().toISOString();
     const values = await getValues();
-    if (values.length === 0) { console.log(`[${ts}] Sheet empty—nothing to do.`); return; }
+    if (values.length === 0) {
+      console.log(`[${ts}] Sheet empty—nothing to do.`);
+      return;
+    }
 
     const col = mapCols(values[0]);
     const targets = chooseTargets(values, col);
-    if (targets.length === 0) { console.log(`[${ts}] Nothing to update.`); return; }
+    if (targets.length === 0) {
+      console.log(`[${ts}] Nothing to update.`);
+      return;
+    }
 
-    const tokens = wantTokens(MARKET_PREFERENCE);
+    const pref = tokensFromPref(MARKET_PREFERENCE);
     const data = [];
 
     for (const t of targets) {
@@ -336,49 +345,60 @@ async function main() {
 
       // 1) STATUS + HALF
       let summary;
+      let liveish = looksLiveStatus(currentStatus);
       try {
         summary = await espnSummary(t.id);
         const compStatus = summary?.header?.competitions?.[0]?.status;
-        const newStatus  = shortStatusFromEspn(compStatus);
-        const nowFinal   = isFinalFromEspn(compStatus);
+        const newStatus = shortStatusFromEspn(compStatus);
+        const nowFinal = isFinalFromEspn(compStatus);
 
         if (newStatus && newStatus !== currentStatus) {
           data.push(makeValue(a1For(t.r, col.STATUS), newStatus));
         }
         const half = parseHalfScore(summary);
         if (half) data.push(makeValue(a1For(t.r, col.HALF), half));
-        if (nowFinal) continue; // stop live odds if Final
+
+        // set liveish if period indicates game has started
+        const period = Number(summary?.header?.period || summary?.header?.competitions?.[0]?.status?.period || 0);
+        if (period > 0) liveish = true;
+
+        if (nowFinal) {
+          // no live odds if Final
+          continue;
+        }
       } catch (e) {
         if (e?.response?.status !== 404) {
           console.log(`Summary warn ${t.id}:`, e?.message || e);
         }
       }
 
-      // 2) LIVE ODDS via v2 odds (expanded)
-      let live = undefined;
+      // Only write live odds when we believe the game is live (or GAME_ID explicitly provided)
+      if (!liveish && !GAME_ID) continue;
+
+      // 2) LIVE ODDS from ESPN BET (Core Markets)
       try {
-        const root = await espnOddsRoot(t.id);
-        const expanded = await expandOddsMarkets(root);
-        live = pickLiveFromExpanded(expanded, tokens);
+        const markets = await coreMarketsForEvent(t.id);
+        let live = await chooseEspnBetLiveBook(markets, pref);
+
+        // If nothing matched preferred tokens, try again with a very permissive pass
+        if (!live) {
+          live = await chooseEspnBetLiveBook(markets, ["live", "line", "spread", "total"]);
+        }
+
+        if (live) {
+          const w = (c, v) => {
+            if (v !== "" && Number.isFinite(Number(v))) data.push(makeValue(a1For(t.r, c), Number(v)));
+          };
+          w(col.LA_S, live.spreadAway);
+          w(col.LA_ML, live.mlAway);
+          w(col.LH_S, live.spreadHome);
+          w(col.LH_ML, live.mlHome);
+          w(col.L_TOT, live.total);
+        } else {
+          console.log(`No ESPN BET live market found for ${t.id} — left M..Q as-is.`);
+        }
       } catch (e) {
-        if (e?.response?.status !== 404) console.log(`Odds v2 warn ${t.id}:`, e?.message || e);
-      }
-
-      // Fallback to summary pools
-      if (!live && summary) {
-        const sLive = liveFromSummaryPools(summary, tokens);
-        if (sLive) live = sLive;
-      }
-
-      if (live) {
-        const w = (c, v) => { if (v !== "" && Number.isFinite(Number(v))) data.push(makeValue(a1For(t.r, c), Number(v))); };
-        w(col.LA_S,  live.spreadAway);
-        w(col.LA_ML, live.mlAway);
-        w(col.LH_S,  live.spreadHome);
-        w(col.LH_ML, live.mlHome);
-        w(col.L_TOT, live.total);
-      } else {
-        console.log(`No live market found/accepted for ${t.id} (tokens="${MARKET_PREFERENCE}") — left M..Q as-is.`);
+        console.log(`Markets warn ${t.id}:`, e?.message || e);
       }
     }
 
@@ -394,7 +414,7 @@ async function main() {
 
     console.log(
       `[${ts}] Updated ${targets.length} row(s). Wrote ${data.length} cell update(s). ` +
-      `Targets: ${targets.map(t => `${t.id}(${t.reason})`).join(", ")}`
+        `Targets: ${targets.map((t) => `${t.id}(${t.reason})`).join(", ")}`
     );
   } catch (err) {
     const code = err?.response?.status || err?.code || err?.message || err;
