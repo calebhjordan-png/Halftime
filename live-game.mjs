@@ -227,11 +227,11 @@ function chooseTargets(rows, col) {
       continue;
     }
 
-    // Also include rows scheduled for today (helps catch rows where status never moved off kickoff time)
-    if (dateCell === todayKey) {
-      targets.push({ r, id, reason: "today" });
-    }
-  }
+   // Only consider rows whose Date == today (ET) and not Final
+if (dateCell === todayKey && status.toLowerCase() !== "final") {
+  targets.push({ r, id, reason: "today" });
+}
+
   return targets;
 }
 
