@@ -1,10 +1,6 @@
 // live-game.mjs
-// Updates: Status (D), Half Score (L), and Live odds (M..Q) from the ESPN BET
-// widget on the game page. Pregame columns are left untouched.
-//
-// Tips:
-// - Set GAME_ID to focus one game (handy for debugging).
-// - Set DEBUG_MODE=1 to see detailed logs in Actions.
+// Status (D), Half Score (L), Live odds (M..Q) from ESPN BET widget.
+// Pregame columns untouched. Supports GAME_ID focus + DEBUG_MODE logs.
 
 import axios from "axios";
 import { google } from "googleapis";
@@ -15,8 +11,8 @@ const {
   GOOGLE_SERVICE_ACCOUNT,
   LEAGUE = "college-football",                 // "nfl" | "college-football"
   TAB_NAME = (LEAGUE === "nfl" ? "NFL" : "CFB"),
-  GAME_ID = "",                                // optional: only update this game
-  DEBUG_MODE = "",                             // "1" to enable verbose logging
+  GAME_ID = "",
+  DEBUG_MODE = "",
 } = process.env;
 
 const DBG = String(DEBUG_MODE).trim() === "1";
@@ -36,14 +32,13 @@ const jwt = new google.auth.JWT(
 );
 const sheets = google.sheets({ version: "v4", auth: jwt });
 
-/* ───────────────────────────── Helpers ───────────────────────────── */
+/* ───────────────────────── Helpers ───────────────────────── */
 function idxToA1(n0) {
   let n = n0 + 1, s = "";
   while (n > 0) { n--; s = String.fromCharCode(65 + (n % 26)) + s; n = Math.floor(n / 26); }
   return s;
 }
 
-// Today key in **US/Eastern** to match the sheet’s date in column B
 const todayKey = (() => {
   const parts = new Intl.DateTimeFormat("en-US", {
     timeZone: "America/New_York",
@@ -62,7 +57,6 @@ function looksLiveStatus(s) {
 }
 const isFinalCell = s => /^final$/i.test(String(s || ""));
 
-// ESPN status helpers
 function shortStatusFromEspn(statusObj) {
   const t = statusObj?.type || {};
   return t.shortDetail || t.detail || t.description || "In Progress";
@@ -71,7 +65,6 @@ function isFinalFromEspn(statusObj) {
   return /final/i.test(String(statusObj?.type?.name || statusObj?.type?.description || ""));
 }
 
-// Half score from first two period linescores
 function sumFirstTwoPeriods(linescores) {
   if (!Array.isArray(linescores) || linescores.length === 0) return null;
   const take = linescores.slice(0, 2);
@@ -90,7 +83,7 @@ function parseHalfScore(summary) {
     const away = comp?.competitors?.find(c => c.homeAway === "away");
     const hHome = sumFirstTwoPeriods(home?.linescores);
     const hAway = sumFirstTwoPeriods(away?.linescores);
-    if (Number.isFinite(hHome) && Number.isFinite(hAway)) return `${hAway}-${hHome}`; // away-first
+    if (Number.isFinite(hHome) && Number.isFinite(hAway)) return `${hAway}-${hHome}`;
   } catch {}
   return "";
 }
@@ -102,7 +95,6 @@ async function espnSummary(gameId) {
   return data;
 }
 
-// Realistic browser headers to avoid ESPN returning a skeletal/blocked payload
 const BROWSER_HEADERS = {
   "User-Agent":
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36",
@@ -113,77 +105,91 @@ const BROWSER_HEADERS = {
   "Upgrade-Insecure-Requests": "1",
 };
 
-// Fetch the public game page HTML (desktop site). The ESPN BET widget renders server-side
 async function fetchGameHtml(gameId) {
-  // Example: https://www.espn.com/college-football/game/_/gameId/401762842
   const url = `https://www.espn.com/${LEAGUE.replace("college-football","college-football")}/game/_/gameId/${gameId}`;
   const { data } = await axios.get(url, { timeout: 15000, headers: BROWSER_HEADERS });
   return String(data || "");
 }
 
+/* ───────────────────── ESPN BET widget parser ────────────────────── */
 /**
- * Parse the ESPN BET widget (LIVE ODDS block).
- * We only take the live values (not CLOSE). Returns:
- *   { spreadAway, spreadHome, mlAway, mlHome, total } or undefined
- *
- * Assumptions from ESPN widget (top row = away team, bottom row = home team):
- *   - Spread buttons show like: '+21.5' and '-21.5'
- *   - Total buttons show like:  'o52.5' and 'u52.5'
- *   - Moneyline buttons show like: '+900' and '-2000' or 'OFF'
+ * Strategy: pull the LIVE ODDS block, strip tags → text, then carve out:
+ *   SPREAD section (between "SPREAD" and "TOTAL")
+ *   TOTAL section  (between "TOTAL"  and "ML")
+ *   ML section     (after   "ML")
+ * Extraction rules:
+ *   - Spread: prefer values with a decimal (.5 etc). First two are away/home.
+ *   - Total:  look for o##.# and u##.# → use the numeric part.
+ *   - ML:     first two tokens like +900 / -180 / OFF → OFF => empty.
  */
+function decodeEntities(txt) {
+  return txt
+    .replace(/&nbsp;|&#160;/g, " ")
+    .replace(/&minus;|&#8722;|−/g, "-")
+    .replace(/&plus;|&#43;/g, "+")
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/\u00A0/g, " ");
+}
+
+function toText(html) {
+  // Remove scripts/styles, then tags
+  let t = html.replace(/<script[\s\S]*?<\/script>/gi, "")
+              .replace(/<style[\s\S]*?<\/style>/gi, "");
+  t = t.replace(/<[^>]+>/g, " ");
+  t = decodeEntities(t);
+  // Collapse whitespace
+  return t.replace(/\s+/g, " ").trim();
+}
+
 function parseEspnBetWidget(html) {
   if (!html) return undefined;
-
-  // Grab the LIVE ODDS table region (keeps the parse cheap)
-  const liveBlockMatch = html.match(/ESPN BET SPORTSBOOK[\s\S]{0,8000}?LIVE ODDS[\s\S]{0,5000}?Note: Odds and lines subject to change\./i);
-  const block = liveBlockMatch ? liveBlockMatch[0] : "";
+  const blockMatch = html.match(/ESPN BET SPORTSBOOK[\s\S]{0,12000}?LIVE ODDS[\s\S]{0,12000}?Note: Odds and lines subject to change\./i);
+  const block = blockMatch ? blockMatch[0] : "";
   log("   [scrape] block length:", block.length);
-
   if (!block) return undefined;
 
-  // Extract the 4 “main buttons” we care about for away/home rows:
-  // Away spread, Home spread, Over total, Under total, Away ML, Home ML.
-  // We’ll look for tokens that look like +34.5 / -34.5 / o57.5 / u57.5 / +900 / -2000 / OFF.
-  const spreadTokens = [...block.matchAll(/>([+−-]\d{1,2}(?:\.\d)?)<\/span>/g)].map(m => m[1].replace("−","-"));
-  const totalTokens  = [...block.matchAll(/>([ou]\d{1,2}(?:\.\d)?)<\/span>/gi)].map(m => m[1]);
-  const mlTokens     = [...block.matchAll(/>([+−-]\d{1,4}|OFF)<\/span>/g)].map(m => m[1].replace("−","-"));
+  const text = toText(block);
+  if (DBG) log("   [text] snippet:", text.slice(0, 300), "...");
 
-  // Heuristic: first pair of spreads belong to away/home (top/bottom),
-  // first pair of totals are o/u, first pair of ML are away/home.
-  // Some pages omit ML ("OFF") — we treat OFF as empty.
-  const spreadAway = spreadTokens[0] || "";
-  const spreadHome = spreadTokens[1] || "";
-  const totalOver  = totalTokens[0]   || "";
-  const totalUnder = totalTokens[1]   || "";
-  const mlAwayRaw  = mlTokens[0]      || "";
-  const mlHomeRaw  = mlTokens[1]      || "";
+  // Sections
+  const spreadSec = (text.match(/SPREAD([\s\S]*?)TOTAL/) || [])[1] || "";
+  const totalSec  = (text.match(/TOTAL([\s\S]*?)ML/)    || [])[1] || "";
+  const mlSec     = (text.match(/ML([\s\S]*)$/)        || [])[1] || "";
 
-  if (!spreadAway && !spreadHome && !totalOver && !totalUnder && !mlAwayRaw && !mlHomeRaw) {
-    return undefined;
+  // Spreads: prefer values with a decimal to dodge -110 juice.
+  const spreadVals = [...spreadSec.matchAll(/[+−-]\d{1,2}\.\d/g)].map(m => m[0].replace("−","-"));
+  const spreadAway = spreadVals[0] || "";
+  const spreadHome = spreadVals[1] || "";
+
+  // Totals: capture o##.# and u##.#; use the numeric part (prefer whichever exists)
+  const oMatch = totalSec.match(/o(\d{1,2}(?:\.\d)?)/i);
+  const uMatch = totalSec.match(/u(\d{1,2}(?:\.\d)?)/i);
+  const total = oMatch ? Number(oMatch[1]) : (uMatch ? Number(uMatch[1]) : "");
+
+  // Moneylines: first two tokens like +900 / -2000 / OFF
+  const mlTokens = [...mlSec.matchAll(/([+−-]\d{2,4}|OFF)/g)].map(m => m[1].replace("−","-"));
+  const mlAway = mlTokens[0] && mlTokens[0] !== "OFF" ? Number(mlTokens[0]) : "";
+  const mlHome = mlTokens[1] && mlTokens[1] !== "OFF" ? Number(mlTokens[1]) : "";
+
+  if (DBG) {
+    log("   [sections] spread:", spreadSec.slice(0,120));
+    log("   [sections] total :", totalSec.slice(0,120));
+    log("   [sections] ml    :", mlSec.slice(0,120));
+    log("   [found] spreadAway:", spreadAway, "spreadHome:", spreadHome, "total:", total, "mlAway:", mlAway, "mlHome:", mlHome);
   }
 
-  // Normalize numbers
-  const N = (v) => (v === "" || v === "OFF" ? "" : Number(v));
-  const spreadAwayNum = spreadAway ? Number(spreadAway) : "";
-  const spreadHomeNum = spreadHome ? Number(spreadHome) : "";
-  const totalNum = (totalOver || totalUnder)
-    ? Number((totalOver || totalUnder).replace(/[ou]/i,""))
-    : "";
-
-  const mlAway = N(mlAwayRaw);
-  const mlHome = N(mlHomeRaw);
-
-  // Basic sanity: a live block should have at least a spread or a total
-  const any = [spreadAwayNum, spreadHomeNum, totalNum, mlAway, mlHome].some(v => v !== "");
-  if (!any) return undefined;
-
-  return {
-    spreadAway: spreadAwayNum,
-    spreadHome: spreadHomeNum,
+  const toNum = v => v === "" ? "" : Number(v);
+  const live = {
+    spreadAway: spreadAway ? Number(spreadAway) : "",
+    spreadHome: spreadHome ? Number(spreadHome) : "",
     mlAway,
     mlHome,
-    total: totalNum,
+    total: total === "" ? "" : Number(total),
   };
+  const any = Object.values(live).some(v => v !== "");
+  return any ? live : undefined;
 }
 
 /* ─────────────────────── values/A1 helpers ───────────────────────── */
@@ -217,7 +223,6 @@ function mapCols(header) {
   };
 }
 
-// Only row selection we want: GAME_ID, already-live rows, or rows with today’s date (ET) and not Final
 function chooseTargets(rows, col) {
   const targets = [];
   for (let r = 1; r < rows.length; r++) {
@@ -225,9 +230,8 @@ function chooseTargets(rows, col) {
     const id = (row[col.GAME_ID] || "").trim();
     if (!id) continue;
 
-    const dateCell = (row[col.DATE] || "").trim();   // MM/DD/YY
+    const dateCell = (row[col.DATE] || "").trim();
     const status   = (row[col.STATUS] || "").trim();
-
     if (isFinalCell(status)) continue;
 
     if (GAME_ID && id === GAME_ID) {
@@ -254,23 +258,18 @@ async function main() {
     const col = mapCols(values[0]);
     const targets = chooseTargets(values, col);
     if (targets.length === 0) { console.log(`Nothing to update.`); return; }
-
-    if (DBG) {
-      console.log(`[${new Date().toISOString()}] Found ${targets.length} game(s) to update: ${targets.map(t=>t.id).join(", ")}`);
-    }
+    if (DBG) console.log(`[${new Date().toISOString()}] Found ${targets.length} game(s) to update: ${targets.map(t=>t.id).join(", ")}`);
 
     const data = [];
 
     for (const t of targets) {
       console.log(`\n=== 🏈 GAME ${t.id} ===`);
-
       const currentStatus = values[t.r]?.[col.STATUS] || "";
       if (isFinalCell(currentStatus)) continue;
 
-      // 1) STATUS + HALF
-      let summary;
+      // STATUS + HALF
       try {
-        summary = await espnSummary(t.id);
+        const summary = await espnSummary(t.id);
         const compStatus = summary?.header?.competitions?.[0]?.status;
         const newStatus  = shortStatusFromEspn(compStatus);
         const nowFinal   = isFinalFromEspn(compStatus);
@@ -281,42 +280,32 @@ async function main() {
         }
         const half = parseHalfScore(summary);
         if (half) data.push(makeValue(a1For(t.r, col.HALF), half));
-        if (nowFinal) {
-          log("   is final -> skip live odds this run");
-          continue; // no live odds if Final
-        }
+        if (nowFinal) { log("   is final -> skip odds"); continue; }
       } catch (e) {
         console.log(`   summary warn ${t.id}:`, e?.message || e);
       }
 
-      // 2) ESPN BET live odds via page scrape
-      let live = undefined;
+      // ESPN BET LIVE ODDS
       try {
         const html = await fetchGameHtml(t.id);
-        live = parseEspnBetWidget(html);
-        if (DBG) {
-          console.log("   chosen source:", live ? "SCRAPE =>" : "NONE =>", live || "undefined");
+        const live = parseEspnBetWidget(html);
+
+        if (live) {
+          const w = (c, v) => { if (v !== "" && Number.isFinite(Number(v))) data.push(makeValue(a1For(t.r, c), Number(v))); };
+          w(col.LA_S,  live.spreadAway);
+          w(col.LA_ML, live.mlAway);
+          w(col.LH_S,  live.spreadHome);
+          w(col.LH_ML, live.mlHome);
+          w(col.L_TOT, live.total);
+        } else {
+          console.log("   ❌ no live odds found");
         }
       } catch (e) {
         console.log(`   scrape warn ${t.id}:`, e?.message || e);
       }
-
-      if (live) {
-        const w = (c, v) => { if (v !== "" && Number.isFinite(Number(v))) data.push(makeValue(a1For(t.r, c), Number(v))); };
-        w(col.LA_S,  live.spreadAway);
-        w(col.LA_ML, live.mlAway);
-        w(col.LH_S,  live.spreadHome);
-        w(col.LH_ML, live.mlHome);
-        w(col.L_TOT, live.total);
-      } else {
-        console.log("   ❌ no live odds found");
-      }
     }
 
-    if (!data.length) {
-      console.log(`Built 0 precise cell updates across ${targets.length} target(s).`);
-      return;
-    }
+    if (!data.length) { console.log(`Built 0 precise cell updates across ${targets.length} target(s).`); return; }
 
     await sheets.spreadsheets.values.batchUpdate({
       spreadsheetId: GOOGLE_SHEET_ID,
