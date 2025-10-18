@@ -1,27 +1,28 @@
 // live-game.mjs
-// Updates: Status (D), Half Score (L), Live odds (M..Q) from ESPN BET only.
-// Optional GAME_ID focus. DEBUG_MODE=1 prints detailed discovery logs.
+// Updates: Status (D), Half Score (L), Live odds (M..Q).
+// Leaves pregame columns untouched. Supports optional GAME_ID focus.
+// Live odds sources: ESPN odds REST -> Summary pools -> ESPN BET page HTML "LIVE ODDS".
 
 import axios from "axios";
 import { google } from "googleapis";
 
-/* ───────────────────── ENV ───────────────────── */
+/* ─────────────────────────────── ENV ─────────────────────────────── */
 const {
   GOOGLE_SHEET_ID,
   GOOGLE_SERVICE_ACCOUNT,
-  LEAGUE = "nfl",                             // "nfl" | "college-football"
+  LEAGUE = "nfl",                           // "nfl" | "college-football"
   TAB_NAME = (LEAGUE === "nfl" ? "NFL" : "CFB"),
-  GAME_ID = "",                               // focus a single game id if set
-  MARKET_PREFERENCE = "Live,In-Game,2H,Second Half,Halftime",
-  DEBUG_MODE = "",
+  GAME_ID = "",                             // optional: only update this game (when set, we still read the sheet to find the row)
+  MARKET_PREFERENCE = "2H,Second Half,Halftime,Live",
+  DEBUG_MODE = "0",
 } = process.env;
 
-const DEBUG = !!String(DEBUG_MODE || "").trim();
-for (const k of ["GOOGLE_SHEET_ID", "GOOGLE_SERVICE_ACCOUNT"]) {
-  if (!process.env[k]) throw new Error(`Missing required env var: ${k}`);
-}
+const DEBUG = String(DEBUG_MODE).trim() === "1";
 
-/* ───────────── Google Sheets bootstrap ───────────── */
+if (!GOOGLE_SHEET_ID) throw new Error("Missing GOOGLE_SHEET_ID");
+if (!GOOGLE_SERVICE_ACCOUNT) throw new Error("Missing GOOGLE_SERVICE_ACCOUNT");
+
+/* ───────────────────── Google Sheets bootstrap ───────────────────── */
 const svc = JSON.parse(GOOGLE_SERVICE_ACCOUNT);
 const jwt = new google.auth.JWT(
   svc.client_email,
@@ -31,20 +32,14 @@ const jwt = new google.auth.JWT(
 );
 const sheets = google.sheets({ version: "v4", auth: jwt });
 
-/* ─────────────────── Helpers ─────────────────── */
+/* ───────────────────────────── Helpers ───────────────────────────── */
 function idxToA1(n0) {
   let n = n0 + 1, s = "";
   while (n > 0) { n--; s = String.fromCharCode(65 + (n % 26)) + s; n = Math.floor(n / 26); }
   return s;
 }
-const norm = s => (s || "").toLowerCase();
-function looksLiveStatus(s) {
-  const x = norm(s);
-  return /\bhalf\b/.test(x) || /\bin\s*progress\b/.test(x) || /\bq[1-4]\b/.test(x) || /\bot\b/.test(x) || /\blive\b/.test(x);
-}
-const isFinalCell = s => /^final$/i.test(String(s || ""));
 
-// Today key in **US/Eastern** for column B
+// Today key in **US/Eastern** to match the sheet’s date (MM/DD/YY)
 const todayKey = (() => {
   const parts = new Intl.DateTimeFormat("en-US", {
     timeZone: "America/New_York",
@@ -56,7 +51,15 @@ const todayKey = (() => {
   return `${mm}/${dd}/${yy}`;
 })();
 
-/* ───────────── ESPN status + summary ───────────── */
+const norm = s => (s || "").toLowerCase();
+function looksLiveStatus(s) {
+  if (!s) return false;
+  const x = s.toLowerCase();
+  return /\bhalf\b/.test(x) || /\bin\s*progress\b/.test(x) || /\bq[1-4]\b/.test(x) || /\bot\b/.test(x) || /\blive\b/.test(x) || /\d+:\d+\s*-\s*(1st|2nd|3rd|4th)/i.test(x);
+}
+const isFinalCell = s => /^final$/i.test(String(s || ""));
+
+// ESPN status helpers
 function shortStatusFromEspn(statusObj) {
   const t = statusObj?.type || {};
   return t.shortDetail || t.detail || t.description || "In Progress";
@@ -64,6 +67,8 @@ function shortStatusFromEspn(statusObj) {
 function isFinalFromEspn(statusObj) {
   return /final/i.test(String(statusObj?.type?.name || statusObj?.type?.description || ""));
 }
+
+// Half score from first two period linescores
 function sumFirstTwoPeriods(linescores) {
   if (!Array.isArray(linescores) || linescores.length === 0) return null;
   const take = linescores.slice(0, 2);
@@ -82,100 +87,123 @@ function parseHalfScore(summary) {
     const away = comp?.competitors?.find(c => c.homeAway === "away");
     const hHome = sumFirstTwoPeriods(home?.linescores);
     const hAway = sumFirstTwoPeriods(away?.linescores);
-    if (Number.isFinite(hHome) && Number.isFinite(hAway)) return `${hAway}-${hHome}`;
+    if (Number.isFinite(hHome) && Number.isFinite(hAway)) return `${hAway}-${hHome}`; // away-first
   } catch {}
   return "";
 }
 
+/* ───────────────────────── ESPN fetchers ─────────────────────────── */
+const leaguePath = LEAGUE === "college-football" ? "football/college-football" : "football/nfl";
+
 async function espnSummary(gameId) {
-  const url = `https://site.api.espn.com/apis/site/v2/sports/football/${LEAGUE}/summary?event=${gameId}`;
-  DEBUG && console.log("🔎 summary:", url);
+  const url = `https://site.api.espn.com/apis/site/v2/sports/${leaguePath}/summary?event=${gameId}`;
+  if (DEBUG) console.log("🔎 summary:", url);
   const { data } = await axios.get(url, { timeout: 15000 });
   return data;
 }
-
-/* ───────────── Summary pools (may be pregame) ───────────── */
-const PREF_BOOKS = ["ESPN BET"]; // constrain to ESPN BET only
-const liveTokens = (MARKET_PREFERENCE || "")
-  .split(",").map(s => s.trim().toLowerCase()).filter(Boolean);
-
-function isTokenHit(s) {
-  const t = norm(s);
-  return liveTokens.some(tok => t.includes(tok));
+async function espnOddsA(gameId) {
+  // competitions/{id}/odds (some sports use this)
+  const url = `https://sports.core.api.espn.com/v2/sports/${leaguePath}/competitions/${gameId}/odds`;
+  if (DEBUG) console.log("🔎 odds:", url);
+  return axios.get(url, { timeout: 15000 }).then(r => r.data);
+}
+async function espnOddsB(gameId) {
+  // events/{id}/competitions/{id}/odds (others use this)
+  const url = `https://sports.core.api.espn.com/v2/sports/${leaguePath}/events/${gameId}/competitions/${gameId}/odds`;
+  if (DEBUG) console.log("🔎 odds:", url);
+  return axios.get(url, { timeout: 15000 }).then(r => r.data);
 }
 
-function dumpPools(summary) {
+/* ─────────────── Live market selection & parsing (REST/pools) ────── */
+function prefTokens(list = MARKET_PREFERENCE) {
+  return (list || "")
+    .split(",")
+    .map(s => s.trim().toLowerCase())
+    .filter(Boolean);
+}
+function textMatchesAny(text, tokens) {
+  const t = norm(text);
+  return tokens.some(tok => t.includes(tok));
+}
+
+function liveFromOddsREST(oddsPayload, tokens) {
+  try {
+    const items = oddsPayload?.items || [];
+    if (!items.length) return undefined;
+
+    const firstBook = m => (m?.books?.[0] || {});
+    const n = v => (v === null || v === undefined || v === "" ? "" : Number(v));
+
+    const candidates = items.filter(mk => {
+      const label = `${mk?.name || ""} ${mk?.displayName || ""} ${mk?.period?.displayName || ""} ${mk?.period?.abbreviation || ""}`;
+      return textMatchesAny(label, tokens);
+    });
+
+    // prefer type-specific within candidates; otherwise just take the first candidate
+    const pickTyped = (words) => {
+      const typed = candidates.filter(mk => {
+        const s = norm(`${mk?.name || ""} ${mk?.displayName || ""}`);
+        return words.some(w => s.includes(w));
+      });
+      return (typed[0] || candidates[0]);
+    };
+
+    const mSpread = pickTyped(["spread", "line"]);
+    const mTotal  = pickTyped(["total", "over", "under"]);
+
+    let spreadAway = "", spreadHome = "", mlAway = "", mlHome = "", total = "";
+
+    if (mSpread) {
+      const b = firstBook(mSpread);
+      const aw = b?.awayTeamOdds || {};
+      const hm = b?.homeTeamOdds || {};
+      spreadAway = n(aw?.current?.spread ?? aw?.spread ?? b?.current?.spread);
+      spreadHome = n(hm?.current?.spread ?? hm?.spread ?? (spreadAway !== "" ? -spreadAway : ""));
+      mlAway     = n(aw?.current?.moneyLine ?? aw?.moneyLine);
+      mlHome     = n(hm?.current?.moneyLine ?? hm?.moneyLine);
+    }
+
+    if (mTotal) {
+      const b = firstBook(mTotal);
+      total = n(b?.current?.total ?? b?.total);
+    }
+
+    const any = [spreadAway, spreadHome, mlAway, mlHome, total].some(v => v !== "");
+    return any ? { spreadAway, spreadHome, mlAway, mlHome, total } : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function liveFromSummaryPools(summary, tokens) {
   const pools = [];
   if (Array.isArray(summary?.pickcenter)) pools.push(...summary.pickcenter);
   if (Array.isArray(summary?.odds))       pools.push(...summary.odds);
-
-  if (DEBUG) {
-    if (!pools.length) console.log("📋 pools: (none in summary)");
-    else {
-      console.log("📋 pools (provider | label | aSpr hSpr aML hML total | live-ish?):");
-      pools.forEach(p => {
-        const prov  = p?.provider?.name || p?.provider || "";
-        const label = [p?.details, p?.name, p?.period].filter(Boolean).join(" | ");
-        const a = p?.awayTeamOdds || {};
-        const h = p?.homeTeamOdds || {};
-        const tot = p?.overUnder ?? p?.total ?? "";
-        console.log(`   - ${prov} | ${label} | ${a?.spread ?? ""} ${h?.spread ?? ""} ${a?.moneyLine ?? ""} ${h?.moneyLine ?? ""} ${tot} | ${isTokenHit(label)}`);
-      });
-    }
-  }
-  return pools;
-}
-
-function pickPool(pools) {
   if (!pools.length) return undefined;
-  const hasNumbers = p => {
-    const a = p?.awayTeamOdds || {};
-    const h = p?.homeTeamOdds || {};
-    return (
-      a?.moneyLine != null || h?.moneyLine != null ||
-      a?.spread != null || h?.spread != null ||
-      p?.overUnder != null || p?.total != null
-    );
-  };
 
-  // 1) ESPN BET + live-ish label
-  for (const book of PREF_BOOKS) {
-    const hit = pools.find(p => {
-      const prov = (p?.provider?.name || p?.provider || "").toUpperCase();
-      const label = [p?.details, p?.name, p?.period].filter(Boolean).join(" ");
-      return prov.includes(book) && isTokenHit(label) && hasNumbers(p);
-    });
-    if (hit) return hit;
-  }
-  // 2) ESPN BET (any label) with numbers
-  for (const book of PREF_BOOKS) {
-    const hit = pools.find(p => {
-      const prov = (p?.provider?.name || p?.provider || "").toUpperCase();
-      return prov.includes(book) && hasNumbers(p);
-    });
-    if (hit) return hit;
-  }
+  // favor ESPN BET, then any matching a live-ish token; otherwise best-available
+  const labelOf = p => `${p?.details || ""} ${p?.name || ""} ${p?.period || ""} ${p?.provider?.name || ""}`;
+  const byEspnBet = pools.filter(p => /espn\s*bet/i.test(p?.provider?.name || ""));
+  const tokenMatch = (arr) => arr.find(p => textMatchesAny(labelOf(p), tokens));
 
-  // 3) live-ish label (any book) as last resort
-  const anyLive = pools.find(p => isTokenHit([p?.details, p?.name, p?.period].filter(Boolean).join(" ")) && hasNumbers(p));
-  return anyLive;
-}
+  const pick = tokenMatch(byEspnBet) || tokenMatch(pools) || byEspnBet[0] || pools[0];
+  if (!pick) return undefined;
 
-function numbersFromPool(pool) {
-  if (!pool) return undefined;
   const n = v => (v === null || v === undefined || v === "" ? "" : Number(v));
-  const aw = pool?.awayTeamOdds || {};
-  const hm = pool?.homeTeamOdds || {};
+  const aw = pick?.awayTeamOdds || {};
+  const hm = pick?.homeTeamOdds || {};
+
   const spreadAway = n(aw?.spread);
   const spreadHome = n(hm?.spread ?? (spreadAway !== "" ? -spreadAway : ""));
   const mlAway     = n(aw?.moneyLine);
   const mlHome     = n(hm?.moneyLine);
-  const total      = n(pool?.overUnder ?? pool?.total);
+  const total      = n(pick?.overUnder ?? pick?.total);
+
   const any = [spreadAway, spreadHome, mlAway, mlHome, total].some(v => v !== "");
   return any ? { spreadAway, spreadHome, mlAway, mlHome, total } : undefined;
 }
 
-/* ─────────── HTML fallback: ESPN BET LIVE ODDS ─────────── */
+/* ─────────── HTML fallback: ESPN BET "LIVE ODDS" scraper ─────────── */
 async function scrapeGamePageLiveOdds(gameId) {
   const sportPath = (LEAGUE === "college-football") ? "college-football" : "nfl";
   const url = `https://www.espn.com/${sportPath}/game/_/gameId/${gameId}`;
@@ -183,65 +211,54 @@ async function scrapeGamePageLiveOdds(gameId) {
     const { data: html } = await axios.get(url, { timeout: 15000 });
     if (DEBUG) console.log("🔎 page:", url);
 
-    // Strictly isolate the ESPN BET LIVE ODDS box
+    // Try to isolate the ESPN BET SPORTSBOOK live odds block; fall back to whole HTML if not found.
     const liveBlockMatch =
-      html.match(/ESPN BET SPORTSBOOK[\s\S]*?LIVE ODDS[\s\S]*?<\/section>/i) ||
-      html.match(/LIVE ODDS[\s\S]*?Odds by ESPN BET/i);
+      html.match(/ESPN BET[\s\S]{0,4000}?LIVE ODDS[\s\S]{0,4000}?<\/section>/i) ||
+      html.match(/LIVE ODDS[\s\S]{0,4000}?Odds by ESPN BET/i);
     const block = liveBlockMatch ? liveBlockMatch[0] : html;
 
-    // Totals like o47.5 / u47.5 -> take the first number after o/u
+    if (DEBUG) {
+      console.log("   [scrape] snippet:");
+      console.log(block.slice(0, 2000)); // keep logs moderate
+    }
+
+    // Totals: o51.5 / u51.5
     const totalMatches = [...block.matchAll(/\b[ou]\s?(\d{2,3}(?:\.\d)?)\b/ig)];
     const total = totalMatches.length ? Number(totalMatches[0][1]) : "";
 
-    // Moneylines like +2000 / -7500; ignore -110 juice by requiring abs >= 300
-    const mlMatches = [...block.matchAll(/>([+-]\d{3,5})<\/button>/g)]
+    // Moneylines: +3000 / -7500 — ignore -110 juice
+    const mlMatches = [...block.matchAll(/([+-]\d{3,5})/g)]
       .map(m => Number(m[1]))
       .filter(v => Math.abs(v) >= 300);
     let mlAway = "", mlHome = "";
-    if (mlMatches.length >= 2) {
-      // first positive is away, first negative is home (widget lists away first)
+    if (mlMatches.length) {
+      // try to choose one positive and one negative (order on page normally away then home)
       mlAway = mlMatches.find(v => v > 0) ?? "";
       mlHome = mlMatches.find(v => v < 0) ?? "";
-      if (mlAway === "" || mlHome === "") {
-        // fallback: most positive as away, most negative as home
-        mlAway = mlAway || Math.max(...mlMatches);
-        mlHome = mlHome || Math.min(...mlMatches);
-      }
     }
 
-    // Spreads like +16.5 / -16.5; ignore values with magnitude >= 100 (juice artifacts)
-    const spreadMatches = [...block.matchAll(/>([+-]\d{1,2}(?:\.\d)?)<\/button>/g)]
+    // Spreads: +21.5 / -21.5 (filter out moneylines we already grabbed)
+    const spreadMatches = [...block.matchAll(/([+-]\d{1,2}(?:\.\d)?)/g)]
       .map(m => Number(m[1]))
-      .filter(v => Math.abs(v) < 100);
+      .filter(v => Math.abs(v) <= 60);
     let spreadAway = "", spreadHome = "";
-    if (spreadMatches.length >= 2) {
-      // choose first positive as away, first negative as home
+    if (spreadMatches.length) {
       spreadAway = spreadMatches.find(v => v > 0) ?? "";
       spreadHome = spreadMatches.find(v => v < 0) ?? "";
-      // fallback if both are same sign (rare)
-      if (spreadAway === "" && spreadHome === "" && spreadMatches.length >= 2) {
-        // pick two with opposite signs if present
-        spreadAway = spreadMatches[0];
-        spreadHome = -Math.abs(spreadAway);
-      }
     }
 
-    const gotAny = [spreadAway, spreadHome, mlAway, mlHome, total].some(v => v !== "");
     if (DEBUG) {
-      console.log(
-        "   [scrape] spreads:", spreadAway, "/", spreadHome,
-        " ML:", mlAway, "/", mlHome,
-        " total:", total
-      );
+      console.log(`   [scrape] parsed => spread ${spreadAway}/${spreadHome}, ML ${mlAway}/${mlHome}, total ${total}`);
     }
-    return gotAny ? { spreadAway, spreadHome, mlAway, mlHome, total } : undefined;
+    const any = [spreadAway, spreadHome, mlAway, mlHome, total].some(v => v !== "");
+    return any ? { spreadAway, spreadHome, mlAway, mlHome, total } : undefined;
   } catch (e) {
     if (DEBUG) console.log("   [scrape] failed:", e?.response?.status || e?.message || e);
     return undefined;
   }
 }
 
-/* ───────────── values/A1 helpers ───────────── */
+/* ─────────────────────── values/A1 helpers ───────────────────────── */
 function makeValue(range, val) { return { range, values: [[val]] }; }
 function a1For(row0, col0, tab = TAB_NAME) {
   const row1 = row0 + 1;
@@ -272,42 +289,49 @@ function mapCols(header) {
   };
 }
 
-/* ───────────── Row selection ───────────── */
+// Row selection: GAME_ID focus, or “live-looking” rows, or rows with Date==today (ET). Skip finals.
 function chooseTargets(rows, col) {
   const targets = [];
-  const focus = String(GAME_ID || "").trim();
-
   for (let r = 1; r < rows.length; r++) {
     const row = rows[r] || [];
     const id = (row[col.GAME_ID] || "").trim();
     if (!id) continue;
 
-    const dateCell = (row[col.DATE] || "").trim();
+    const dateCell = (row[col.DATE] || "").trim();   // MM/DD/YY
     const status   = (row[col.STATUS] || "").trim();
 
     if (isFinalCell(status)) continue;
 
-    if (focus) { if (id === focus) targets.push({ r, id, reason: "GAME_ID" }); continue; }
+    if (GAME_ID) {
+      if (id === GAME_ID) targets.push({ r, id, reason: "GAME_ID" });
+      continue;
+    }
 
-    if (looksLiveStatus(status)) { targets.push({ r, id, reason: "live-like status" }); continue; }
-    if (dateCell === todayKey)   { targets.push({ r, id, reason: "today" }); }
+    if (looksLiveStatus(status)) {
+      targets.push({ r, id, reason: "live-like status" });
+      continue;
+    }
+    if (dateCell === todayKey) {
+      targets.push({ r, id, reason: "today" });
+    }
   }
   return targets;
 }
 
-/* ───────────────────── MAIN ───────────────────── */
+/* ─────────────────────────────── MAIN ────────────────────────────── */
 async function main() {
   try {
     const ts = new Date().toISOString();
     const values = await getValues();
-    if (!values.length) { console.log(`[${ts}] Sheet empty—nothing to do.`); return; }
+    if (values.length === 0) { console.log(`[${ts}] Sheet empty—nothing to do.`); return; }
 
     const col = mapCols(values[0]);
     const targets = chooseTargets(values, col);
+    if (DEBUG) console.log(`[${ts}] Found ${targets.length} game(s) to update: ${targets.map(t=>t.id).join(", ")}`);
 
-    console.log(`[${ts}] Found ${targets.length} game(s) to update: ${targets.map(t=>t.id).join(", ")}`);
-    if (!targets.length) return;
+    if (targets.length === 0) { console.log(`[${ts}] Nothing to update.`); return; }
 
+    const tokens = prefTokens(MARKET_PREFERENCE);
     const data = [];
 
     for (const t of targets) {
@@ -316,7 +340,7 @@ async function main() {
       const currentStatus = values[t.r]?.[col.STATUS] || "";
       if (isFinalCell(currentStatus)) continue;
 
-      // STATUS + HALF
+      // 1) STATUS + HALF
       let summary;
       try {
         summary = await espnSummary(t.id);
@@ -324,41 +348,53 @@ async function main() {
         const newStatus  = shortStatusFromEspn(compStatus);
         const nowFinal   = isFinalFromEspn(compStatus);
 
-        DEBUG && console.log("   status text:", JSON.stringify(newStatus));
-        if (newStatus && newStatus !== currentStatus) data.push(makeValue(a1For(t.r, col.STATUS), newStatus));
-
+        if (DEBUG) console.log(`   status text: "${newStatus}"`);
+        if (newStatus && newStatus !== currentStatus) {
+          data.push(makeValue(a1For(t.r, col.STATUS), newStatus));
+        }
         const half = parseHalfScore(summary);
-        if (half) {
-          DEBUG && console.log("   half score:", half);
-          data.push(makeValue(a1For(t.r, col.HALF), half));
-        }
-        if (nowFinal) { DEBUG && console.log("   final detected — skipping live odds."); continue; }
+        if (DEBUG && half) console.log(`   half score: ${half}`);
+        if (half) data.push(makeValue(a1For(t.r, col.HALF), half));
+        if (nowFinal) continue; // don't attempt live odds if already final
       } catch (e) {
-        if (e?.response?.status !== 404) console.log(`Summary warn ${t.id}:`, e?.message || e);
+        if (DEBUG) console.log("   summary fetch warn:", e?.response?.status || e?.message || e);
       }
 
-      // Summary pools (ESPN BET if possible)
+      // 2) LIVE ODDS: REST -> summary pools -> HTML scrape
       let live;
-      const pools = dumpPools(summary);
-      if (pools.length) {
-        const chosen = pickPool(pools);
-        live = numbersFromPool(chosen);
-        if (DEBUG) {
-          if (chosen) {
-            const prov = chosen?.provider?.name || chosen?.provider || "";
-            const label = [chosen?.details, chosen?.name, chosen?.period].filter(Boolean).join(" | ");
-            console.log(`   chosen pool: ${prov} | ${label}`);
-            console.log(`   → numbers: ${JSON.stringify(live)}`);
-          } else {
-            console.log("   no suitable ESPN BET pool.");
-          }
+
+      // REST A
+      try {
+        const oddsA = await espnOddsA(t.id);
+        live = liveFromOddsREST(oddsA, tokens);
+      } catch (e) {
+        if (DEBUG) console.log("   ↪️ odds A failed:", e?.response?.status || e?.message || e);
+      }
+
+      // REST B (second shape)
+      if (!live) {
+        try {
+          const oddsB = await espnOddsB(t.id);
+          live = liveFromOddsREST(oddsB, tokens);
+        } catch (e) {
+          if (DEBUG) console.log("   ↪️ odds B failed:", e?.response?.status || e?.message || e);
         }
       }
 
-      // HTML scrape fallback: ESPN BET LIVE ODDS widget
+      // Summary pools
+      if (!live && summary) {
+        const poolsLive = liveFromSummaryPools(summary, tokens);
+        if (DEBUG && poolsLive) {
+          console.log(`   pools picked =>`, JSON.stringify(poolsLive));
+        }
+        live = poolsLive || live;
+      }
+
+      // HTML scrape (ESPN BET page block)
       if (!live) {
         const scraped = await scrapeGamePageLiveOdds(t.id);
-        if (scraped) live = scraped;
+        if (DEBUG && scraped) console.log("   scrape picked =>", JSON.stringify(scraped));
+        live = scraped || live;
       }
 
       if (live) {
@@ -368,12 +404,15 @@ async function main() {
         w(col.LH_S,  live.spreadHome);
         w(col.LH_ML, live.mlHome);
         w(col.L_TOT, live.total);
-      } else if (DEBUG) {
-        console.log("   ❌ no live numbers found this run.");
+      } else {
+        if (DEBUG) console.log("   no live market found after all sources.");
       }
     }
 
-    if (!data.length) { console.log("✅ Nothing to write this run."); return; }
+    if (!data.length) {
+      console.log(`[${new Date().toISOString()}] Built 0 cell updates across ${targets.length} target(s).`);
+      return;
+    }
 
     await sheets.spreadsheets.values.batchUpdate({
       spreadsheetId: GOOGLE_SHEET_ID,
@@ -383,7 +422,7 @@ async function main() {
     console.log(`✅ Updated ${data.length} cell(s).`);
   } catch (err) {
     const code = err?.response?.status || err?.code || err?.message || err;
-    console.error("Live updater fatal:", "*** code:", code, "***");
+    console.error("Live updater fatal:", code);
     process.exit(1);
   }
 }
