@@ -6,13 +6,13 @@
 import axios from "axios";
 import { google } from "googleapis";
 
-// ===== ENV =====
+/* ===== ENV ===== */
 const {
   GOOGLE_SHEET_ID,
   GOOGLE_SERVICE_ACCOUNT,
-  LEAGUE = "nfl", // "nfl" | "college-football"
+  LEAGUE = "nfl",                               // "nfl" | "college-football"
   TAB_NAME = (LEAGUE === "nfl" ? "NFL" : "CFB"),
-  GAME_ID = "",
+  GAME_ID = "",                                 // optional: force a single game
   MARKET_PREFERENCE = "2H,Second Half,Halftime,Live",
 } = process.env;
 
@@ -20,7 +20,7 @@ for (const k of ["GOOGLE_SHEET_ID", "GOOGLE_SERVICE_ACCOUNT"]) {
   if (!process.env[k]) throw new Error(`Missing required env var: ${k}`);
 }
 
-// ===== Google Sheets =====
+/* ===== Google Sheets ===== */
 const svc = JSON.parse(GOOGLE_SERVICE_ACCOUNT);
 const jwt = new google.auth.JWT(
   svc.client_email,
@@ -30,14 +30,14 @@ const jwt = new google.auth.JWT(
 );
 const sheets = google.sheets({ version: "v4", auth: jwt });
 
-// ===== Helpers =====
+/* ===== Helpers ===== */
 function idxToA1(n0) {
   let n = n0 + 1, s = "";
   while (n > 0) { n--; s = String.fromCharCode(65 + (n % 26)) + s; n = Math.floor(n / 26); }
   return s;
 }
 
-// Build today's key in US/Eastern to match the sheet (MM/DD/YY)
+// Today's key in US/Eastern (MM/DD/YY) to match the sheet
 const todayKey = (() => {
   const d = new Date();
   const parts = new Intl.DateTimeFormat("en-US", {
@@ -66,26 +66,29 @@ function isFinalCell(s) {
   return /^final$/i.test(String(s || ""));
 }
 
-function sumFirstTwoPeriods(linescores) {
-  if (!Array.isArray(linescores) || linescores.length === 0) return null;
-  const take = linescores.slice(0, 2);
+// Strict half calculator: returns null if any period data is missing
+function sumFirstTwoPeriodsStrict(linescores) {
+  if (!Array.isArray(linescores) || linescores.length < 2) return null;
   let tot = 0;
-  for (const p of take) {
-    const v = Number(p?.value ?? p?.score ?? 0);
+  for (let i = 0; i < 2; i++) {
+    const raw = linescores[i]?.value ?? linescores[i]?.score;
+    if (raw === undefined || raw === null || raw === "") return null;
+    const v = Number(raw);
     if (!Number.isFinite(v)) return null;
     tot += v;
   }
   return tot;
 }
+
 function parseHalfScore(summary) {
   try {
     const comp = summary?.header?.competitions?.[0];
     const home = comp?.competitors?.find(c => c.homeAway === "home");
     const away = comp?.competitors?.find(c => c.homeAway === "away");
-    const hHome = sumFirstTwoPeriods(home?.linescores);
-    const hAway = sumFirstTwoPeriods(away?.linescores);
+    const hHome = sumFirstTwoPeriodsStrict(home?.linescores);
+    const hAway = sumFirstTwoPeriodsStrict(away?.linescores);
     if (Number.isFinite(hHome) && Number.isFinite(hAway)) {
-      return `${hAway}-${hHome}`; // away-first
+      return `${hAway}-${hHome}`; // away-first, matches your sheet
     }
   } catch {}
   return "";
@@ -96,15 +99,18 @@ async function espnSummary(gameId) {
   const { data } = await axios.get(url, { timeout: 15000 });
   return data;
 }
+
 async function espnOdds(gameId) {
   const url = `https://sports.core.api.espn.com/v2/sports/football/${LEAGUE}/events/${gameId}/competitions/${gameId}/odds`;
   const { data } = await axios.get(url, { timeout: 15000 });
   return data;
 }
 
+// ---- Market selection helpers ----
+const norm = s => (s || "").toLowerCase();
 function pickMarket(markets, preferenceList) {
   if (!Array.isArray(markets) || markets.length === 0) return null;
-  const norm = s => (s || "").toLowerCase();
+
   const wants = (preferenceList || "")
     .split(",")
     .map(s => s.trim().toLowerCase())
@@ -121,21 +127,20 @@ function pickMarket(markets, preferenceList) {
   }
 
   const fallback = markets.find(mk => {
-    const s = (mk?.name || "") + " " + (mk?.displayName || "");
-    const t = s.toLowerCase();
-    return t.includes("spread") || t.includes("total") || t.includes("line") || t.includes("over") || t.includes("under");
+    const s = `${mk?.name || ""} ${mk?.displayName || ""}`.toLowerCase();
+    return s.includes("spread") || s.includes("total") || s.includes("line") || s.includes("over") || s.includes("under");
   });
   return fallback || markets[0];
 }
 
-function extractLiveNumbers(oddsPayload, preference = MARKET_PREFERENCE) {
+function extractFromOddsPayload(oddsPayload, preference = MARKET_PREFERENCE) {
   try {
     const markets = oddsPayload?.items || [];
     if (markets.length === 0) return undefined;
 
     const choose = (typeWords) => {
       const typed = markets.filter(mk => {
-        const s = ((mk?.name || "") + " " + (mk?.displayName || "")).toLowerCase();
+        const s = `${mk?.name || ""} ${mk?.displayName || ""}`.toLowerCase();
         return typeWords.some(w => s.includes(w));
       });
       return pickMarket(typed.length ? typed : markets, preference);
@@ -143,7 +148,6 @@ function extractLiveNumbers(oddsPayload, preference = MARKET_PREFERENCE) {
 
     const mSpread = choose(["spread", "line"]);
     const mTotal  = choose(["total", "over", "under"]);
-
     const firstBook = (m) => m?.books?.[0] || {};
 
     const sB = firstBook(mSpread);
@@ -166,7 +170,49 @@ function extractLiveNumbers(oddsPayload, preference = MARKET_PREFERENCE) {
   }
 }
 
-// A1 helpers
+// Fallback: derive a "live/2H" style line out of summary.pickcenter/summary.odds
+function extractFromSummaryPools(summary, preference = MARKET_PREFERENCE) {
+  const pools = [];
+  if (Array.isArray(summary?.pickcenter)) pools.push(...summary.pickcenter);
+  if (Array.isArray(summary?.odds))       pools.push(...summary.odds);
+  if (!pools.length) return undefined;
+
+  const wants = (preference || "")
+    .split(",").map(s => s.trim().toLowerCase()).filter(Boolean);
+
+  const score = (p) => {
+    const label = `${p?.name || ""} ${p?.displayName || ""} ${p?.market?.name || ""} ${p?.period?.displayName || ""}`.toLowerCase();
+    let rank = 0;
+    wants.forEach((w, i) => { if (label.includes(w)) rank += (wants.length - i) * 10; });
+    if (label.includes("2h") || label.includes("second half")) rank += 5;
+    if (label.includes("live")) rank += 1;
+    return rank;
+  };
+
+  const best = pools
+    .map(p => ({ p, r: score(p) }))
+    .sort((a,b) => b.r - a.r)[0]?.p;
+
+  if (!best) return undefined;
+
+  const n = v => (v === null || v === undefined || v === "" ? "" : Number(v));
+
+  const aw = best?.awayTeamOdds || {};
+  const hm = best?.homeTeamOdds || {};
+  let spreadAway = n(aw?.current?.spread ?? aw?.spread);
+  let spreadHome = n(hm?.current?.spread ?? hm?.spread);
+  if (spreadAway !== "" && spreadHome === "") spreadHome = -spreadAway;
+  if (spreadHome !== "" && spreadAway === "") spreadAway = -spreadHome;
+
+  const mlAway = n(aw?.current?.moneyLine ?? aw?.moneyLine);
+  const mlHome = n(hm?.current?.moneyLine ?? hm?.moneyLine);
+  const total  = n(best?.current?.total ?? best?.total ?? best?.overUnder);
+
+  const any = [spreadAway, spreadHome, mlAway, mlHome, total].some(v => v !== "");
+  return any ? { spreadAway, spreadHome, mlAway, mlHome, total } : undefined;
+}
+
+/* ===== A1 helpers ===== */
 function makeValue(range, val) { return { range, values: [[val]] }; }
 function a1For(row0, col0, tab = TAB_NAME) {
   const row1 = row0 + 1;
@@ -180,7 +226,7 @@ async function getValues() {
   return res.data.values || [];
 }
 
-// header mapping
+// header column mapping
 function mapCols(header) {
   const lower = s => (s || "").trim().toLowerCase();
   const find = (name, fb) => {
@@ -218,6 +264,7 @@ function chooseTargets(rows, col) {
   return targets;
 }
 
+/* ===== MAIN ===== */
 async function main() {
   try {
     const ts = new Date().toISOString();
@@ -239,10 +286,11 @@ async function main() {
       const currentStatus = values[t.r]?.[col.STATUS] || "";
       if (isFinalCell(currentStatus)) continue;
 
-      // 1) STATUS + HALF
+      // 1) STATUS + HALF (from summary)
+      let summary;
       try {
-        const sum = await espnSummary(t.id);
-        const compStatus = sum?.header?.competitions?.[0]?.status;
+        summary = await espnSummary(t.id);
+        const compStatus = summary?.header?.competitions?.[0]?.status;
         const newStatus  = shortStatusFromEspn(compStatus);
         const nowFinal   = isFinalFromEspn(compStatus);
 
@@ -250,7 +298,7 @@ async function main() {
           data.push(makeValue(a1For(t.r, col.STATUS), newStatus));
         }
 
-        const hs = parseHalfScore(sum);
+        const hs = parseHalfScore(summary);
         if (hs) data.push(makeValue(a1For(t.r, col.HALF), hs));
 
         if (nowFinal) continue; // don’t fetch live odds for finals
@@ -259,22 +307,32 @@ async function main() {
       }
 
       // 2) LIVE ODDS (2H preferred)
+      let live;
       try {
         const odds = await espnOdds(t.id);
-        const live = extractLiveNumbers(odds, MARKET_PREFERENCE);
-        if (live) {
-          const w = (c, v) => { if (v !== "" && Number.isFinite(Number(v))) data.push(makeValue(a1For(t.r, c), Number(v))); };
-          w(col.LA_S,  live.spreadAway);
-          w(col.LA_ML, live.mlAway);
-          w(col.LH_S,  live.spreadHome);
-          w(col.LH_ML, live.mlHome);
-          w(col.L_TOT, live.total);
-        } else {
-          console.log(`No live market found ${t.id} (pref="${MARKET_PREFERENCE}") — left M..Q as-is.`);
-        }
+        live = extractFromOddsPayload(odds, MARKET_PREFERENCE);
       } catch (e) {
-        if (e?.response?.status === 404) console.log(`Odds 404 ${t.id} — markets unavailable, skipping M..Q.`);
-        else console.log(`Odds warn ${t.id}:`, e?.message || e);
+        if (e?.response?.status === 404) {
+          // odds endpoint missing is common: fall back to summary pools if we have them
+          if (summary) live = extractFromSummaryPools(summary, MARKET_PREFERENCE);
+          else console.log(`Odds 404 ${t.id} — no markets API; will try summary pools if available.`);
+        } else {
+          console.log(`Odds warn ${t.id}:`, e?.message || e);
+        }
+      }
+
+      // If odds endpoint returned nothing usable, try summary pools as a secondary fallback
+      if (!live && summary) live = extractFromSummaryPools(summary, MARKET_PREFERENCE);
+
+      if (live) {
+        const w = (c, v) => { if (v !== "" && Number.isFinite(Number(v))) data.push(makeValue(a1For(t.r, c), Number(v))); };
+        w(col.LA_S,  live.spreadAway);
+        w(col.LA_ML, live.mlAway);
+        w(col.LH_S,  live.spreadHome);
+        w(col.LH_ML, live.mlHome);
+        w(col.L_TOT, live.total);
+      } else {
+        console.log(`No live market found ${t.id} (pref="${MARKET_PREFERENCE}") — left M..Q as-is.`);
       }
     }
 
