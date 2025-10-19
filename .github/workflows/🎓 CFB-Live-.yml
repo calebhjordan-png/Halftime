@@ -8,9 +8,9 @@ on:
         required: false
         default: "false"
   schedule:
-    # Top of every hour, 10:00–01:00 ET (i.e., 10:00 to 01:00 next day). DST-safe by ET cron.
-    - cron: "0 14-23 * * *"   # 10:00–23:00 UTC->ET window (adjusted in job guard)
-    - cron: "0 0-5 * * *"    # 00:00–05:00 UTC->ET window
+    # Top of every hour, 10:00–01:00 ET
+    - cron: "0 14-23 * * *"   # 10 AM–11 PM ET hourly
+    - cron: "0 0-5 * * *"     # 12 AM–5 AM ET hourly
 
 permissions:
   contents: read
@@ -21,9 +21,6 @@ jobs:
     timeout-minutes: 10
 
     steps:
-      - name: Set up job
-        run: echo "Starting CFB live updater…"
-
       - name: Checkout
         uses: actions/checkout@v4
 
@@ -34,7 +31,7 @@ jobs:
 
       - name: Install deps
         run: |
-          npm --version
+          echo "Building clean package.json"
           cat <<'PKG' > package.json
           {
             "name": "halftime-live",
@@ -47,7 +44,7 @@ jobs:
             }
           }
           PKG
-          npm ci
+          npm install
 
       - name: Run CFB live updater
         env:
@@ -56,14 +53,7 @@ jobs:
           LEAGUE: college-football
           TAB_NAME: CFB
           DEBUG_MODE: "0"
-        run: |
-          node live-game.mjs || true
-
-      # ───────────────── Gate: only loop 5-min if any game is pre-3rd ─────────────────
-      - name: Install gate deps
-        run: |
-          # deps already installed above; keep step for clarity/logs
-          node -e "console.log('Gate deps present.')"
+        run: node live-game.mjs || true
 
       - name: Decide 5-minute loop (CFB)
         id: gate
@@ -71,7 +61,6 @@ jobs:
           LEAGUE: college-football
           FORCE_FIVE: ${{ github.event.inputs.force_five }}
         run: |
-          node -e "console.log('Running gate with LEAGUE=' + process.env.LEAGUE)"
           node orchestrator.mjs > gate.json
           cat gate.json
           SHOULD=$(node -e "console.log(JSON.parse(require('fs').readFileSync('gate.json')).shouldLoop ? 'true':'false')")
@@ -80,9 +69,9 @@ jobs:
       - name: Conditional requeue (5-min loop if live games)
         if: steps.gate.outputs.should_loop == 'true'
         env:
-          GH_TOKEN: ${{ secrets.GH_PAT_WORKFLOW }}   # Personal Access Token with 'workflow' + 'repo' scopes
+          GH_TOKEN: ${{ secrets.GH_PAT_WORKFLOW }}
         run: |
-          echo "Re-dispatching this workflow for another pass in 5 minutes (pre-3rd games present)…"
+          echo "Re-dispatching this workflow in 5 minutes (live games pre-3rd detected)..."
           sleep 300
           gh workflow run "${GITHUB_WORKFLOW}" \
             --ref "${GITHUB_REF_NAME}" \
@@ -90,4 +79,4 @@ jobs:
 
       - name: Done / no loop needed
         if: steps.gate.outputs.should_loop != 'true'
-        run: echo "No pre-3rd games → stay on hourly cadence."
+        run: echo "No pre-3rd games — remain on hourly schedule."
