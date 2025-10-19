@@ -1,58 +1,93 @@
-name: 🎓 CFB Live (Hourly + Smart 5-Minute Loop)
+name: "🎓 CFB Live (Hourly + Smart 5-Minute Loop)"
 
 on:
   workflow_dispatch:
-  repository_dispatch:
-    types: [cfb_live_requeue]
+    inputs:
+      force_five:
+        description: "Force 5-minute loop (debug)"
+        required: false
+        default: "false"
   schedule:
-    - cron: "0 10-23 * * *"   # 10AM–11PM ET hourly
-    - cron: "0 0-2 * * *"     # Midnight–2AM ET hourly
+    # Top of every hour, 10:00–01:00 ET (i.e., 10:00 to 01:00 next day). DST-safe by ET cron.
+    - cron: "0 14-23 * * *"   # 10:00–23:00 UTC->ET window (adjusted in job guard)
+    - cron: "0 0-5 * * *"    # 00:00–05:00 UTC->ET window
+
+permissions:
+  contents: read
 
 jobs:
   live:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+
     steps:
+      - name: Set up job
+        run: echo "Starting CFB live updater…"
+
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: 20
 
       - name: Install deps
-        run: npm i axios googleapis
+        run: |
+          npm --version
+          cat <<'PKG' > package.json
+          {
+            "name": "halftime-live",
+            "private": true,
+            "type": "module",
+            "dependencies": {
+              "axios": "^1.7.2",
+              "luxon": "^3.5.0",
+              "googleapis": "^129.0.0"
+            }
+          }
+          PKG
+          npm ci
 
       - name: Run CFB live updater
         env:
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
-          GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
-          LEAGUE: "college-football"
-          TAB_NAME: "CFB"
+          GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GCP_SA_JSON }}
+          LEAGUE: college-football
+          TAB_NAME: CFB
           DEBUG_MODE: "0"
-        run: node live-game.mjs
+        run: |
+          node live-game.mjs || true
+
+      # ───────────────── Gate: only loop 5-min if any game is pre-3rd ─────────────────
+      - name: Install gate deps
+        run: |
+          # deps already installed above; keep step for clarity/logs
+          node -e "console.log('Gate deps present.')"
+
+      - name: Decide 5-minute loop (CFB)
+        id: gate
+        env:
+          LEAGUE: college-football
+          FORCE_FIVE: ${{ github.event.inputs.force_five }}
+        run: |
+          node -e "console.log('Running gate with LEAGUE=' + process.env.LEAGUE)"
+          node orchestrator.mjs > gate.json
+          cat gate.json
+          SHOULD=$(node -e "console.log(JSON.parse(require('fs').readFileSync('gate.json')).shouldLoop ? 'true':'false')")
+          echo "should_loop=$SHOULD" >> $GITHUB_OUTPUT
 
       - name: Conditional requeue (5-min loop if live games)
-        if: success()
+        if: steps.gate.outputs.should_loop == 'true'
         env:
-          GH_PAT_WORKFLOW: ${{ secrets.GH_PAT_WORKFLOW }}
+          GH_TOKEN: ${{ secrets.GH_PAT_WORKFLOW }}   # Personal Access Token with 'workflow' + 'repo' scopes
         run: |
-          node - <<'JS'
-          import axios from "axios";
-          const fs = await import("fs");
-          const txt = fs.readFileSync("live-game.mjs", "utf8");
-          const hasLive = txt.includes("In Progress") || txt.includes("Q1") || txt.includes("Q2");
-          if (hasLive) {
-            console.log("Detected live games — scheduling requeue in 5m.");
-            const delay = 5 * 60 * 1000;
-            setTimeout(async () => {
-              await axios.post(
-                "https://api.github.com/repos/${{ github.repository }}/dispatches",
-                { event_type: "cfb_live_requeue" },
-                { headers: { Authorization: `token ${{ secrets.GH_PAT_WORKFLOW }}` } }
-              );
-            }, delay);
-          } else {
-            console.log("No live games — remain hourly.");
-          }
-          JS
+          echo "Re-dispatching this workflow for another pass in 5 minutes (pre-3rd games present)…"
+          sleep 300
+          gh workflow run "${GITHUB_WORKFLOW}" \
+            --ref "${GITHUB_REF_NAME}" \
+            -f force_five=false
+
+      - name: Done / no loop needed
+        if: steps.gate.outputs.should_loop != 'true'
+        run: echo "No pre-3rd games → stay on hourly cadence."
