@@ -1,7 +1,6 @@
 // live-game.mjs
-// Updates: Status (D), Half Score (L), Live odds (M..Q) with halftime lock.
-// Targets: GAME_ID focus OR rows with date = today/yesterday (ET) OR live-like status.
-// Live odds source order: ESPN REST → ESPN summary pools → ESPN BET text scraper.
+// Updates: Status (D), Score (L), Half odds (M..Q).
+// Locks all lines after halftime. Uses ESPN summary + ESPN BET live odds scraping.
 
 import axios from "axios";
 import { google } from "googleapis";
@@ -10,11 +9,11 @@ import { google } from "googleapis";
 const {
   GOOGLE_SHEET_ID,
   GOOGLE_SERVICE_ACCOUNT,
-  LEAGUE = "college-football",                 // "nfl" | "college-football"
+  LEAGUE = "college-football", // "nfl" | "college-football"
   TAB_NAME = (LEAGUE === "nfl" ? "NFL" : "CFB"),
-  GAME_ID = "",                                // focus a single game when set
+  GAME_ID = "",
   MARKET_PREFERENCE = "2H,Second Half,Halftime,Live",
-  DEBUG_MODE = "",                             // "1" for verbose logs
+  DEBUG_MODE = "",
 } = process.env;
 
 const DEBUG = String(DEBUG_MODE || "").trim() === "1";
@@ -41,32 +40,34 @@ function idxToA1(n0) {
   return s;
 }
 
-// ET calendar helpers (today + yesterday allowed)
-const fmtET = (d) => new Intl.DateTimeFormat("en-US", {
-  timeZone: "America/New_York",
-  month: "2-digit", day: "2-digit", year: "2-digit",
-}).format(d);
-const todayKey = fmtET(new Date());
-const yesterdayKey = fmtET(new Date(Date.now() - 86400000));
+const todayKey = (() => {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: "America/New_York",
+    month: "2-digit", day: "2-digit", year: "2-digit",
+  }).formatToParts(new Date());
+  const mm = parts.find(p => p.type === "month")?.value ?? "00";
+  const dd = parts.find(p => p.type === "day")?.value ?? "00";
+  const yy = parts.find(p => p.type === "year")?.value ?? "00";
+  return `${mm}/${dd}/${yy}`;
+})();
 
-const normStr = (s) => (s || "").toString().trim();
+const normStr = (s) => (s || "").toString();
 const isFinalCell = s => /^final$/i.test(normStr(s));
 function looksLiveStatus(s) {
   const x = normStr(s).toLowerCase();
-  // covers strings like "Halftime", "9:15 - 2nd", "Q3", "In Progress", "OT"
-  return /\b(1st|2nd|3rd|4th|q[1-4]|half|progress|ot|live)\b/.test(x);
+  return /\bhalf\b/.test(x) || /\bin\s*progress\b/.test(x) || /\bq[1-2]\b/.test(x);
 }
 
 // ESPN status helpers
 function shortStatusFromEspn(statusObj) {
   const t = statusObj?.type || {};
-  return t.shortDetail || t.detail || t.description || "";
+  return t.shortDetail || t.detail || t.description || "In Progress";
 }
 function isFinalFromEspn(statusObj) {
   return /final/i.test(String(statusObj?.type?.name || statusObj?.type?.description || ""));
 }
 
-// Half score from first two period linescores
+/* ─────────────── Half score (full score col now) ─────────────── */
 function sumFirstTwoPeriods(linescores) {
   if (!Array.isArray(linescores) || linescores.length === 0) return null;
   const take = linescores.slice(0, 2);
@@ -78,16 +79,15 @@ function sumFirstTwoPeriods(linescores) {
   }
   return tot;
 }
-function parseHalfScore(summary) {
+function parseScore(summary) {
   try {
     const comp = summary?.header?.competitions?.[0];
     const home = comp?.competitors?.find(c => c.homeAway === "home");
     const away = comp?.competitors?.find(c => c.homeAway === "away");
-    const hHome = sumFirstTwoPeriods(home?.linescores);
-    const hAway = sumFirstTwoPeriods(away?.linescores);
-    if (Number.isFinite(hHome) && Number.isFinite(hAway)) return `${hAway}-${hHome}`; // away-first
-  } catch {}
-  return "";
+    const hHome = home?.score ?? 0;
+    const hAway = away?.score ?? 0;
+    return `${hAway}-${hHome}`;
+  } catch { return ""; }
 }
 
 /* ───────────────────────── ESPN fetchers ─────────────────────────── */
@@ -97,137 +97,48 @@ async function espnSummary(gameId) {
   const { data } = await axios.get(url, { timeout: 15000 });
   return data;
 }
-async function espnOddsREST_A(gameId) {
-  // legacy path
-  const url = `https://sports.core.api.espn.com/v2/sports/football/${LEAGUE}/competitions/${gameId}/odds`;
-  log("🔎 odds:", url);
-  const { data } = await axios.get(url, { timeout: 15000 });
-  return data;
+
+/* ───────────── ESPN BET text scraper ───────────── */
+function normalizeDashes(s) {
+  return s.replace(/\u2212|\u2013|\u2014/g, "-").replace(/\uFE63|\uFF0B/g, "+");
 }
-async function espnOddsREST_B(gameId) {
-  // events/{id}/competitions/{id}/odds path
-  const url = `https://sports.core.api.espn.com/v2/sports/football/${LEAGUE}/events/${gameId}/competitions/${gameId}/odds`;
-  log("🔎 odds:", url);
-  const { data } = await axios.get(url, { timeout: 15000 });
-  return data;
-}
-
-/* ─────────────── Live market selection & parsing (REST/POOL) ─────────────── */
-function prefTokens(list = MARKET_PREFERENCE) {
-  return (list || "")
-    .split(",")
-    .map(s => s.trim().toLowerCase())
-    .filter(Boolean);
-}
-function textMatchesAny(text, tokens) {
-  const t = normStr(text).toLowerCase();
-  return tokens.some(tok => t.includes(tok));
-}
-function pickLiveFromREST(oddsPayload, tokens) {
-  const items = oddsPayload?.items || [];
-  if (!items.length) return undefined;
-  const label = (mk)=>`${mk?.name||""} ${mk?.displayName||""} ${mk?.period?.displayName||""} ${mk?.period?.abbreviation||""}`;
-  const isLiveish = (mk)=>textMatchesAny(label(mk), tokens);
-  const typed = items.filter(isLiveish);
-  const take = typed[0] || undefined;
-  if (!take) return undefined;
-
-  const b = (take?.books?.[0] || {});
-  const aw = b?.awayTeamOdds || {};
-  const hm = b?.homeTeamOdds || {};
-  const n = v => (v === null || v === undefined || v === "" ? "" : Number(v));
-  const totalBook = b?.current?.total ?? b?.total;
-
-  const spreadAway = n(aw?.current?.spread ?? aw?.spread);
-  const spreadHome = n(hm?.current?.spread ?? hm?.spread ?? (spreadAway !== "" ? -spreadAway : ""));
-  const mlAway     = n(aw?.current?.moneyLine ?? aw?.moneyLine);
-  const mlHome     = n(hm?.current?.moneyLine ?? hm?.moneyLine);
-  const total      = n(totalBook);
-
-  const any = [spreadAway, spreadHome, mlAway, mlHome, total].some(v => v !== "");
-  return any ? { spreadAway, spreadHome, mlAway, mlHome, total } : undefined;
-}
-function pickLiveFromPools(summary, tokens) {
-  const pools = [];
-  if (Array.isArray(summary?.pickcenter)) pools.push(...summary.pickcenter);
-  if (Array.isArray(summary?.odds))       pools.push(...summary.odds);
-  if (!pools.length) return undefined;
-
-  const label = p => `${p?.details || ""} ${p?.name || ""} ${p?.period || ""}`;
-  const match = pools.find(p => textMatchesAny(label(p), tokens));
-  if (!match) return undefined;
-
-  const n = v => (v === null || v === undefined || v === "" ? "" : Number(v));
-  const aw = match?.awayTeamOdds || {};
-  const hm = match?.homeTeamOdds || {};
-
-  const spreadAway = n(aw?.spread);
-  const spreadHome = n(hm?.spread ?? (spreadAway !== "" ? -spreadAway : ""));
-  const mlAway     = n(aw?.moneyLine);
-  const mlHome     = n(hm?.moneyLine);
-  const total      = n(match?.overUnder ?? match?.total);
-
-  const any = [spreadAway, spreadHome, mlAway, mlHome, total].some(v => v !== "");
-  return any ? { spreadAway, spreadHome, mlAway, mlHome, total } : undefined;
-}
-
-/* ───────── ESPN BET text scraper (robust to EVEN / missing prices) ───────── */
-function regexEscape(s) { return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); }
-function normalizeDashes(s) { return s.replace(/\u2212|\u2013|\u2014/g, "-").replace(/\uFE63|\uFF0B/g, "+"); }
-
 function tokenizeOdds(rowText) {
-  // remove o/u prefixes so numbers parse uniformly
   let t = normalizeDashes(rowText).replace(/\b[ou](\d+(?:\.\d+)?)/gi, "$1");
   const parts = t.split(/\s+/).filter(Boolean);
   const NUM = /^[-+]?(\d+(\.\d+)?|\.\d+)$/;
-  return parts.filter(p => NUM.test(p)); // keep only numeric tokens
+  return parts.filter(p => NUM.test(p));
 }
-
-/**
- * Row token structure at ESPN BET (numeric-only after stripping text):
- *   [close?, closePrice?] spread spreadPrice? total totalPrice? moneyline
- * We index from the END so rows with "EVEN" (non-numeric) don't break positions.
- */
-function scrapeRowNumeric(rowText) {
-  const tok = tokenizeOdds(rowText);
-  const L = tok.length;
-  if (L < 5) return undefined; // need at least spread, total, ml
-  const toNum = (v) => (v === "" ? "" : Number(v));
-  const ml      = toNum(tok[L - 1]);
-  const total   = toNum(tok[L - 3]);         // works for 5..7 tokens
-  const spread  = toNum(tok[L - 5]);         // works for 5..7 tokens
+function scrapeRowNumbers(txt) {
+  const nums = tokenizeOdds(txt).map(Number);
+  const spread = nums.find(v => Math.abs(v) <= 60) ?? "";
+  const total = nums.find(v => v >= 30 && v <= 100) ?? "";
+  const ml = nums.find(v => Math.abs(v) >= 100) ?? "";
   return { spread, total, ml };
 }
-
-function scrapeEspnBetText(summary, fullText) {
+function scrapeEspnBetText(summary, html) {
   try {
     const comp = summary?.header?.competitions?.[0];
     const awayName = comp?.competitors?.find(c=>c.homeAway==="away")?.team?.displayName || "";
     const homeName = comp?.competitors?.find(c=>c.homeAway==="home")?.team?.displayName || "";
     if (!awayName || !homeName) return undefined;
 
-    const txt = normalizeDashes(fullText || "");
-    const aIdx = txt.search(new RegExp(regexEscape(awayName), "i"));
-    const hIdx = txt.search(new RegExp(regexEscape(homeName), "i"));
+    const txt = normalizeDashes(html);
+    const aIdx = txt.search(new RegExp(awayName, "i"));
+    const hIdx = txt.search(new RegExp(homeName, "i"));
     if (aIdx < 0 || hIdx < 0) return undefined;
 
-    const aRow = txt.slice(aIdx, hIdx);
-    const hRow = txt.slice(hIdx);
+    const awayRow = txt.slice(aIdx, hIdx);
+    const homeRow = txt.slice(hIdx);
+    const a = scrapeRowNumbers(awayRow);
+    const h = scrapeRowNumbers(homeRow);
 
-    const a = scrapeRowNumeric(aRow);
-    const h = scrapeRowNumeric(hRow);
-    if (!a || !h) return undefined;
-
-    return {
-      spreadAway: a.spread,
-      spreadHome: h.spread,
-      mlAway: a.ml,
-      mlHome: h.ml,
-      total: Number.isFinite(h.total) ? h.total : a.total
-    };
-  } catch {
-    return undefined;
-  }
+    const total = h.total || a.total || "";
+    const any = [a.spread, h.spread, a.ml, h.ml, total].some(v => v !== "");
+    return any ? {
+      spreadA: a.spread, spreadH: h.spread,
+      mlA: a.ml, mlH: h.ml, total
+    } : undefined;
+  } catch { return undefined; }
 }
 
 /* ─────────────────────── values/A1 helpers ───────────────────────── */
@@ -252,152 +163,82 @@ function mapCols(header) {
     GAME_ID: find("Game ID", 0),
     DATE: find("Date", 1),
     STATUS: find("Status", 3),
-    HALF: find("Half Score", 11),         // writing away-home like "10-7"
-    LA_S: find("Live Away Spread", 12),
-    LA_ML: find("Live Away ML", 13),
-    LH_S: find("Live Home Spread", 14),
-    LH_ML: find("Live Home ML", 15),
-    L_TOT: find("Live Total", 16),
+    SCORE: find("Score", 11),
+    HA_S: find("Half A Spread", 12),
+    HA_ML: find("Half A ML", 13),
+    HH_S: find("Half H Spread", 14),
+    HH_ML: find("Half H ML", 15),
+    H_TOT: find("Half Total", 16),
   };
-}
-
-// halftime lock (don’t overwrite odds once game reaches/ passes halftime)
-function isHalftimeOrLater(statusCell) {
-  const t = normStr(statusCell).toLowerCase();
-  return /\b(halftime|3rd|4th|end of 2nd|end of 3rd|ot)\b/.test(t);
-}
-
-// Target rows: GAME_ID match, live-like status, OR date is today/yesterday ET
-function chooseTargets(rows, col) {
-  const targets = [];
-  for (let r = 1; r < rows.length; r++) {
-    const row = rows[r] || [];
-    const id = (row[col.GAME_ID] || "").trim();
-    if (!id) continue;
-
-    const dateCell = (row[col.DATE] || "").trim();   // MM/DD/YY
-    const status   = (row[col.STATUS] || "").trim();
-
-    if (isFinalCell(status)) continue;
-
-    if (GAME_ID && id === GAME_ID) {
-      targets.push({ r, id, reason: "GAME_ID" });
-      continue;
-    }
-    if (looksLiveStatus(status)) {
-      targets.push({ r, id, reason: "live-like status" });
-      continue;
-    }
-    if (dateCell === todayKey || dateCell === yesterdayKey) {
-      targets.push({ r, id, reason: "date window" });
-    }
-  }
-  return targets;
 }
 
 /* ─────────────────────────────── MAIN ────────────────────────────── */
 async function main() {
   try {
     const values = await getValues();
-    if (values.length === 0) { console.log("Sheet empty—nothing to do."); return; }
+    if (values.length === 0) return console.log("Sheet empty—nothing to do.");
     const col = mapCols(values[0]);
-    const targets = chooseTargets(values, col);
-    if (targets.length === 0) { console.log("Nothing to update."); return; }
-    console.log(`[${new Date().toISOString()}] Found ${targets.length} game(s) to update: ${targets.map(t=>t.id).join(", ")}`);
 
-    const tokens = prefTokens(MARKET_PREFERENCE);
+    const targets = [];
+    for (let r = 1; r < values.length; r++) {
+      const row = values[r] || [];
+      const id = (row[col.GAME_ID] || "").trim();
+      const date = (row[col.DATE] || "").trim();
+      const status = (row[col.STATUS] || "").trim();
+      if (!id || isFinalCell(status)) continue;
+      if (GAME_ID && id !== GAME_ID) continue;
+      if (looksLiveStatus(status) || date === todayKey) targets.push({ r, id });
+    }
+    if (!targets.length) return console.log("Nothing to update.");
+
+    console.log(`[${new Date().toISOString()}] Found ${targets.length} game(s) to update.`);
+
     const data = [];
-
     for (const t of targets) {
       console.log(`\n=== 🏈 GAME ${t.id} ===`);
-      const currentStatus = values[t.r]?.[col.STATUS] || "";
-
-      // 1) SUMMARY (status + half score)
       let summary;
-      let nowFinal = false;
       try {
         summary = await espnSummary(t.id);
         const compStatus = summary?.header?.competitions?.[0]?.status;
-        const newStatus  = shortStatusFromEspn(compStatus);
-        nowFinal         = isFinalFromEspn(compStatus);
-
+        const newStatus = shortStatusFromEspn(compStatus);
+        const nowFinal = isFinalFromEspn(compStatus);
+        const period = compStatus?.period ?? 0;
         console.log(`   status: "${newStatus}"`);
 
-        if (newStatus && newStatus !== currentStatus) {
-          data.push(makeValue(a1For(t.r, col.STATUS), newStatus));
+        if (newStatus) data.push(makeValue(a1For(t.r, col.STATUS), newStatus));
+        const score = parseScore(summary);
+        if (score) data.push(makeValue(a1For(t.r, col.SCORE), score));
+
+        // lock after halftime
+        if (period >= 3 || nowFinal) continue;
+
+        // ESPN BET scrape
+        const url = `https://www.espn.com/${LEAGUE === "nfl" ? "nfl" : "college-football"}/game/_/gameId/${t.id}`;
+        const { data: html } = await axios.get(url, { timeout: 15000 });
+        const block = html.match(/ESPN BET SPORTSBOOK[\s\S]*?Note:\s*Odds and lines subject to change\./i);
+        const flat = block ? block[0].replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim() : "";
+        const live = scrapeEspnBetText(summary, flat);
+        if (live) {
+          const w = (c, v) => { if (v !== "" && Number.isFinite(Number(v))) data.push(makeValue(a1For(t.r, c), Number(v))); };
+          w(col.HA_S, live.spreadA);
+          w(col.HA_ML, live.mlA);
+          w(col.HH_S, live.spreadH);
+          w(col.HH_ML, live.mlH);
+          w(col.H_TOT, live.total);
         }
-        const half = parseHalfScore(summary);
-        if (half) data.push(makeValue(a1For(t.r, col.HALF), half));
-        if (nowFinal) continue; // stop here on finals
       } catch (e) {
-        log("   summary warn:", e?.message || e);
-      }
-
-      // Lock odds at/after halftime
-      if (isHalftimeOrLater(values[t.r]?.[col.STATUS])) {
-        console.log("   ⛳ halftime lock — skipping odds update");
-        continue;
-      }
-
-      // 2) LIVE ODDS – REST → pools → ESPN BET scraper
-      let live = undefined;
-
-      try {
-        const oddsA = await espnOddsREST_A(t.id);
-        live = pickLiveFromREST(oddsA, tokens);
-      } catch (e) { log("   odds A failed:", e?.response?.status || e?.message); }
-
-      if (!live) {
-        try {
-          const oddsB = await espnOddsREST_B(t.id);
-          live = pickLiveFromREST(oddsB, tokens);
-        } catch (e) { log("   odds B failed:", e?.response?.status || e?.message); }
-      }
-
-      if (!live && summary) {
-        live = pickLiveFromPools(summary, tokens);
-      }
-
-      if (!live) {
-        try {
-          const url = `https://www.espn.com/${LEAGUE === "nfl" ? "nfl" : "college-football"}/game/_/gameId/${t.id}`;
-          const { data: html } = await axios.get(url, { timeout: 15000 });
-          const blockMatch = html.match(/ESPN BET SPORTSBOOK[\s\S]*?Note:\s*Odds and lines subject to change\./i);
-          const flatText = blockMatch ? blockMatch[0].replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim() : "";
-          if (DEBUG) {
-            console.log("   [scrape] block length:", flatText.length);
-            console.log("   [text] snippet:", flatText.slice(0, 220), "...");
-          }
-          if (flatText) {
-            live = scrapeEspnBetText(summary, flatText);
-          }
-        } catch (e) {
-          log("   scrape warn:", e?.message || e);
-        }
-      }
-
-      if (live) {
-        if (DEBUG) console.log("   → live picked:", JSON.stringify(live));
-        const w = (c, v) => { if (v !== "" && Number.isFinite(Number(v))) data.push(makeValue(a1For(t.r, c), Number(v))); };
-        w(col.LA_S,  live.spreadAway);
-        w(col.LA_ML, live.mlAway);
-        w(col.LH_S,  live.spreadHome);
-        w(col.LH_ML, live.mlHome);
-        w(col.L_TOT, live.total);
-      } else {
-        console.log("   ❌ no live odds found");
+        console.log(`   ⚠️ ${t.id} failed:`, e?.message);
       }
     }
 
+    if (!data.length) return console.log("No updates.");
     await sheets.spreadsheets.values.batchUpdate({
       spreadsheetId: GOOGLE_SHEET_ID,
       requestBody: { valueInputOption: "USER_ENTERED", data },
     });
-
     console.log(`✅ Updated ${data.length} cell(s).`);
   } catch (err) {
-    const code = err?.response?.status || err?.code || err?.message || err;
-    console.error("Live updater fatal:", "*** code:", code, "***");
+    console.error("Live updater fatal:", err?.message || err);
     process.exit(1);
   }
 }
