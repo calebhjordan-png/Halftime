@@ -1,6 +1,6 @@
 // orchestrator.mjs
 // Bold winner, underline pregame favorite, and apply consistent background color grading.
-// Works for both prefill and finals grading.
+// Works for both prefill and finals grading. Safe when no ranges exist.
 
 import axios from "axios";
 import { google } from "googleapis";
@@ -52,32 +52,45 @@ function totalOver(awayScore, homeScore, total) {
   return "push";
 }
 
-function winnerRangeFromDisplay(display, winner) {
+function rangeForSide(display, side) {
   const text = String(display || "");
   const sep = text.indexOf(" @ ");
   if (sep <= 0) return null;
   const n = text.length;
-  let start = 0,
-    end = 0;
-  if (winner === "away") {
-    start = 0;
-    end = sep;
-  } else {
-    start = sep + 3;
-    end = n;
-  }
+  let start = 0, end = 0;
+  if (side === "away") { start = 0; end = sep; }
+  else { start = sep + 3; end = n; }
   start = Math.max(0, Math.min(start, n));
   end = Math.max(start, Math.min(end, n));
   if (start >= end) return null;
   return { start, end, length: n };
 }
 
-function mergeTextRuns(existingRuns = [], winRange, underlineRange) {
-  const length = winRange ? winRange.length : underlineRange.length;
+function favoriteRange(display, favorite) {
+  if (!favorite) return null;
+  return rangeForSide(display, favorite);
+}
+function winnerRangeFromDisplay(display, winner) {
+  if (!winner) return null;
+  return rangeForSide(display, winner);
+}
+
+/**
+ * Merge + normalize text runs.
+ * @param {number} textLength  length of the cell string
+ * @param {Array} existingRuns effective textFormatRuns (can be undefined)
+ * @param {Object|null} winRange range to bold (start,end,length)
+ * @param {Object|null} underlineRange range to underline (start,end,length)
+ * @returns normalized textFormatRuns
+ */
+function mergeTextRuns(textLength, existingRuns = [], winRange, underlineRange) {
+  const length = Math.max(0, Number(textLength) || 0);
+  if (length === 0) return []; // nothing to format
+
   const runs = [...(existingRuns || [])]
     .map((r) => ({
-      startIndex: Math.max(0, Math.min(r.startIndex ?? 0, length)),
-      format: r.format || {},
+      startIndex: Math.max(0, Math.min(r?.startIndex ?? 0, length)),
+      format: r?.format || {},
     }))
     .sort((a, b) => a.startIndex - b.startIndex);
 
@@ -86,15 +99,10 @@ function mergeTextRuns(existingRuns = [], winRange, underlineRange) {
   }
 
   const points = new Set([0, length]);
-  if (winRange) {
-    points.add(winRange.start);
-    points.add(winRange.end);
-  }
-  if (underlineRange) {
-    points.add(underlineRange.start);
-    points.add(underlineRange.end);
-  }
+  if (winRange) { points.add(winRange.start); points.add(winRange.end); }
+  if (underlineRange) { points.add(underlineRange.start); points.add(underlineRange.end); }
   for (const r of runs) points.add(r.startIndex);
+
   const cuts = Array.from(points).sort((a, b) => a - b);
 
   function baseFmtAt(idx) {
@@ -111,14 +119,10 @@ function mergeTextRuns(existingRuns = [], winRange, underlineRange) {
     const segStart = cuts[i];
     const segEnd = cuts[i + 1];
     if (segStart === segEnd) continue;
-    const base = { ...(baseFmtAt(segStart) || {}) };
 
-    const inWinner =
-      winRange &&
-      !(segEnd <= winRange.start || segStart >= winRange.end);
-    const inUnderline =
-      underlineRange &&
-      !(segEnd <= underlineRange.start || segStart >= underlineRange.end);
+    const base = { ...(baseFmtAt(segStart) || {}) };
+    const inWinner = !!(winRange && !(segEnd <= winRange.start || segStart >= winRange.end));
+    const inUnderline = !!(underlineRange && !(segEnd <= underlineRange.start || segStart >= underlineRange.end));
 
     const nextFmt = {
       ...base,
@@ -128,40 +132,17 @@ function mergeTextRuns(existingRuns = [], winRange, underlineRange) {
 
     if (
       !merged.length ||
-      JSON.stringify(merged[merged.length - 1].format) !==
-        JSON.stringify(nextFmt)
+      JSON.stringify(merged[merged.length - 1].format) !== JSON.stringify(nextFmt)
     ) {
       merged.push({ startIndex: segStart, format: nextFmt });
     }
   }
 
-  if (merged.length && merged[merged.length - 1].startIndex >= length) {
-    merged.pop();
-  }
-  if (!merged.length || merged[0].startIndex !== 0)
-    merged.unshift({ startIndex: 0, format: {} });
+  // cleanup
+  if (merged.length && merged[merged.length - 1].startIndex >= length) merged.pop();
+  if (!merged.length || merged[0].startIndex !== 0) merged.unshift({ startIndex: 0, format: {} });
 
   return merged;
-}
-
-function favoriteRange(display, favorite) {
-  const text = String(display || "");
-  const sep = text.indexOf(" @ ");
-  if (sep <= 0) return null;
-  const n = text.length;
-  let start = 0,
-    end = 0;
-  if (favorite === "away") {
-    start = 0;
-    end = sep;
-  } else {
-    start = sep + 3;
-    end = n;
-  }
-  start = Math.max(0, Math.min(start, n));
-  end = Math.max(start, Math.min(end, n));
-  if (start >= end) return null;
-  return { start, end, length: n };
 }
 
 /* ───────────────────────── ESPN Summary ───────────────────────── */
@@ -208,8 +189,7 @@ async function main() {
     range: `${TAB_NAME}!A1:Q1`,
   });
   const headers = headerRes.data.values?.[0] || [];
-  const col = (n) =>
-    headers.findIndex((h) => h.toLowerCase().trim() === n.toLowerCase());
+  const col = (n) => headers.findIndex((h) => h.toLowerCase().trim() === n.toLowerCase());
 
   const C = {
     GAME_ID: col("Game ID"),
@@ -225,21 +205,17 @@ async function main() {
 
   const grid = await getGrid(GOOGLE_SHEET_ID, TAB_NAME, "A2:Q2000");
 
-  // sample ML colors
+  // default shades; try to learn from ML columns if present
   let red = { red: 1, green: 0.85, blue: 0.85 };
   let green = { red: 0.85, green: 1, blue: 0.85 };
   for (const row of grid) {
     for (const c of [C.A_ML, C.H_ML]) {
-      const bg =
-        row.values?.[c]?.effectiveFormat?.backgroundColor ??
-        row.values?.[c]?.userEnteredFormat?.backgroundColor ??
-        null;
-      if (bg) {
-        const r = bg.red ?? 1,
-          g = bg.green ?? 1;
-        if (g > r && !green) green = bg;
-        if (r > g && !red) red = bg;
-      }
+      const cell = row.values?.[c];
+      const bg = cell?.effectiveFormat?.backgroundColor ?? cell?.userEnteredFormat?.backgroundColor ?? null;
+      if (!bg) continue;
+      const r = bg.red ?? 1, g = bg.green ?? 1;
+      if (g > r) green = bg;
+      if (r > g) red = bg;
     }
   }
 
@@ -255,6 +231,8 @@ async function main() {
     const gid = v(C.GAME_ID);
     const status = v(C.STATUS);
     const matchup = v(C.MATCHUP);
+    const textLen = String(matchup || "").length;
+
     const aSpread = toNum(v(C.A_SPREAD));
     const hSpread = toNum(v(C.H_SPREAD));
     const total = toNum(v(C.TOTAL));
@@ -262,49 +240,56 @@ async function main() {
     const parsed = parseFinalScore(finalScore);
     const isFinal = /^final/i.test(status);
 
-    // If final but missing score, backfill
+    // backfill missing final score when status says final
     if (isFinal && !parsed && gid) {
-      try {
-        finalScore = await espnSummary(gid);
-      } catch {}
+      try { finalScore = await espnSummary(gid); } catch {}
     }
 
-    // underline favorite
-    let fav = null;
+    // underline pregame favorite (persist)
+    let favorite = null;
     if (aSpread !== null && hSpread !== null) {
-      fav = Math.abs(aSpread) < Math.abs(hSpread) ? "home" : "away";
+      favorite = Math.abs(aSpread) < Math.abs(hSpread) ? "home" : "away";
     }
-    const favRange = favoriteRange(matchup, fav);
+    const favRange = favoriteRange(matchup, favorite);
 
-    // bold winner (only on final)
+    // bold winner on final (preserve underline + links)
     let winRange = null;
-    if (isFinal && parseFinalScore(finalScore)) {
-      const { away, home } = parseFinalScore(finalScore);
+    const parsedFinal = parseFinalScore(finalScore);
+    if (isFinal && parsedFinal) {
+      const { away, home } = parsedFinal;
       const winner = away > home ? "away" : "home";
       winRange = winnerRangeFromDisplay(matchup, winner);
     }
 
-    const mCell = row[C.MATCHUP] || {};
-    const currentRuns = mCell.textFormatRuns || [];
-    const newRuns = mergeTextRuns(currentRuns, winRange, favRange);
+    // text runs update (only if there is text)
+    if (textLen > 0) {
+      const mCell = row[C.MATCHUP] || {};
+      const currentRuns = Array.isArray(mCell.textFormatRuns) ? mCell.textFormatRuns : [];
+      const newRuns = mergeTextRuns(textLen, currentRuns, winRange, favRange);
 
-    req.push({
-      updateCells: {
-        range: {
-          sheetId: sid,
-          startRowIndex: i + 1,
-          endRowIndex: i + 2,
-          startColumnIndex: C.MATCHUP,
-          endColumnIndex: C.MATCHUP + 1,
-        },
-        rows: [{ values: [{ textFormatRuns: newRuns }] }],
-        fields: "textFormatRuns",
-      },
-    });
+      // only enqueue if different
+      const currentJSON = JSON.stringify(currentRuns || []);
+      const nextJSON = JSON.stringify(newRuns || []);
+      if (currentJSON !== nextJSON) {
+        req.push({
+          updateCells: {
+            range: {
+              sheetId: sid,
+              startRowIndex: i + 1,
+              endRowIndex: i + 2,
+              startColumnIndex: C.MATCHUP,
+              endColumnIndex: C.MATCHUP + 1,
+            },
+            rows: [{ values: [{ textFormatRuns: newRuns }] }],
+            fields: "textFormatRuns",
+          },
+        });
+      }
+    }
 
-    // compute score + coloring
-    if (isFinal && parseFinalScore(finalScore)) {
-      const { away, home } = parseFinalScore(finalScore);
+    // grading colors when final and score present
+    if (isFinal && parsedFinal) {
+      const { away, home } = parsedFinal;
       const covA = coverAway(away, home, aSpread);
       const covH = coverHome(away, home, hSpread);
       const totR = totalOver(away, home, total);
@@ -320,10 +305,7 @@ async function main() {
         { c: C.H_ML, color: colorFor(home > away) },
         { c: C.A_SPREAD, color: colorFor(covA) },
         { c: C.H_SPREAD, color: colorFor(covH) },
-        {
-          c: C.TOTAL,
-          color: totR === "push" ? null : colorFor(totR === true),
-        },
+        { c: C.TOTAL, color: totR === "push" ? null : colorFor(totR === true) },
       ];
       for (const u of upd) {
         if (!u.color) continue;
@@ -371,6 +353,6 @@ async function main() {
 }
 
 main().catch((e) => {
-  console.error("❌ Orchestrator fatal:", e.message);
+  console.error("❌ Orchestrator fatal:", e?.message || e);
   process.exit(1);
 });
