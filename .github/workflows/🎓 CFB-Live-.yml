@@ -1,27 +1,28 @@
-name: 🎓 CFB Live
+name: "🎓 CFB Live"
 
 on:
-  workflow_dispatch:
+  workflow_dispatch: {}
   schedule:
-    # All times are UTC. These windows map to 10:00–01:59 ET year-round.
-    # Top of every hour
-    - cron: "0 14-23 * * *"   # 10:00–19:59 ET
-    - cron: "0 0-5 * * *"     # 20:00–01:59 ET
-    # Every 5 minutes (gated below so we only run the updater when a pre-3rd game is live)
-    - cron: "*/5 14-23 * * *"
-    - cron: "*/5 0-5 * * *"
-
-permissions:
-  contents: read
-
-concurrency:
-  group: cfb-live-${{ github.ref_name }}
-  cancel-in-progress: false
+    # Top-of-hour in ET, regardless of DST:
+    # ET 10:00–01:00 → during EDT (UTC-4): 14–05
+    - cron: "0 14-23 * * 5"     # Fri 10:00–19:00 ET (EDT)
+    - cron: "0 0-5 * * 6"       # Sat 20:00–01:00 ET (EDT)
+    - cron: "0 14-23 * * 6"     # Sat 10:00–19:00 ET (EDT)
+    - cron: "0 0-2 * * 0"       # Sun 20:00–22:00 ET (EDT)
+    # Repeat block for EST (UTC-5) to “pin” 10:00–01:00 ET after DST switch
+    - cron: "0 15-23 * * 5"     # Fri 10:00–18:00 ET (EST)
+    - cron: "0 0-6 * * 6"       # Sat 19:00–01:00 ET (EST)
+    - cron: "0 15-23 * * 6"     # Sat 10:00–18:00 ET (EST)
+    - cron: "0 0-3 * * 0"       # Sun 19:00–22:00 ET (EST)
 
 jobs:
   run:
     runs-on: ubuntu-latest
-
+    env:
+      LEAGUE: "college-football"
+      TAB_NAME: "CFB"
+      GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+      GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -34,29 +35,34 @@ jobs:
       - name: Install deps
         run: npm i axios googleapis
 
-      # Gate: only allow the */5 runs to call the updater when a game is
-      # IN PROGRESS and pre-3rd (Q1, Q2, Halftime).
-      - name: Gate for 5-minute cycle
+      # 1) Decide if any CFB games are pre-3rd (gate looks at ESPN scoreboard)
+      - name: Gate for 5-minute cycle (CFB)
         id: gate
         env:
-          LEAGUE: college-football
-        run: |
-          # Top-of-hour runs ALWAYS proceed.
-          now_min=$(date -u +%M)
-          if [ "$now_min" != "00" ]; then
-            node ops/live-gate.mjs > gate.log || true
-            cat gate.log
-            v=$(grep -Eo 'run_updater=(true|false)' gate.log | cut -d= -f2)
-            echo "run_updater=${v:-false}" >> $GITHUB_OUTPUT
-          else
-            echo "run_updater=true" >> $GITHUB_OUTPUT
-          fi
+          LEAGUE: "college-football"
+          DEBUG_MODE: "0"
+        run: node .github/workflows/live-gate.mjs
 
+      # 2) Always run the updater (this writes Status, Score, live odds)
       - name: Run live updater (CFB)
-        if: steps.gate.outputs.run_updater == 'true'
         env:
-          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
-          GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
           LEAGUE: "college-football"
           TAB_NAME: "CFB"
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+          GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
         run: node live-game.mjs
+
+      # 3) If the gate said FAST=1, queue another run in ~5 minutes
+      - name: Re-queue in 5 minutes if games are pre-3rd
+        if: steps.gate.outputs.FAST == '1'
+        uses: benc-uk/workflow-dispatch@v1
+        with:
+          workflow: "🎓 CFB Live"
+          token: ${{ secrets.GITHUB_TOKEN }}
+          ref: ${{ github.ref }}
+          inputs: ""
+        env:
+          # sleep ~5m before re-queue to avoid a burst; keep job alive to rate-limit
+          SNOOZE: 300
+        run: |
+          sleep "${SNOOZE}"
