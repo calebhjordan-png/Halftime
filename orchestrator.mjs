@@ -9,14 +9,14 @@ const TAB_NAME      = (process.env.TAB_NAME || "NFL").trim();
 const RUN_SCOPE     = (process.env.RUN_SCOPE || "today").toLowerCase();     // "today" | "week"
 const ADAPTIVE_HALFTIME = String(process.env.ADAPTIVE_HALFTIME ?? "1") !== "0";
 
-/** NEW: GitHub Actions JSON-output mode (stdout = JSON only) */
+/** GitHub Actions JSON-output mode (stdout = JSON only) */
 const GHA_JSON_MODE = process.argv.includes("--gha") || String(process.env.GHA_JSON || "") === "1";
 
 /** Bounds for adaptive sleep */
 const MIN_RECHECK_MIN = 2;
 const MAX_RECHECK_MIN = 20;
 
-/** Column names — now with Game ID in col A */
+/** Column names — includes Game ID in col A */
 const COLS = [
   "Game ID", "Date","Week","Status","Matchup","Final Score",
   "Away Spread","Away ML","Home Spread","Home ML","Total",
@@ -83,7 +83,7 @@ function tidyStatus(evt){
   return fmtETTime(evt.date);
 }
 
-/** Week label helpers */
+/** Week labels */
 function resolveWeekLabelFromCalendar(sb, eventDateISO){
   const cal=sb?.leagues?.[0]?.calendar||sb?.calendar||[];
   const t=new Date(eventDateISO).getTime();
@@ -149,7 +149,6 @@ function extractMoneylines(o,awayId,homeId,competitors=[]){
   }
   return {awayML,homeML};
 }
-
 async function extractMLWithFallback(event, baseOdds, away, home){
   const base=extractMoneylines(baseOdds||{},away?.team?.id,home?.team?.id,(event.competitions?.[0]?.competitors)||[]);
   if(base.awayML&&base.homeML) return base;
@@ -225,13 +224,12 @@ function pregameRowFactory(sbForDay){
   };
 }
 
-/** Halftime detection */
+/** Halftime helpers */
 function isHalftimeLike(evt){
   const t=(evt.status?.type?.name||evt.competitions?.[0]?.status?.type?.name||"").toUpperCase();
   const short=(evt.status?.type?.shortDetail||"").toUpperCase();
   return t.includes("HALFTIME")||/Q2.*0:0?0/.test(short)||/HALF/.test(short);
 }
-
 function parseShortDetailClock(s=""){ s=String(s).trim().toUpperCase();
   if(/HALF/.test(s)||/HALFTIME/.test(s)) return {quarter:2,min:0,sec:0,halftime:true};
   if(/FINAL/.test(s)) return {final:true};
@@ -243,7 +241,7 @@ function clampRecheck(mins){ return Math.max(MIN_RECHECK_MIN, Math.min(MAX_RECHE
 function kickoff65CandidateMinutes(evt,row,h){ const half=(row?.[h["half score"]]||"").toString().trim(); if(half) return null; const m=minutesAfterKickoff(evt); if(m<60||m>80) return null; const rem=65-m; return clampRecheck(rem<=0?MIN_RECHECK_MIN:rem); }
 function q2AdaptiveCandidateMinutes(evt){ const p=parseShortDetailClock((evt.status?.type?.shortDetail||"").trim()); if(!p||p.final||p.halftime) return null; if(p.quarter!==2) return null; const left=p.min+p.sec/60; if(left>=10) return null; return clampRecheck(2*left); }
 
-/** Live odds scrape at halftime (one-time) */
+/** Live odds scrape (one-time at halftime) */
 async function scrapeLiveOddsOnce(league, gameId){
   const url=gameUrl(league,gameId);
   const browser=await playwright.chromium.launch({headless:true});
@@ -305,7 +303,7 @@ async function applyCenterFormatting(sheets){
   const auth=new google.auth.GoogleAuth({credentials:{client_email:CREDS.client_email, private_key:CREDS.private_key}, scopes:["https://www.googleapis.com/auth/spreadsheets"]});
   const sheets=google.sheets({version:"v4",auth});
 
-  // Ensure tab + (if needed) header
+  // Ensure tab + header
   const meta=await sheets.spreadsheets.get({spreadsheetId:SHEET_ID});
   const tabs=(meta.data.sheets||[]).map(s=>s.properties?.title);
   if(!tabs.includes(TAB_NAME)){
@@ -321,7 +319,7 @@ async function applyCenterFormatting(sheets){
   const hmap=mapHeadersToIndex(header);
   const rows=values.slice(1);
 
-  /** Build key index of existing rows — prefer Game ID */
+  /** Build index of existing rows — prefer Game ID */
   const keyToRowNum = new Map();
   rows.forEach((r,i)=>{
     const {key}=keyForRow(r,hmap);
@@ -341,29 +339,26 @@ async function applyCenterFormatting(sheets){
   log(`Events found: ${events.length}`);
 
   const buildPregame=pregameRowFactory(firstDaySB);
-  let appendBatch=[], appendedCount=0;
+  let appendBatch=[];
 
   // Append pregame rows only for events not present by **Game ID**
   for(const ev of events){
-    const {values:rowVals, dateET, matchup, gameId}=await buildPregame(ev);
+    const {values:rowVals, dateET, matchup}=await buildPregame(ev);
     const {key}=keyForEvent(ev, dateET, matchup);
     if(!keyToRowNum.has(key)){
       appendBatch.push(rowVals);
-      // Pre-reserve a row number after append? We'll refresh after appending.
     }
   }
   if(appendBatch.length){
     await sheets.spreadsheets.values.append({spreadsheetId:SHEET_ID, range:`${TAB_NAME}!A1`, valueInputOption:"RAW", requestBody:{values:appendBatch}});
-    appendedCount=appendBatch.length;
-
-    // Refresh index from sheet to include the newly appended rows
+    // Refresh index
     const re=await sheets.spreadsheets.values.get({spreadsheetId:SHEET_ID, range:`${TAB_NAME}!A1:Z`});
     const v2=re.data.values||[], hdr2=v2[0]||header, h2=mapHeadersToIndex(hdr2);
     (v2.slice(1)).forEach((r,i)=>{ const {key}=keyForRow(r,h2); if(key) keyToRowNum.set(key, i+2); });
     log(`Appended ${appendBatch.length} pregame row(s).`);
   }
 
-  /** Pass: finals/halftime writes + collect adaptive delay */
+  // Pass 1: finals/halftime + collect adaptive delay
   const batch=new BatchWriter(TAB_NAME);
   let masterDelayMin=null;
 
@@ -447,7 +442,6 @@ async function applyCenterFormatting(sheets){
       const statusName=(ev.status?.type?.name||comp.status?.type?.name||"").toUpperCase();
       if(!statusName.includes("HALFTIME")) continue;
 
-      // snapshot to avoid double-writing
       const snap=await sheets.spreadsheets.values.get({spreadsheetId:SHEET_ID, range:`${TAB_NAME}!A1:Z`});
       const rowsNow=(snap.data.values||[]).slice(1);
       const headerNow=(snap.data.values||[])[0]||header;
