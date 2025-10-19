@@ -7,27 +7,27 @@ on:
         description: "Force 5-minute loop (debug)"
         required: false
         default: "false"
+  # Hourly from 10:00–01:00 ET (convert to UTC in cron if you wish).
   schedule:
-    # Top of every hour. Window gating below (ET 10:00–01:59) decides whether to continue.
     - cron: "0 * * * *"
-
-permissions:
-  contents: read
-  actions: write
-
-concurrency:
-  group: nfl-live
-  cancel-in-progress: false
 
 jobs:
   live:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+
+    env:
+      # Sheet + service account
+      GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+      GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GCP_SA_JSON }}
+
+      # This repo PAT is only needed for self re-dispatch
+      GH_PAT_WORKFLOW: ${{ secrets.GH_PAT_WORKFLOW }}
+
+      # League context for the scripts
+      LEAGUE: nfl
+      TAB_NAME: NFL
 
     steps:
-      - name: Set up job
-        run: echo "NFL live updater starting…"
-
       - name: Checkout
         uses: actions/checkout@v4
 
@@ -37,67 +37,41 @@ jobs:
           node-version: "20"
 
       - name: Install deps
-        run: |
-          # keep it simple and robust across lock changes
-          npm install --no-fund --no-audit
-        env:
-          CI: "true"
-
-      # Only run between 10:00–01:59 ET (manual dispatch always allowed)
-      - name: Hour window guard (ET 10:00–01:59)
-        id: window
-        shell: bash
-        run: |
-          ET_HOUR=$(TZ=America/New_York date +%H)
-          if [ "$ET_HOUR" -ge 10 ] || [ "$ET_HOUR" -le 01 ]; then
-            echo "run_now=true" >> "$GITHUB_OUTPUT"
-            echo "Within allowed window (ET hour=$ET_HOUR)."
-          else
-            echo "run_now=false" >> "$GITHUB_OUTPUT"
-            echo "Outside window (ET hour=$ET_HOUR)."
-          fi
+        run: npm ci
 
       - name: Run NFL live updater
-        if: steps.window.outputs.run_now == 'true' || github.event_name == 'workflow_dispatch'
-        shell: bash
         env:
-          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
-          GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
+          GOOGLE_SHEET_ID: ${{ env.GOOGLE_SHEET_ID }}
+          GOOGLE_SERVICE_ACCOUNT: ${{ env.GOOGLE_SERVICE_ACCOUNT }}
           LEAGUE: nfl
           TAB_NAME: NFL
           DEBUG_MODE: "0"
-        run: |
-          node live-game.mjs
+        run: node live-game.mjs
 
-      # Decide whether we should requeue in 5 minutes (any live game pre-3rd?)
-      - name: Conditional requeue (5-min loop if live games)
+      # ── Gate: decide whether to loop every 5 minutes ──────────────────────────
+      - name: Gate for 5-minute cycle (NFL)
         id: gate
-        if: steps.window.outputs.run_now == 'true' || github.event_name == 'workflow_dispatch'
-        shell: bash
         env:
-          FORCE_FIVE: ${{ inputs.force_five }}
+          GOOGLE_SHEET_ID: ${{ env.GOOGLE_SHEET_ID }}
+          GOOGLE_SERVICE_ACCOUNT: ${{ env.GOOGLE_SERVICE_ACCOUNT }}
           LEAGUE: nfl
-        run: |
-          node orchestrator.mjs > gate.json
-          echo "Gate payload:"
-          cat gate.json
-          SHOULD=$(node -e "console.log(JSON.parse(require('fs').readFileSync('gate.json','utf8')).shouldLoop ? 'true':'false')")
-          echo "should_loop=$SHOULD" >> "$GITHUB_OUTPUT"
+          TAB_NAME: NFL
+        run: node orchestrator.mjs > gate.json
 
-      - name: Sleep 5 minutes when pre-3rd games exist
-        if: steps.gate.outputs.should_loop == 'true'
+      - name: Read gate decision
+        id: read_gate
         run: |
-          echo "Sleeping 300s…"
-          sleep 300
+          echo "json=$(cat gate.json | tr -d '\n')" >> "$GITHUB_OUTPUT"
 
-      - name: Re-queue workflow (self-dispatch)
-        if: steps.gate.outputs.should_loop == 'true'
+      - name: Conditional requeue (5-min loop if live games)
+        if: ${{ inputs.force_five == 'true' || (fromJson(steps.read_gate.outputs.json).shouldLoop) }}
         env:
-          GH_PAT: ${{ secrets.GH_PAT_WORKFLOW }}
+          GH_TOKEN: ${{ env.GH_PAT_WORKFLOW }}
         run: |
-          echo "Re-dispatching NFL Live for another 5-minute cycle…"
+          # Sleep 5 minutes, then self-dispatch this workflow
+          sleep 300
           curl -s -X POST \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
             -H "Accept: application/vnd.github+json" \
-            -H "Authorization: Bearer ${GH_PAT}" \
-            https://api.github.com/repos/${{ github.repository }}/actions/workflows/NFL-Live.yml/dispatches \
-            -d '{"ref":"main","inputs":{"force_five":"false"}}'
+            https://api.github.com/repos/${{ github.repository }}/actions/workflows/${{ github.workflow }} \
+            -d '{"ref":"${{ github.ref_name }}","inputs":{"force_five":"false"}}'
