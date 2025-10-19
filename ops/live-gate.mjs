@@ -1,72 +1,92 @@
 // live-gate.mjs
-// Purpose: tell the workflow whether to run a 5-minute cycle for CFB.
-// Decides by looking at ESPN's *scoreboard* (not the sheet).
-//
-// "FAST=1"  → run every 5 minutes (there is at least one game pre-3rd)
-// "FAST=0"  → run on the top-of-hour only
-//
-// Pre-3rd definition: STATUS_IN_PROGRESS with period 1 or 2, or "Halftime".
+// Emits PURE JSON to STDOUT: { shouldLoop, reason, inProgress, preThird, gameIds }
+// Nothing except JSON goes to stdout. Any human logs go to stderr.
 
 import axios from "axios";
+import { DateTime } from "luxon";
 
-// --- config from env (defaults are safe) ---
-const LEAGUE = process.env.LEAGUE || "college-football"; // keep CFB here
-const DEBUG  = String(process.env.DEBUG_MODE || "") === "1";
+const {
+  LEAGUE = "college-football",               // "college-football" | "nfl"
+} = process.env;
 
-// Format an ET date → YYYYMMDD for ESPN scoreboard ?dates= param
-function ymdInEastern(d = new Date()) {
-  const f = new Intl.DateTimeFormat("en-US", {
-    timeZone: "America/New_York",
-    year: "numeric", month: "2-digit", day: "2-digit"
-  }).formatToParts(d);
-  const yy = f.find(p => p.type === "year").value;
-  const mm = f.find(p => p.type === "month").value;
-  const dd = f.find(p => p.type === "day").value;
-  return `${yy}${mm}${dd}`;
+// ---- helpers ----
+const ET = "America/New_York";
+function inDailyWindowET(now = DateTime.now().setZone(ET)) {
+  // Active between 10:00–01:59 ET (i.e., 10am–2am next day).
+  const h = now.hour;
+  return (h >= 10) || (h <= 1);
 }
 
-function isPreThird(status) {
-  // Robust detection across ESPN variants
-  const type   = status?.type || {};
-  const name   = String(type.name || type.state || "").toUpperCase(); // STATUS_IN_PROGRESS etc.
-  const desc   = (type.shortDetail || type.detail || type.description || "").toLowerCase();
-  const period = Number(status?.period ?? status?.displayPeriod ?? 0);
-
-  if (desc.includes("halftime")) return true;          // halftime still "pre-3rd"
-  if (name.includes("IN_PROGRESS") && period > 0 && period < 3) return true;
-  return false;
-}
-
-async function fetchScoreboard() {
-  const ymd = ymdInEastern();
-  const url = `https://site.api.espn.com/apis/site/v2/sports/football/${LEAGUE}/scoreboard?dates=${ymd}`;
-  if (DEBUG) console.log("🔎 scoreboard:", url);
+async function fetchScoreboardIds(league) {
+  // ESPN “events” list from the scoreboard endpoint
+  const url = `https://site.api.espn.com/apis/site/v2/sports/football/${league}/scoreboard`;
   const { data } = await axios.get(url, { timeout: 15000 });
-  return data;
+  const events = data?.events || [];
+  return events.map(e => String(e?.id)).filter(Boolean);
 }
 
-(async () => {
-  try {
-    const board = await fetchScoreboard();
-    const events = Array.isArray(board?.events) ? board.events : [];
-
-    let preThirdCount = 0;
-    for (const ev of events) {
-      const comp = ev?.competitions?.[0];
-      const st   = comp?.status || ev?.status;
-      if (isPreThird(st)) preThirdCount++;
+async function fetchSummaries(league, ids) {
+  const got = [];
+  for (const id of ids) {
+    try {
+      const url = `https://site.api.espn.com/apis/site/v2/sports/football/${league}/summary?event=${id}`;
+      const { data } = await axios.get(url, { timeout: 15000 });
+      const comp = data?.header?.competitions?.[0];
+      const stat = comp?.status?.type?.description || comp?.status?.type?.detail || "";
+      // figure quarter number if present
+      const qNum = Number(comp?.status?.period ?? 0);
+      const short = comp?.status?.type?.shortDetail || stat || "";
+      const isInProgress = /in\s*progress|^q[1-4]\b|^1st|^2nd|^3rd|^4th|^ot/i.test(short) || /2nd|3rd|4th|OT/i.test(short);
+      const isFinal = /final/i.test(short);
+      got.push({ id, short, qNum, isInProgress, isFinal });
+    } catch (e) {
+      console.error(`summary miss ${id}:`, e?.response?.status || e?.message || e);
     }
-
-    const FAST = preThirdCount > 0 ? "1" : "0";
-    console.log(`Gate: pre-3rd games = ${preThirdCount} → FAST=${FAST}`);
-
-    // Emit GitHub Actions output in both modern & legacy styles
-    console.log(`::set-output name=FAST::${FAST}`);
-    console.log(`FAST=${FAST}`);
-  } catch (err) {
-    console.log("Gate error (failing open to FAST):", err?.message || err);
-    // If the gate can’t decide, fail open so we don’t miss updates.
-    console.log("::set-output name=FAST::1");
-    console.log("FAST=1");
   }
+  return got;
+}
+
+function decideLoop(rows) {
+  const inProgress = rows.filter(r => r.isInProgress && !r.isFinal);
+  const preThird   = inProgress.filter(r => (r.qNum || 0) < 3);
+  if (preThird.length > 0) {
+    return { shouldLoop: true, reason: `${preThird.length} pre-3rd`, inProgress: inProgress.length, preThird: preThird.length, gameIds: preThird.map(r => r.id) };
+  }
+  if (inProgress.length > 0) {
+    return { shouldLoop: false, reason: `all ${inProgress.length} in 3Q+`, inProgress: inProgress.length, preThird: 0, gameIds: [] };
+  }
+  return { shouldLoop: false, reason: "no live games", inProgress: 0, preThird: 0, gameIds: [] };
+}
+
+// ---- main ----
+(async () => {
+  const nowET = DateTime.now().setZone(ET);
+  if (!inDailyWindowET(nowET)) {
+    // Outside window: never loop
+    const out = { shouldLoop: false, reason: "outside 10:00–01:59 ET window", inProgress: 0, preThird: 0, gameIds: [] };
+    process.stdout.write(JSON.stringify(out));
+    return;
+  }
+
+  let ids = [];
+  try {
+    ids = await fetchScoreboardIds(LEAGUE);
+  } catch (e) {
+    console.error("scoreboard fetch failed:", e?.message || e);
+    const out = { shouldLoop: false, reason: "scoreboard error", inProgress: 0, preThird: 0, gameIds: [] };
+    process.stdout.write(JSON.stringify(out));
+    return;
+  }
+
+  if (!ids.length) {
+    const out = { shouldLoop: false, reason: "no events", inProgress: 0, preThird: 0, gameIds: [] };
+    process.stdout.write(JSON.stringify(out));
+    return;
+  }
+
+  const rows = await fetchSummaries(LEAGUE, ids);
+  const decision = decideLoop(rows);
+
+  // Emit PURE JSON
+  process.stdout.write(JSON.stringify(decision));
 })();
