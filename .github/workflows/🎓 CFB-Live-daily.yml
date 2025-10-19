@@ -1,37 +1,22 @@
-name: CFB Live (Daily Planner)
+name: CFB Live (auto-cadence)
 
 on:
   schedule:
-    # Evening windows (16:00–23:59 UTC)
-    - cron: "*/5 16-23 * * 4"   # Thursday
-    - cron: "*/5 16-23 * * 5"   # Friday
-    - cron: "*/5 16-23 * * 6"   # Saturday
-    - cron: "*/5 16-23 * * 0"   # Sunday
-    # Early-morning spillover (00:00–06:59 UTC)
-    - cron: "*/5 0-6 * * 5"     # Friday early morning
-    - cron: "*/5 0-6 * * 6"     # Saturday early morning
-    - cron: "*/5 0-6 * * 0"     # Sunday early morning
-    - cron: "*/5 0-6 * * 1"     # Monday early morning
-
-  # Manual run with optional GAME_ID focus and DEBUG output
+    - cron: "*/5 * * * *"   # every 5 minutes
+    - cron: "0 * * * *"     # top of every hour
   workflow_dispatch:
-    inputs:
-      game_id:
-        description: "Optional ESPN game id to focus on (e.g. 401754371)"
-        required: false
-        default: ""
-      debug:
-        description: "Enable verbose debug logging"
-        type: boolean
-        required: false
-        default: false
 
 jobs:
-  live:
+  cfb-live:
     runs-on: ubuntu-latest
+    env:
+      GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+      GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
+      LEAGUE: "college-football"
+      TAB_NAME: "CFB"
 
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
       - name: Setup Node
@@ -39,16 +24,105 @@ jobs:
         with:
           node-version: "20"
 
-      - name: Install runtime deps
+      - name: Install deps
         run: npm i axios googleapis
 
-      - name: Run live updater (CFB)
+      # Scanner: read the sheet and decide if any CFB games are EARLY-LIVE (pre-3Q)
+      - name: Decide cadence (scan sheet)
+        id: scan
+        run: |
+          node - <<'NODE'
+          const { google } = require("googleapis");
+
+          const svc = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT);
+          const jwt = new google.auth.JWT(
+            svc.client_email, undefined, svc.private_key,
+            ["https://www.googleapis.com/auth/spreadsheets.readonly"]
+          );
+          const sheets = google.sheets({ version: "v4", auth: jwt });
+
+          const TAB_NAME = process.env.TAB_NAME || "CFB";
+          const SPREADSHEET_ID = process.env.GOOGLE_SHEET_ID;
+
+          const todayKey = (() => {
+            const parts = new Intl.DateTimeFormat("en-US", {
+              timeZone: "America/New_York",
+              month: "2-digit", day: "2-digit", year: "2-digit",
+            }).formatToParts(new Date());
+            const mm = parts.find(p => p.type==="month")?.value ?? "00";
+            const dd = parts.find(p => p.type==="day")?.value ?? "00";
+            const yy = parts.find(p => p.type==="year")?.value ?? "00";
+            return `${mm}/${dd}/${yy}`;
+          })();
+
+          const looksEarlyLive = (s) => {
+            const x = String(s||"").toLowerCase();
+            // treat anything clearly before 3Q as early-live
+            if (/halftime|end of 2nd/.test(x)) return true;
+            if (/\b1st\b|\b2nd\b|\bin\s*progress\b|delayed/.test(x)) return true;
+            // explicitly NOT early-live if 3rd/4th/OT/Final
+            if (/\b3rd\b|\b4th\b|\bot\b|final/.test(x)) return false;
+            return false;
+          };
+
+          (async () => {
+            const range = `${TAB_NAME}!A1:Q2000`;
+            const { data } = await sheets.spreadsheets.values.get({
+              spreadsheetId: SPREADSHEET_ID, range
+            });
+            const rows = data.values || [];
+            if (rows.length === 0) {
+              console.log("No rows.");
+              console.log("fast_needed=false");
+              return;
+            }
+            const header = rows[0].map(h => String(h||"").trim().toLowerCase());
+            const idxDate   = header.indexOf("date");     // B
+            const idxStatus = header.indexOf("status");   // D
+            if (idxDate < 0 || idxStatus < 0) {
+              console.log("Missing Date/Status columns.");
+              console.log("fast_needed=false");
+              return;
+            }
+            let earlyLive = false;
+            for (let r=1; r<rows.length; r++){
+              const row = rows[r] || [];
+              const dateCell   = String(row[idxDate]||"").trim();
+              const statusCell = String(row[idxStatus]||"").trim();
+              if (!dateCell || !statusCell) continue;
+              if (/^final$/i.test(statusCell)) continue;
+              if (dateCell === todayKey && looksEarlyLive(statusCell)) {
+                earlyLive = true; break;
+              }
+            }
+            console.log(`fast_needed=${earlyLive}`);
+            // expose to next steps
+            require('fs').appendFileSync(process.env.GITHUB_OUTPUT, `fast_needed=${earlyLive}\n`);
+          })().catch(e => {
+            console.error("scan error:", e?.message||e);
+            require('fs').appendFileSync(process.env.GITHUB_OUTPUT, `fast_needed=false\n`);
+          });
+          NODE
+
+      # Run updater if any early-live games exist (pre-3Q)
+      - name: Run live updater (fast window)
+        if: steps.scan.outputs.fast_needed == 'true'
         env:
-          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
-          GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
           LEAGUE: "college-football"
           TAB_NAME: "CFB"
-          # Debug + single-game focus only when manually triggered
-          GAME_ID: ${{ inputs.game_id }}
-          DEBUG_MODE: ${{ inputs.debug && '1' || '' }}
+          DEBUG_MODE: ""
         run: node live-game.mjs
+
+      # Also run at the top of the hour to keep Status fresh even when not live
+      - name: Run hourly status refresh
+        if: steps.scan.outputs.fast_needed != 'true' && ${{ startsWith(steps.get_minute.outputs.minute, '00') }}
+        env:
+          LEAGUE: "college-football"
+          TAB_NAME: "CFB"
+          DEBUG_MODE: ""
+        run: node live-game.mjs
+
+      # small helper to compute minute (UTC)
+      - name: Compute current minute
+        id: get_minute
+        run: echo "minute=$(date -u +%M)" >> $GITHUB_OUTPUT
