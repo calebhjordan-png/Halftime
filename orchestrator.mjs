@@ -1,7 +1,8 @@
 // orchestrator.mjs
-// Finals sweeper: bold winning team in Matchup (preserve underline/links),
-// and background-color A/H Spreads & Total using the SAME shades as ML columns.
+// Bold winner, underline pregame favorite, and apply consistent background color grading.
+// Works for both prefill and finals grading.
 
+import axios from "axios";
 import { google } from "googleapis";
 
 /* ─────────────────────────── ENV ─────────────────────────── */
@@ -9,6 +10,7 @@ const {
   GOOGLE_SHEET_ID,
   GOOGLE_SERVICE_ACCOUNT,
   TAB_NAME = "CFB",
+  LEAGUE = "college-football",
 } = process.env;
 
 if (!GOOGLE_SHEET_ID) throw new Error("Missing GOOGLE_SHEET_ID");
@@ -50,52 +52,51 @@ function totalOver(awayScore, homeScore, total) {
   return "push";
 }
 
-/**
- * Build winner range (start,end) in "Away @ Home" display string.
- * Returns null if we can't safely split.
- */
 function winnerRangeFromDisplay(display, winner) {
   const text = String(display || "");
   const sep = text.indexOf(" @ ");
   if (sep <= 0) return null;
   const n = text.length;
-  let start = 0, end = 0;
+  let start = 0,
+    end = 0;
   if (winner === "away") {
     start = 0;
-    end = sep; // up to (not including) space before '@'
+    end = sep;
   } else {
-    start = sep + 3; // after " @ "
+    start = sep + 3;
     end = n;
   }
-  // clamp
   start = Math.max(0, Math.min(start, n));
-  end   = Math.max(start, Math.min(end, n));
+  end = Math.max(start, Math.min(end, n));
   if (start >= end) return null;
   return { start, end, length: n };
 }
 
-/**
- * Merge bold into existing textFormatRuns while preserving all other styling (underline, etc.).
- * existingRuns: array of {startIndex, format?}
- * win: {start, end, length}
- */
-function mergeBoldIntoRuns(existingRuns = [], win) {
-  const length = win.length;
-  // Normalize runs sorted with implicit default at 0
+function mergeTextRuns(existingRuns = [], winRange, underlineRange) {
+  const length = winRange ? winRange.length : underlineRange.length;
   const runs = [...(existingRuns || [])]
-    .map(r => ({ startIndex: Math.max(0, Math.min(r.startIndex ?? 0, length)), format: r.format || {} }))
+    .map((r) => ({
+      startIndex: Math.max(0, Math.min(r.startIndex ?? 0, length)),
+      format: r.format || {},
+    }))
     .sort((a, b) => a.startIndex - b.startIndex);
 
   if (!runs.length || runs[0].startIndex !== 0) {
     runs.unshift({ startIndex: 0, format: {} });
   }
 
-  // Build segment boundaries
-  const points = new Set([0, length, win.start, win.end]);
+  const points = new Set([0, length]);
+  if (winRange) {
+    points.add(winRange.start);
+    points.add(winRange.end);
+  }
+  if (underlineRange) {
+    points.add(underlineRange.start);
+    points.add(underlineRange.end);
+  }
   for (const r of runs) points.add(r.startIndex);
   const cuts = Array.from(points).sort((a, b) => a - b);
 
-  // Helper to get base format at an index
   function baseFmtAt(idx) {
     let fmt = {};
     for (const r of runs) {
@@ -105,7 +106,6 @@ function mergeBoldIntoRuns(existingRuns = [], win) {
     return fmt;
   }
 
-  // Walk segments and assign formats (preserve all props, just tweak bold)
   const merged = [];
   for (let i = 0; i < cuts.length - 1; i++) {
     const segStart = cuts[i];
@@ -113,73 +113,81 @@ function mergeBoldIntoRuns(existingRuns = [], win) {
     if (segStart === segEnd) continue;
     const base = { ...(baseFmtAt(segStart) || {}) };
 
-    const overlaps =
-      !(segEnd <= win.start || segStart >= win.end); // any overlap with winner span
-    const nextFmt = { ...base, bold: overlaps ? true : (base.bold ?? false) };
+    const inWinner =
+      winRange &&
+      !(segEnd <= winRange.start || segStart >= winRange.end);
+    const inUnderline =
+      underlineRange &&
+      !(segEnd <= underlineRange.start || segStart >= underlineRange.end);
 
-    // push if first or format changed
+    const nextFmt = {
+      ...base,
+      bold: inWinner ? true : base.bold || false,
+      underline: inUnderline ? true : base.underline || false,
+    };
+
     if (
       !merged.length ||
-      JSON.stringify(merged[merged.length - 1].format || {}) !== JSON.stringify(nextFmt)
+      JSON.stringify(merged[merged.length - 1].format) !==
+        JSON.stringify(nextFmt)
     ) {
       merged.push({ startIndex: segStart, format: nextFmt });
     }
   }
 
-  // Ensure last startIndex < length (Sheets requires this)
   if (merged.length && merged[merged.length - 1].startIndex >= length) {
     merged.pop();
   }
-  // Guarantee a run beginning at 0
-  if (!merged.length || merged[0].startIndex !== 0) {
+  if (!merged.length || merged[0].startIndex !== 0)
     merged.unshift({ startIndex: 0, format: {} });
-  }
+
   return merged;
 }
 
-/**
- * Sample the sheet's ML background colors so we can match shades exactly.
- * Returns { green, red } with {red,green,blue} floats (0..1).
- */
-function sampleMlShades(grid, colAwayML, colHomeML) {
-  let green = null, red = null;
-
-  function pick(c) {
-    const bg =
-      c?.effectiveFormat?.backgroundColor ??
-      c?.userEnteredFormat?.backgroundColor ??
-      null;
-    if (!bg) return;
-    const { red: r = 1, green: g = 1, blue: b = 1 } = bg;
-    // very naive classifier
-    if (g >= r + 0.05 && !green) green = { red: r, green: g, blue: b };
-    if (r >= g + 0.05 && !red)   red   = { red: r, green: g, blue: b };
+function favoriteRange(display, favorite) {
+  const text = String(display || "");
+  const sep = text.indexOf(" @ ");
+  if (sep <= 0) return null;
+  const n = text.length;
+  let start = 0,
+    end = 0;
+  if (favorite === "away") {
+    start = 0;
+    end = sep;
+  } else {
+    start = sep + 3;
+    end = n;
   }
+  start = Math.max(0, Math.min(start, n));
+  end = Math.max(start, Math.min(end, n));
+  if (start >= end) return null;
+  return { start, end, length: n };
+}
 
-  for (const row of grid) {
-    const cells = row?.values || [];
-    if (cells[colAwayML]) pick(cells[colAwayML]);
-    if (cells[colHomeML]) pick(cells[colHomeML]);
-    if (green && red) break;
-  }
-  // Fallback gentle pastels if sheet has no fills yet
-  if (!green) green = { red: 0.85, green: 1.0, blue: 0.85 };
-  if (!red)   red   = { red: 1.0,  green: 0.85, blue: 0.85 };
-  return { green, red };
+/* ───────────────────────── ESPN Summary ───────────────────────── */
+async function espnSummary(gameId) {
+  const url = `https://site.api.espn.com/apis/site/v2/sports/football/${LEAGUE}/summary?event=${gameId}`;
+  const { data } = await axios.get(url, { timeout: 15000 });
+  const comp = data?.header?.competitions?.[0];
+  const home = comp?.competitors?.find((c) => c.homeAway === "home");
+  const away = comp?.competitors?.find((c) => c.homeAway === "away");
+  const homeScore = Number(home?.score ?? 0);
+  const awayScore = Number(away?.score ?? 0);
+  return `${awayScore}-${homeScore}`;
 }
 
 /* ───────────────────── Sheet bootstrap ───────────────────── */
-async function getSheetMeta(spreadsheetId) {
+async function getMeta(spreadsheetId) {
   const { data } = await sheets.spreadsheets.get({
     spreadsheetId,
     includeGridData: false,
   });
   return data;
 }
-function findSheetIdByTitle(meta, title) {
-  const sheet = meta.sheets.find(s => s.properties.title === title);
-  if (!sheet) throw new Error(`Tab "${title}" not found`);
-  return sheet.properties.sheetId;
+function sheetId(meta, title) {
+  const s = meta.sheets.find((x) => x.properties.title === title);
+  if (!s) throw new Error(`No tab ${title}`);
+  return s.properties.sheetId;
 }
 async function getGrid(spreadsheetId, title, rangeA1) {
   const { data } = await sheets.spreadsheets.get({
@@ -190,139 +198,179 @@ async function getGrid(spreadsheetId, title, rangeA1) {
   return data.sheets?.[0]?.data?.[0]?.rowData || [];
 }
 
-/* ───────────────────────── MAIN ─────────────────────────── */
+/* ───────────────────────── MAIN ───────────────────────── */
 async function main() {
-  const meta = await getSheetMeta(GOOGLE_SHEET_ID);
-  const sheetId = findSheetIdByTitle(meta, TAB_NAME);
-
-  const headerRange = "A1:Q1";
-  const rowsRange   = "A2:Q2000";
+  const meta = await getMeta(GOOGLE_SHEET_ID);
+  const sid = sheetId(meta, TAB_NAME);
 
   const headerRes = await sheets.spreadsheets.values.get({
     spreadsheetId: GOOGLE_SHEET_ID,
-    range: `${TAB_NAME}!${headerRange}`,
+    range: `${TAB_NAME}!A1:Q1`,
   });
   const headers = headerRes.data.values?.[0] || [];
+  const col = (n) =>
+    headers.findIndex((h) => h.toLowerCase().trim() === n.toLowerCase());
 
-  const colIdx = (name, fb = -1) => {
-    const i = headers.findIndex(h => String(h).trim().toLowerCase() === name.toLowerCase());
-    return i >= 0 ? i : fb;
+  const C = {
+    GAME_ID: col("Game ID"),
+    STATUS: col("Status"),
+    MATCHUP: col("Matchup"),
+    FINAL: col("Final Score"),
+    A_SPREAD: col("Away Spread"),
+    A_ML: col("Away ML"),
+    H_SPREAD: col("Home Spread"),
+    H_ML: col("Home ML"),
+    TOTAL: col("Total"),
   };
 
-  const COL = {
-    STATUS:     colIdx("Status", 3),
-    MATCHUP:    colIdx("Matchup", 4),
-    FINAL:      colIdx("Final Score", 5),
-    A_SPREAD:   colIdx("Away Spread", 6),
-    A_ML:       colIdx("Away ML", 7),
-    H_SPREAD:   colIdx("Home Spread", 8),
-    H_ML:       colIdx("Home ML", 9),
-    TOTAL:      colIdx("Total", 10),
-  };
+  const grid = await getGrid(GOOGLE_SHEET_ID, TAB_NAME, "A2:Q2000");
 
-  // Grid with formats for Matchup runs + ML background sampling
-  const grid = await getGrid(GOOGLE_SHEET_ID, TAB_NAME, rowsRange);
-
-  // Shade sampling from ML columns
-  const shades = sampleMlShades(grid, COL.A_ML, COL.H_ML);
-
-  const requests = [];
-
-  for (let r = 0; r < grid.length; r++) {
-    const row = grid[r]?.values || [];
-
-    const cellVal = idx => {
-      const v = row[idx];
-      return v?.effectiveValue?.stringValue ?? v?.formattedValue ?? "";
-    };
-
-    const status = cellVal(COL.STATUS);
-    if (!/^final/i.test(status)) continue;
-
-    const finalScore = cellVal(COL.FINAL);
-    const ps = parseFinalScore(finalScore);
-    if (!ps) continue;
-    const { away: sA, home: sH } = ps;
-
-    // 1) Bold the winner (preserving underline/links via merge)
-    const mCell = row[COL.MATCHUP] || {};
-    const display = mCell.formattedValue || "";
-    const existingRuns = mCell.textFormatRuns || [];
-    const winner = sA > sH ? "away" : "home";
-    const win = winnerRangeFromDisplay(display, winner);
-
-    if (win) {
-      const mergedRuns = mergeBoldIntoRuns(existingRuns, win);
-
-      requests.push({
-        updateCells: {
-          range: {
-            sheetId,
-            startRowIndex: r + 1, // A2 is row index 1
-            endRowIndex:   r + 2,
-            startColumnIndex: COL.MATCHUP,
-            endColumnIndex:   COL.MATCHUP + 1,
-          },
-          rows: [{
-            values: [{ textFormatRuns: mergedRuns }]
-          }],
-          fields: "textFormatRuns"
-        }
-      });
-    }
-
-    // 2) Background colors: spreads & total using sampled shades
-    const aSpread = toNum(cellVal(COL.A_SPREAD));
-    const hSpread = toNum(cellVal(COL.H_SPREAD));
-    const total   = toNum(cellVal(COL.TOTAL));
-
-    const covA = coverAway(sA, sH, aSpread); // true/false/null
-    const covH = coverHome(sA, sH, hSpread);
-    const totR = totalOver(sA, sH, total);   // true/false/"push"/null
-
-    const colorFor = (flag) => {
-      if (flag === true) return shades.green;
-      if (flag === false) return shades.red;
-      return null; // leave unchanged
-    };
-
-    const cellColorUpdates = [
-      { col: COL.A_SPREAD, color: colorFor(covA) },
-      { col: COL.H_SPREAD, color: colorFor(covH) },
-      { col: COL.TOTAL,    color: (totR === "push" || totR === null) ? null : colorFor(totR === true) }
-    ];
-
-    for (const cu of cellColorUpdates) {
-      if (!cu.color) continue;
-      requests.push({
-        repeatCell: {
-          range: {
-            sheetId,
-            startRowIndex: r + 1,
-            endRowIndex:   r + 2,
-            startColumnIndex: cu.col,
-            endColumnIndex:   cu.col + 1,
-          },
-          cell: {
-            userEnteredFormat: { backgroundColor: cu.color }
-          },
-          fields: "userEnteredFormat.backgroundColor"
-        }
-      });
+  // sample ML colors
+  let red = { red: 1, green: 0.85, blue: 0.85 };
+  let green = { red: 0.85, green: 1, blue: 0.85 };
+  for (const row of grid) {
+    for (const c of [C.A_ML, C.H_ML]) {
+      const bg =
+        row.values?.[c]?.effectiveFormat?.backgroundColor ??
+        row.values?.[c]?.userEnteredFormat?.backgroundColor ??
+        null;
+      if (bg) {
+        const r = bg.red ?? 1,
+          g = bg.green ?? 1;
+        if (g > r && !green) green = bg;
+        if (r > g && !red) red = bg;
+      }
     }
   }
 
-  if (requests.length) {
+  const req = [];
+
+  for (let i = 0; i < grid.length; i++) {
+    const row = grid[i]?.values || [];
+    const v = (idx) =>
+      row[idx]?.effectiveValue?.stringValue ??
+      row[idx]?.formattedValue ??
+      "";
+
+    const gid = v(C.GAME_ID);
+    const status = v(C.STATUS);
+    const matchup = v(C.MATCHUP);
+    const aSpread = toNum(v(C.A_SPREAD));
+    const hSpread = toNum(v(C.H_SPREAD));
+    const total = toNum(v(C.TOTAL));
+    let finalScore = v(C.FINAL);
+    const parsed = parseFinalScore(finalScore);
+    const isFinal = /^final/i.test(status);
+
+    // If final but missing score, backfill
+    if (isFinal && !parsed && gid) {
+      try {
+        finalScore = await espnSummary(gid);
+      } catch {}
+    }
+
+    // underline favorite
+    let fav = null;
+    if (aSpread !== null && hSpread !== null) {
+      fav = Math.abs(aSpread) < Math.abs(hSpread) ? "home" : "away";
+    }
+    const favRange = favoriteRange(matchup, fav);
+
+    // bold winner (only on final)
+    let winRange = null;
+    if (isFinal && parseFinalScore(finalScore)) {
+      const { away, home } = parseFinalScore(finalScore);
+      const winner = away > home ? "away" : "home";
+      winRange = winnerRangeFromDisplay(matchup, winner);
+    }
+
+    const mCell = row[C.MATCHUP] || {};
+    const currentRuns = mCell.textFormatRuns || [];
+    const newRuns = mergeTextRuns(currentRuns, winRange, favRange);
+
+    req.push({
+      updateCells: {
+        range: {
+          sheetId: sid,
+          startRowIndex: i + 1,
+          endRowIndex: i + 2,
+          startColumnIndex: C.MATCHUP,
+          endColumnIndex: C.MATCHUP + 1,
+        },
+        rows: [{ values: [{ textFormatRuns: newRuns }] }],
+        fields: "textFormatRuns",
+      },
+    });
+
+    // compute score + coloring
+    if (isFinal && parseFinalScore(finalScore)) {
+      const { away, home } = parseFinalScore(finalScore);
+      const covA = coverAway(away, home, aSpread);
+      const covH = coverHome(away, home, hSpread);
+      const totR = totalOver(away, home, total);
+
+      const colorFor = (flag) => {
+        if (flag === true) return green;
+        if (flag === false) return red;
+        return null;
+      };
+
+      const upd = [
+        { c: C.A_ML, color: colorFor(away > home) },
+        { c: C.H_ML, color: colorFor(home > away) },
+        { c: C.A_SPREAD, color: colorFor(covA) },
+        { c: C.H_SPREAD, color: colorFor(covH) },
+        {
+          c: C.TOTAL,
+          color: totR === "push" ? null : colorFor(totR === true),
+        },
+      ];
+      for (const u of upd) {
+        if (!u.color) continue;
+        req.push({
+          repeatCell: {
+            range: {
+              sheetId: sid,
+              startRowIndex: i + 1,
+              endRowIndex: i + 2,
+              startColumnIndex: u.c,
+              endColumnIndex: u.c + 1,
+            },
+            cell: { userEnteredFormat: { backgroundColor: u.color } },
+            fields: "userEnteredFormat.backgroundColor",
+          },
+        });
+      }
+
+      // write Final Score if missing
+      if (!v(C.FINAL) && finalScore) {
+        req.push({
+          updateCells: {
+            range: {
+              sheetId: sid,
+              startRowIndex: i + 1,
+              endRowIndex: i + 2,
+              startColumnIndex: C.FINAL,
+              endColumnIndex: C.FINAL + 1,
+            },
+            rows: [{ values: [{ userEnteredValue: { stringValue: finalScore } }] }],
+            fields: "userEnteredValue.stringValue",
+          },
+        });
+      }
+    }
+  }
+
+  if (req.length) {
     await sheets.spreadsheets.batchUpdate({
       spreadsheetId: GOOGLE_SHEET_ID,
-      requestBody: { requests }
+      requestBody: { requests: req },
     });
   }
-
-  console.log(`Orchestrator: applied ${requests.length} request(s).`);
+  console.log(`✅ Applied ${req.length} updates.`);
 }
 
-main().catch(err => {
-  console.error("Orchestrator fatal:", JSON.stringify(err, null, 2));
+main().catch((e) => {
+  console.error("❌ Orchestrator fatal:", e.message);
   process.exit(1);
 });
