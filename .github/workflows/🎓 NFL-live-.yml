@@ -1,12 +1,7 @@
 name: NFL Live
 
 on:
-  workflow_dispatch:
-    inputs:
-      tab_name:
-        description: "Sheet tab to update"
-        required: false
-        default: "NFL"
+  workflow_dispatch: {}
 
 concurrency:
   group: nfl-live-${{ github.ref }}
@@ -18,7 +13,7 @@ jobs:
     timeout-minutes: 360
     env:
       LEAGUE: nfl
-      TAB_NAME: ${{ inputs.tab_name || 'NFL' }}
+      TAB_NAME: NFL
       GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
       GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
       MAX_TOTAL_MIN: 200
@@ -36,7 +31,7 @@ jobs:
         run: |
           npm i googleapis
 
-      # ── Collect today's Game IDs (ET) from the NFL tab (column A) ─────────────────
+      # ── Collect today's Game IDs (ET) from the NFL tab (column A) ────────────────
       - name: Collect today’s Game IDs from sheet
         id: ids
         shell: bash
@@ -46,20 +41,21 @@ jobs:
           TAB_NAME: ${{ env.TAB_NAME }}
         run: |
           node - <<'NODE'
-          import { google } from "googleapis";
+          const { google } = require("googleapis");
+          const { appendFileSync } = require("node:fs");
 
           const SHEET_ID = process.env.GOOGLE_SHEET_ID;
           const SA = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT);
           const TAB = process.env.TAB_NAME || "NFL";
           const ET = "America/New_York";
 
-          const todayEtMDY = () => {
-            const p = new Intl.DateTimeFormat("en-US", {
+          function todayEtMDY() {
+            const parts = new Intl.DateTimeFormat("en-US", {
               timeZone: ET, year: "2-digit", month: "2-digit", day: "2-digit"
             }).formatToParts(new Date());
-            const g = k => p.find(x => x.type === k)?.value || "";
+            const g = (k) => parts.find(x => x.type === k)?.value || "";
             return `${g("month")}/${g("day")}/${g("year")}`; // MM/DD/YY
-          };
+          }
 
           (async () => {
             const auth = new google.auth.JWT(
@@ -97,10 +93,9 @@ jobs:
               ids.push(gid);
             }
 
-            const out = JSON.stringify(ids);
             console.log("TODAY_IDS=" + ids.join(","));
-            // Export to GHA outputs (new syntax)
-            require("fs").appendFileSync(process.env.GITHUB_OUTPUT, `list=${out}\n`);
+            // set the step output "list"
+            appendFileSync(process.env.GITHUB_OUTPUT, `list=${JSON.stringify(ids)}\n`);
           })().catch(e => { console.error(e); process.exit(1); });
           NODE
 
@@ -114,8 +109,8 @@ jobs:
           GOOGLE_SHEET_ID: ${{ env.GOOGLE_SHEET_ID }}
           GOOGLE_SERVICE_ACCOUNT: ${{ env.GOOGLE_SERVICE_ACCOUNT }}
           MAX_TOTAL_MIN: ${{ env.MAX_TOTAL_MIN }}
+          IDS_JSON: ${{ steps.ids.outputs.list }}
         run: |
-          IDS_JSON='${{ steps.ids.outputs.list }}'
           node -e "
             const ids = JSON.parse(process.env.IDS_JSON || '[]');
             if (!ids.length) { console.log('No today IDs'); process.exit(0); }
@@ -133,10 +128,3 @@ jobs:
               }
             })().catch(e => { console.error(e); process.exit(1); });
           "
-
-      # Optional: show the IDs we actually watched in the job summary
-      - name: Summary
-        if: always()
-        run: |
-          echo '### NFL Live watched IDs' >> $GITHUB_STEP_SUMMARY
-          echo '${{ steps.ids.outputs.list }}' >> $GITHUB_STEP_SUMMARY
