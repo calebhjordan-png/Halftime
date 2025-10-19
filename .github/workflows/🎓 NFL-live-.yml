@@ -2,21 +2,25 @@ name: NFL Live
 
 on:
   workflow_dispatch: {}
+  schedule:
+    # Top of the hour, 10:00–23:00 & 00:00–02:00 ET
+    # GitHub cron uses UTC. Adjust from ET (UTC-4/5). Example here assumes EDT (UTC-4).
+    - cron: "0 14-23 * * *"   # 10:00–19:00 ET
+    - cron: "0 0-6 * * *"     # 20:00–02:00 ET
 
 concurrency:
   group: nfl-live-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   live:
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+    timeout-minutes: 60
     env:
       LEAGUE: nfl
       TAB_NAME: NFL
       GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
       GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
-      MAX_TOTAL_MIN: 200
 
     steps:
       - name: Checkout
@@ -31,7 +35,6 @@ jobs:
         run: |
           npm i googleapis
 
-      # ── Collect today's Game IDs (ET) from the NFL tab (column A) ────────────────
       - name: Collect today’s Game IDs from sheet
         id: ids
         shell: bash
@@ -70,15 +73,12 @@ jobs:
               range: `${TAB}!A1:Z2000`,
             });
             const rows = r.data.values || [];
-            if (!rows.length) { console.log("No rows"); return; }
+            if (!rows.length) { appendFileSync(process.env.GITHUB_OUTPUT, `list=[]\n`); return; }
 
             const header = rows[0] || [];
             const h = Object.fromEntries(header.map((x,i)=>[(x||"").trim().toLowerCase(), i]));
             const iA = h["game id"], iDate = h["date"], iStatus = h["status"];
-            if (iA == null || iDate == null) {
-              console.error("Missing required columns: 'Game ID' or 'Date'");
-              process.exit(1);
-            }
+            if (iA == null || iDate == null) { appendFileSync(process.env.GITHUB_OUTPUT, `list=[]\n`); return; }
 
             const today = todayEtMDY();
             const ids = [];
@@ -88,19 +88,17 @@ jobs:
               const d   = (row[iDate] || "").toString().trim();
               const st  = iStatus == null ? "" : (row[iStatus] || "").toString().trim().toLowerCase();
               if (!gid) continue;
-              if (d !== today) continue;      // only today's games → avoids next-week rows
-              if (st === "final") continue;   // skip already finished games
+              if (d !== today) continue;
+              if (st === "final") continue;
               ids.push(gid);
             }
 
-            console.log("TODAY_IDS=" + ids.join(","));
-            // set the step output "list"
             appendFileSync(process.env.GITHUB_OUTPUT, `list=${JSON.stringify(ids)}\n`);
+            console.log("TODAY_IDS=" + ids.join(","));
           })().catch(e => { console.error(e); process.exit(1); });
           NODE
 
-      # ── Run live-game.mjs (status + halftime) for each ID sequentially ────────────
-      - name: Run live-game for each ID (status + halftime only)
+      - name: Run live-game oneshot for each ID in parallel
         if: steps.ids.outputs.list != '[]'
         shell: bash
         env:
@@ -108,23 +106,21 @@ jobs:
           TAB_NAME: ${{ env.TAB_NAME }}
           GOOGLE_SHEET_ID: ${{ env.GOOGLE_SHEET_ID }}
           GOOGLE_SERVICE_ACCOUNT: ${{ env.GOOGLE_SERVICE_ACCOUNT }}
-          MAX_TOTAL_MIN: ${{ env.MAX_TOTAL_MIN }}
           IDS_JSON: ${{ steps.ids.outputs.list }}
         run: |
+          ids=$(node -e "process.stdout.write((process.env.IDS_JSON||'[]'))")
           node -e "
-            const ids = JSON.parse(process.env.IDS_JSON || '[]');
-            if (!ids.length) { console.log('No today IDs'); process.exit(0); }
+            const ids = JSON.parse(process.argv[1]||'[]');
+            if (!ids.length) process.exit(0);
             (async () => {
               const { spawn } = await import('node:child_process');
-              for (const id of ids) {
-                console.log('▶ watching', id);
-                await new Promise((res, rej) => {
-                  const p = spawn('node', ['live-game.mjs'], {
-                    stdio: 'inherit',
-                    env: { ...process.env, TARGET_GAME_ID: String(id) }
-                  });
-                  p.on('exit', c => c === 0 ? res() : rej(new Error('exit ' + c)));
+              const procs = ids.map(id => new Promise((res, rej) => {
+                const p = spawn('node',['live-game.mjs'],{
+                  stdio:'inherit',
+                  env:{...process.env, TARGET_GAME_ID:String(id), ONESHOT:'true'}
                 });
-              }
+                p.on('exit', c => c===0 ? res() : rej(new Error('exit '+c)));
+              }));
+              await Promise.allSettled(procs);
             })().catch(e => { console.error(e); process.exit(1); });
-          "
+          " "$ids"
