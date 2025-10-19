@@ -7,23 +7,16 @@ on:
         description: "Force 5-minute loop (debug)"
         required: false
         default: "false"
-  # Hourly from 10:00–01:00 ET (convert to UTC in cron if you wish).
   schedule:
     - cron: "0 * * * *"
 
 jobs:
   live:
     runs-on: ubuntu-latest
-
     env:
-      # Sheet + service account
       GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
       GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GCP_SA_JSON }}
-
-      # This repo PAT is only needed for self re-dispatch
       GH_PAT_WORKFLOW: ${{ secrets.GH_PAT_WORKFLOW }}
-
-      # League context for the scripts
       LEAGUE: nfl
       TAB_NAME: NFL
 
@@ -36,8 +29,9 @@ jobs:
         with:
           node-version: "20"
 
+      # ⬅️ switched from `npm ci` to `npm install`
       - name: Install deps
-        run: npm ci
+        run: npm install --no-audit --no-fund
 
       - name: Run NFL live updater
         env:
@@ -48,7 +42,6 @@ jobs:
           DEBUG_MODE: "0"
         run: node live-game.mjs
 
-      # ── Gate: decide whether to loop every 5 minutes ──────────────────────────
       - name: Gate for 5-minute cycle (NFL)
         id: gate
         env:
@@ -60,15 +53,13 @@ jobs:
 
       - name: Read gate decision
         id: read_gate
-        run: |
-          echo "json=$(cat gate.json | tr -d '\n')" >> "$GITHUB_OUTPUT"
+        run: echo "json=$(tr -d '\n' < gate.json)" >> "$GITHUB_OUTPUT"
 
       - name: Conditional requeue (5-min loop if live games)
         if: ${{ inputs.force_five == 'true' || (fromJson(steps.read_gate.outputs.json).shouldLoop) }}
         env:
           GH_TOKEN: ${{ env.GH_PAT_WORKFLOW }}
         run: |
-          # Sleep 5 minutes, then self-dispatch this workflow
           sleep 300
           curl -s -X POST \
             -H "Authorization: Bearer ${GH_TOKEN}" \
