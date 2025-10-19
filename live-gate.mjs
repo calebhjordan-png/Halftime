@@ -1,12 +1,13 @@
 // live-gate.mjs — emits a single FAST output for GitHub Actions
-// FAST=1 → run 5-min loop (there is at least one game pre-3rd or halftime)
-// FAST=0 → skip 5-min loop
+// FAST=1  → run 5-min loop (there is at least one game pre-3rd or halftime)
+// FAST=0  → skip 5-min loop
+
+import fs from "node:fs";
 
 const LEAGUE = (process.env.LEAGUE || "college-football").toLowerCase();
 const DEBUG  = String(process.env.DEBUG_MODE || "") === "1";
-
-// Keep stdout machine-clean when running in GA mode; send logs to stderr.
 const GHA_JSON_MODE = process.argv.includes("--gha") || process.env.GHA_JSON === "1";
+
 const log  = (...a) => GHA_JSON_MODE ? process.stderr.write(a.join(" ") + "\n") : console.log(...a);
 const elog = (...a) => process.stderr.write(a.join(" ") + "\n");
 
@@ -38,7 +39,9 @@ async function fetchScoreboard() {
 
 function writeGhaOutput(name, value) {
   const file = process.env.GITHUB_OUTPUT;
-  if (file) require("fs").appendFileSync(file, `${name}=${value}\n`, "utf8");
+  if (file) {
+    fs.appendFileSync(file, `${name}=${value}\n`, "utf8");
+  }
 }
 
 (async () => {
@@ -55,7 +58,7 @@ function writeGhaOutput(name, value) {
     // Expose to downstream steps as steps.gate.outputs.FAST
     writeGhaOutput("FAST", FAST);
 
-    // Keep stdout pure JSON (for optional consumption/logging)
+    // Keep stdout pure JSON (optional to read/log) when in GA mode
     if (GHA_JSON_MODE) {
       process.stdout.write(JSON.stringify({ ok: true, FAST }) + "\n");
     } else {
