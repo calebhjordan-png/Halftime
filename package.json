@@ -9,17 +9,10 @@
     "live:nfl": "LEAGUE=nfl TAB_NAME=NFL node live-game.mjs"
   },
   "dependencies": {
-<<<<<<< HEAD
     "axios": "1.12.2",
     "googleapis": "129.0.0",
     "luxon": "3.7.2",
     "dotenv": "17.2.3",
     "playwright": "1.48.2"
-=======
-    "axios": "^1.12.2",
-    "dotenv": "^17.2.3",
-    "googleapis": "^126.0.1",
-    "playwright": "^1.48.2"
->>>>>>> 40213c9 (wip: local edits before rebase)
   }
 }
