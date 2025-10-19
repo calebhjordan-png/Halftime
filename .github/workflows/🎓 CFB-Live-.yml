@@ -1,10 +1,10 @@
-name: NFL Live
+name: 🎓 CFB Live
 
 on:
   schedule:
     # Hourly during window (top of hour)
-    - cron: "0 14-23 * * *"
-    - cron: "0 0-6 * * *"
+    - cron: "0 14-23 * * *"   # 10:00–23:59 ET
+    - cron: "0 0-6 * * *"     # 00:00–02:59 ET
     # Every 5 minutes during window
     - cron: "*/5 14-23 * * *"
     - cron: "*/5 0-6 * * *"
@@ -22,6 +22,7 @@ jobs:
       - name: Install deps
         run: npm i axios googleapis
 
+      # Guard: only allow runs inside 10:00–02:59 ET
       - name: Check ET window
         id: window
         run: |
@@ -39,11 +40,11 @@ jobs:
           console.log('ET hour =', h, 'ok_window =', ok);
           NODE
 
-      - name: Decide from ESPN scoreboard (NFL)
+      - name: Decide from ESPN scoreboard (CFB)
         if: steps.window.outputs.ok == 'true'
         id: scan
         env:
-          LEAGUE: nfl
+          LEAGUE: college-football
         run: |
           node - <<'NODE'
           const { appendFileSync } = require('fs');
@@ -56,15 +57,15 @@ jobs:
               const events = data?.events || [];
               const should = events.some(ev => {
                 const st = ev?.competitions?.[0]?.status || {};
-                const name  = String(st?.type?.name || '').toLowerCase();
-                const short = String(st?.type?.shortDetail || '').toLowerCase();
+                const name  = String(st?.type?.name || '').toLowerCase();       // e.g., STATUS_IN_PROGRESS
+                const short = String(st?.type?.shortDetail || '').toLowerCase(); // "12:34 - 2nd", "Halftime"
                 const completed = !!st?.type?.completed;
                 const period = Number(st?.period || 0);
 
                 if (completed) return false;
                 if (short.includes('halftime')) return true;
                 if (/\b(1st|2nd)\b/.test(short)) return true;
-                if (name.includes('in') && period <= 2) return true;
+                if (name.includes('in') && period <= 2) return true; // “in progress” and pre-3rd
                 return false;
               });
               console.log('should_run =', should);
@@ -76,11 +77,11 @@ jobs:
           })();
           NODE
 
-      - name: Run live updater (NFL)
+      - name: Run live updater (CFB)
         if: steps.window.outputs.ok == 'true' && steps.scan.outputs.should_run == 'true'
         env:
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
           GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
-          LEAGUE: "nfl"
-          TAB_NAME: "NFL"
+          LEAGUE: "college-football"
+          TAB_NAME: "CFB"
         run: node live-game.mjs
