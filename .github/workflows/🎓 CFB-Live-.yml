@@ -1,62 +1,73 @@
-name: 🎓 CFB Live
+// ops/live-gate.mjs
+// Purpose: tell the workflow whether to run live-game.mjs on */5 schedules.
+// Rule: return run_updater=true if ANY game is IN PROGRESS and pre-3rd (Q1, Q2, Halftime).
 
-on:
-  workflow_dispatch:
-  schedule:
-    # All times are UTC. These windows map to 10:00–01:59 ET year-round.
-    # Top of every hour
-    - cron: "0 14-23 * * *"   # 10:00–19:59 ET
-    - cron: "0 0-5 * * *"     # 20:00–01:59 ET
-    # Every 5 minutes (gated below so we only run the updater when a pre-3rd game is live)
-    - cron: "*/5 14-23 * * *"
-    - cron: "*/5 0-5 * * *"
+import axios from "axios";
 
-permissions:
-  contents: read
+const LEAGUE = (process.env.LEAGUE || "college-football").trim(); // "college-football" | "nfl"
 
-concurrency:
-  group: cfb-live-${{ github.ref_name }}
-  cancel-in-progress: false
+// Build an ET (America/New_York) YYYYMMDD for ESPN scoreboard
+function etYmd(d = new Date()) {
+  const fmt = new Intl.DateTimeFormat("en-US", {
+    timeZone: "America/New_York",
+    year: "numeric", month: "2-digit", day: "2-digit",
+  });
+  const parts = Object.fromEntries(fmt.formatToParts(d).map(p => [p.type, p.value]));
+  return `${parts.year}${parts.month}${parts.day}`;
+}
 
-jobs:
-  run:
-    runs-on: ubuntu-latest
+function leaguePath(l) {
+  return l === "nfl" ? "nfl" : "college-football";
+}
 
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+function isPreThird(status) {
+  // ESPN status shape:
+  // status.type.state -> "in" | "post" | "pre"
+  // status.period -> 1,2,3,4,...
+  // status.type.shortDetail -> e.g. "Halftime" / "3:41 - 1st" etc.
+  const s = status || {};
+  const period = Number(s.period || 0);
+  const state = (s?.type?.state || "").toLowerCase();
+  const short = (s?.type?.shortDetail || "").toLowerCase();
 
-      - name: Setup Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: "20"
+  if (state !== "in") return false;
+  if (period <= 2) return true;
+  if (short.includes("half")) return true;
+  return false;
+}
 
-      - name: Install deps
-        run: npm i axios googleapis
+async function fetchScoreboard(dayYmd) {
+  const sportPath = leaguePath(LEAGUE);
+  const url = `https://site.api.espn.com/apis/site/v2/sports/football/${sportPath}/scoreboard?dates=${dayYmd}&limit=500`;
+  const { data } = await axios.get(url, { timeout: 15000 });
+  return data;
+}
 
-      # Gate: only allow the */5 runs to call the updater when a game is
-      # IN PROGRESS and pre-3rd (Q1, Q2, Halftime).
-      - name: Gate for 5-minute cycle
-        id: gate
-        env:
-          LEAGUE: college-football
-        run: |
-          # Top-of-hour runs ALWAYS proceed.
-          now_min=$(date -u +%M)
-          if [ "$now_min" != "00" ]; then
-            node ops/live-gate.mjs > gate.log || true
-            cat gate.log
-            v=$(grep -Eo 'run_updater=(true|false)' gate.log | cut -d= -f2)
-            echo "run_updater=${v:-false}" >> $GITHUB_OUTPUT
-          else
-            echo "run_updater=true" >> $GITHUB_OUTPUT
-          fi
+(async () => {
+  try {
+    const ymd = etYmd();
+    const board = await fetchScoreboard(ymd);
+    const events = Array.isArray(board?.events) ? board.events : [];
 
-      - name: Run live updater (CFB)
-        if: steps.gate.outputs.run_updater == 'true'
-        env:
-          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
-          GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
-          LEAGUE: "college-football"
-          TAB_NAME: "CFB"
-        run: node live-game.mjs
+    let livePreThird = [];
+    for (const ev of events) {
+      const comp = ev?.competitions?.[0];
+      const st = comp?.status || ev?.status;
+      if (isPreThird(st)) {
+        livePreThird.push(ev?.id || comp?.id || "unknown");
+      }
+    }
+
+    const runUpdater = livePreThird.length > 0;
+
+    console.log(`[live-gate] league=${LEAGUE}, etDate=${ymd}`);
+    console.log(`[live-gate] live pre-3rd games: ${livePreThird.join(", ") || "(none)"}`);
+    console.log(`run_updater=${runUpdater ? "true" : "false"}`);
+    process.exit(0);
+  } catch (e) {
+    // Fail closed: if gate can't decide, don't spam the */5 runs
+    console.log(`[live-gate] error: ${e?.message || e}`);
+    console.log("run_updater=false");
+    process.exit(0);
+  }
+})();
