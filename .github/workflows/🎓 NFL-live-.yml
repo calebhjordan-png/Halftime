@@ -1,34 +1,34 @@
-name: "🎓 NFL Live"
+name: "🎓 NFL Live (Hourly + Smart 5-Minute Loop)"
 
 on:
   workflow_dispatch:
     inputs:
-      game_id:
-        description: "Optional ESPN game id to focus on"
+      force_five:
+        description: "Force 5-minute loop (debug)"
         required: false
-        default: ""
-      debug:
-        description: "Enable verbose debug logging"
-        required: false
-        default: "0"
+        default: "false"
   schedule:
-    # ET window only (10:00 → 01:59, pinned with TZ below)
-    - cron: "0 10-23 * * *"
-    - cron: "0 0-1 * * *"
-    - cron: "*/5 10-23 * * *"
-    - cron: "*/5 0-1 * * *"
+    # Top of every hour. Window gating below (ET 10:00–01:59) decides whether to continue.
+    - cron: "0 * * * *"
 
-env:
-  TZ: America/New_York
-  LEAGUE: nfl
-  TAB_NAME: NFL
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: nfl-live
+  cancel-in-progress: false
 
 jobs:
-  run:
+  live:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
 
     steps:
-      - name: Checkout repo
+      - name: Set up job
+        run: echo "NFL live updater starting…"
+
+      - name: Checkout
         uses: actions/checkout@v4
 
       - name: Setup Node
@@ -37,84 +37,67 @@ jobs:
           node-version: "20"
 
       - name: Install deps
-        run: npm i axios googleapis
-
-      - name: Scan ESPN for live (≤ HT) games
-        id: scan
+        run: |
+          # keep it simple and robust across lock changes
+          npm install --no-fund --no-audit
         env:
-          ESPN_SPORT: football
-          ESPN_LEAGUE: nfl
+          CI: "true"
+
+      # Only run between 10:00–01:59 ET (manual dispatch always allowed)
+      - name: Hour window guard (ET 10:00–01:59)
+        id: window
         shell: bash
         run: |
-          set -euo pipefail
-          SCHED="${{ github.event.schedule || '' }}"
-          echo "schedule_fired=$SCHED" >> "$GITHUB_OUTPUT"
-          echo "live=false" >> "$GITHUB_OUTPUT"
-          echo "ids="       >> "$GITHUB_OUTPUT"
-
-          if [[ "${{ github.event_name }}" == "workflow_dispatch" && -n "${{ github.event.inputs.game_id }}" ]]; then
-            echo "live=true"        >> "$GITHUB_OUTPUT"
-            echo "ids=${{ github.event.inputs.game_id }}" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          URL="https://site.api.espn.com/apis/site/v2/sports/${ESPN_SPORT}/${ESPN_LEAGUE}/scoreboard"
-          curl -sS "$URL" > /tmp/scoreboard.json
-
-          IDS=$(jq -r '
-            .events[]
-            | select(.status.type.state=="in")
-            | select((.status.period|tonumber) <= 2 or (.status.type.description|ascii_downcase|test("halftime")))
-            | .id
-          ' /tmp/scoreboard.json | tr '\n' ' ' | sed 's/  */ /g' | sed 's/[[:space:]]$//')
-
-          if [[ -n "$IDS" ]]; then
-            echo "Live (≤HT) game IDs: $IDS"
-            echo "live=true" >> "$GITHUB_OUTPUT"
-            echo "ids=$IDS"  >> "$GITHUB_OUTPUT"
+          ET_HOUR=$(TZ=America/New_York date +%H)
+          if [ "$ET_HOUR" -ge 10 ] || [ "$ET_HOUR" -le 01 ]; then
+            echo "run_now=true" >> "$GITHUB_OUTPUT"
+            echo "Within allowed window (ET hour=$ET_HOUR)."
           else
-            echo "No NFL games live at or before halftime."
+            echo "run_now=false" >> "$GITHUB_OUTPUT"
+            echo "Outside window (ET hour=$ET_HOUR)."
           fi
 
-      - name: Decide to run updater
-        id: decide
+      - name: Run NFL live updater
+        if: steps.window.outputs.run_now == 'true' || github.event_name == 'workflow_dispatch'
         shell: bash
-        run: |
-          set -euo pipefail
-          SCHED="${{ steps.scan.outputs.schedule_fired }}"
-          LIVE="${{ steps.scan.outputs.live }}"
-          RUN="no"
-
-          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
-            RUN="yes"
-          elif [[ "$SCHED" =~ ^0[[:space:]] ]]; then
-            RUN="yes"
-          else
-            [[ "$LIVE" == "true" ]] && RUN="yes"
-          fi
-
-          echo "run_updater=$RUN" >> "$GITHUB_OUTPUT"
-          echo "ids=${{ steps.scan.outputs.ids }}" >> "$GITHUB_OUTPUT"
-          echo "Decision: $RUN"
-
-      - name: Run live updater (NFL)
-        if: steps.decide.outputs.run_updater == 'yes'
         env:
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
           GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
-          LEAGUE: ${{ env.LEAGUE }}
-          TAB_NAME: ${{ env.TAB_NAME }}
-          DEBUG_MODE: ${{ github.event.inputs.debug || '0' }}
-        shell: bash
+          LEAGUE: nfl
+          TAB_NAME: NFL
+          DEBUG_MODE: "0"
         run: |
-          set -euo pipefail
-          IDS="${{ steps.decide.outputs.ids }}"
-          if [[ -n "$IDS" ]]; then
-            for id in $IDS; do
-              echo "→ Updating focused game $id"
-              GAME_ID="$id" node live-game.mjs
-            done
-          else
-            echo "→ General pass (no focused IDs)"
-            node live-game.mjs
-          fi
+          node live-game.mjs
+
+      # Decide whether we should requeue in 5 minutes (any live game pre-3rd?)
+      - name: Conditional requeue (5-min loop if live games)
+        id: gate
+        if: steps.window.outputs.run_now == 'true' || github.event_name == 'workflow_dispatch'
+        shell: bash
+        env:
+          FORCE_FIVE: ${{ inputs.force_five }}
+          LEAGUE: nfl
+        run: |
+          node orchestrator.mjs > gate.json
+          echo "Gate payload:"
+          cat gate.json
+          SHOULD=$(node -e "console.log(JSON.parse(require('fs').readFileSync('gate.json','utf8')).shouldLoop ? 'true':'false')")
+          echo "should_loop=$SHOULD" >> "$GITHUB_OUTPUT"
+
+      - name: Sleep 5 minutes when pre-3rd games exist
+        if: steps.gate.outputs.should_loop == 'true'
+        run: |
+          echo "Sleeping 300s…"
+          sleep 300
+
+      - name: Re-queue workflow (self-dispatch)
+        if: steps.gate.outputs.should_loop == 'true'
+        env:
+          GH_PAT: ${{ secrets.GH_PAT_WORKFLOW }}
+        run: |
+          echo "Re-dispatching NFL Live for another 5-minute cycle…"
+          curl -s -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${GH_PAT}" \
+            https://api.github.com/repos/${{ github.repository }}/actions/workflows/NFL-Live.yml/dispatches \
+            -d '{"ref":"main","inputs":{"force_five":"false"}}'
