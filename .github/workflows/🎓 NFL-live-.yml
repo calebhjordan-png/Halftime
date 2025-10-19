@@ -1,61 +1,142 @@
-name: "🏈 NFL Live (Hourly + Smart 5-Minute Loop)"
+name: NFL Live
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: "0 * * * *"   # hourly
+    inputs:
+      tab_name:
+        description: "Sheet tab to update"
+        required: false
+        default: "NFL"
+
+concurrency:
+  group: nfl-live-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   live:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 360
+    env:
+      LEAGUE: nfl
+      TAB_NAME: ${{ inputs.tab_name || 'NFL' }}
+      GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+      GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
+      MAX_TOTAL_MIN: 200
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Node
+      - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: "20"
 
-      - name: Install deps
+      - name: Install deps used by live scripts
         run: |
-          npm init -y >/dev/null 2>&1 || true
-          npm i googleapis playwright
-          npx playwright install --with-deps chromium
+          npm i googleapis
 
-      - name: Run NFL live updater
-        id: updater
+      # ── Collect today's Game IDs (ET) from the NFL tab (column A) ─────────────────
+      - name: Collect today’s Game IDs from sheet
+        id: ids
+        shell: bash
         env:
-          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
-          GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
-          LEAGUE: nfl
-          TAB_NAME: NFL
-          RUN_SCOPE: week
-          ADAPTIVE_HALFTIME: "1"
-          GHA_JSON: "1"
-        shell: bash
+          GOOGLE_SHEET_ID: ${{ env.GOOGLE_SHEET_ID }}
+          GOOGLE_SERVICE_ACCOUNT: ${{ env.GOOGLE_SERVICE_ACCOUNT }}
+          TAB_NAME: ${{ env.TAB_NAME }}
         run: |
-          json="$(node orchestrator.mjs --gha)"
-          echo "result=${json}" >> "$GITHUB_OUTPUT"
+          node - <<'NODE'
+          import { google } from "googleapis";
 
-      - name: Gate for 5-minute cycle (NFL)
-        id: gate
+          const SHEET_ID = process.env.GOOGLE_SHEET_ID;
+          const SA = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT);
+          const TAB = process.env.TAB_NAME || "NFL";
+          const ET = "America/New_York";
+
+          const todayEtMDY = () => {
+            const p = new Intl.DateTimeFormat("en-US", {
+              timeZone: ET, year: "2-digit", month: "2-digit", day: "2-digit"
+            }).formatToParts(new Date());
+            const g = k => p.find(x => x.type === k)?.value || "";
+            return `${g("month")}/${g("day")}/${g("year")}`; // MM/DD/YY
+          };
+
+          (async () => {
+            const auth = new google.auth.JWT(
+              SA.client_email, null, SA.private_key,
+              ["https://www.googleapis.com/auth/spreadsheets"]
+            );
+            await auth.authorize();
+            const sheets = google.sheets({ version: "v4", auth });
+
+            const r = await sheets.spreadsheets.values.get({
+              spreadsheetId: SHEET_ID,
+              range: `${TAB}!A1:Z2000`,
+            });
+            const rows = r.data.values || [];
+            if (!rows.length) { console.log("No rows"); return; }
+
+            const header = rows[0] || [];
+            const h = Object.fromEntries(header.map((x,i)=>[(x||"").trim().toLowerCase(), i]));
+            const iA = h["game id"], iDate = h["date"], iStatus = h["status"];
+            if (iA == null || iDate == null) {
+              console.error("Missing required columns: 'Game ID' or 'Date'");
+              process.exit(1);
+            }
+
+            const today = todayEtMDY();
+            const ids = [];
+            for (let r = 1; r < rows.length; r++) {
+              const row = rows[r] || [];
+              const gid = (row[iA] || "").toString().trim();
+              const d   = (row[iDate] || "").toString().trim();
+              const st  = iStatus == null ? "" : (row[iStatus] || "").toString().trim().toLowerCase();
+              if (!gid) continue;
+              if (d !== today) continue;      // only today's games → avoids next-week rows
+              if (st === "final") continue;   // skip already finished games
+              ids.push(gid);
+            }
+
+            const out = JSON.stringify(ids);
+            console.log("TODAY_IDS=" + ids.join(","));
+            // Export to GHA outputs (new syntax)
+            require("fs").appendFileSync(process.env.GITHUB_OUTPUT, `list=${out}\n`);
+          })().catch(e => { console.error(e); process.exit(1); });
+          NODE
+
+      # ── Run live-game.mjs (status + halftime) for each ID sequentially ────────────
+      - name: Run live-game for each ID (status + halftime only)
+        if: steps.ids.outputs.list != '[]'
+        shell: bash
         env:
-          LEAGUE: nfl
-          DEBUG_MODE: "0"
-          GHA_JSON: "1"
-        shell: bash
-        run: node live-gate.mjs --gha
-
-      - name: Read gate decision
-        shell: bash
-        run: echo "FAST=${{ steps.gate.outputs.FAST }}"
-
-      - name: Conditional requeue (5-min loop if live games)
-        if: ${{ steps.gate.outputs.FAST == '1' }}
-        shell: bash
+          LEAGUE: ${{ env.LEAGUE }}
+          TAB_NAME: ${{ env.TAB_NAME }}
+          GOOGLE_SHEET_ID: ${{ env.GOOGLE_SHEET_ID }}
+          GOOGLE_SERVICE_ACCOUNT: ${{ env.GOOGLE_SERVICE_ACCOUNT }}
+          MAX_TOTAL_MIN: ${{ env.MAX_TOTAL_MIN }}
         run: |
-          echo "Re-queuing in 5 minutes because there are pre-3rd/halftime games."
-          # Your requeue action goes here (e.g., schedule another run via API or a delay+re-run pattern)
+          IDS_JSON='${{ steps.ids.outputs.list }}'
+          node -e "
+            const ids = JSON.parse(process.env.IDS_JSON || '[]');
+            if (!ids.length) { console.log('No today IDs'); process.exit(0); }
+            (async () => {
+              const { spawn } = await import('node:child_process');
+              for (const id of ids) {
+                console.log('▶ watching', id);
+                await new Promise((res, rej) => {
+                  const p = spawn('node', ['live-game.mjs'], {
+                    stdio: 'inherit',
+                    env: { ...process.env, TARGET_GAME_ID: String(id) }
+                  });
+                  p.on('exit', c => c === 0 ? res() : rej(new Error('exit ' + c)));
+                });
+              }
+            })().catch(e => { console.error(e); process.exit(1); });
+          "
+
+      # Optional: show the IDs we actually watched in the job summary
+      - name: Summary
+        if: always()
+        run: |
+          echo '### NFL Live watched IDs' >> $GITHUB_STEP_SUMMARY
+          echo '${{ steps.ids.outputs.list }}' >> $GITHUB_STEP_SUMMARY
