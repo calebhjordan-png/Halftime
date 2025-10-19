@@ -8,18 +8,18 @@ on:
         required: false
         default: "false"
   schedule:
-    - cron: "0 * * * *"
+    - cron: "0 * * * *"   # top of every hour (UTC) — gate script enforces ET window
+
+permissions:
+  contents: read
+
+env:
+  LEAGUE: college-football
+  TAB_NAME: CFB
 
 jobs:
   live:
     runs-on: ubuntu-latest
-    env:
-      GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
-      GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GCP_SA_JSON }}
-      GH_PAT_WORKFLOW: ${{ secrets.GH_PAT_WORKFLOW }}
-      LEAGUE: college-football
-      TAB_NAME: CFB
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -29,40 +29,38 @@ jobs:
         with:
           node-version: "20"
 
-      # ⬅️ switched from `npm ci` to `npm install`
       - name: Install deps
-        run: npm install --no-audit --no-fund
+        run: npm ci
 
       - name: Run CFB live updater
         env:
-          GOOGLE_SHEET_ID: ${{ env.GOOGLE_SHEET_ID }}
-          GOOGLE_SERVICE_ACCOUNT: ${{ env.GOOGLE_SERVICE_ACCOUNT }}
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+          GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GCP_SA_JSON }}
           LEAGUE: college-football
           TAB_NAME: CFB
           DEBUG_MODE: "0"
-        run: node live-game.mjs
+        run: node live-game.mjs || true
 
-      - name: Gate for 5-minute cycle (CFB)
+      # ----- Gate: should we switch into a 5-minute loop? -----
+      - name: Evaluate 5-minute gate (ET window + pre-3rd)
         id: gate
         env:
-          GOOGLE_SHEET_ID: ${{ env.GOOGLE_SHEET_ID }}
-          GOOGLE_SERVICE_ACCOUNT: ${{ env.GOOGLE_SERVICE_ACCOUNT }}
           LEAGUE: college-football
-          TAB_NAME: CFB
-        run: node orchestrator.mjs > gate.json
-
-      - name: Read gate decision
-        id: read_gate
-        run: echo "json=$(tr -d '\n' < gate.json)" >> "$GITHUB_OUTPUT"
+          WINDOW_ET_START: "10"
+          WINDOW_ET_END: "2"
+        run: |
+          node orchestrator.mjs > gate.json
+          echo "json=$(cat gate.json)" >> "$GITHUB_OUTPUT"
 
       - name: Conditional requeue (5-min loop if live games)
-        if: ${{ inputs.force_five == 'true' || (fromJson(steps.read_gate.outputs.json).shouldLoop) }}
+        if: ${{ inputs.force_five == 'true' || fromJSON(steps.gate.outputs.json).shouldLoop }}
         env:
-          GH_TOKEN: ${{ env.GH_PAT_WORKFLOW }}
+          GH_PAT: ${{ secrets.GH_PAT_WORKFLOW }}
         run: |
+          # Wait 5 minutes then self-dispatch
           sleep 300
-          curl -s -X POST \
-            -H "Authorization: Bearer ${GH_TOKEN}" \
+          curl -sS -X POST \
             -H "Accept: application/vnd.github+json" \
-            https://api.github.com/repos/${{ github.repository }}/actions/workflows/${{ github.workflow }} \
-            -d '{"ref":"${{ github.ref_name }}","inputs":{"force_five":"false"}}'
+            -H "Authorization: Bearer $GH_PAT" \
+            https://api.github.com/repos/${{ github.repository }}/actions/workflows/CFB-Live-.yml/dispatches \
+            -d '{"ref":"${{ github.ref_name }}"}'
