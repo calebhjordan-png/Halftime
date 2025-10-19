@@ -8,84 +8,61 @@ on:
         required: false
         default: "false"
   schedule:
-    # Top of every hour, Eastern time (cron runs in UTC; this is fine because
-    # the gate logic decides whether to loop every 5 minutes)
     - cron: "0 * * * *"
 
 jobs:
   live:
     runs-on: ubuntu-latest
-
-    # Make these available to BOTH live-game.mjs and orchestrator.mjs
     env:
       GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
       GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GCP_SA_JSON }}
+      GH_PAT_WORKFLOW: ${{ secrets.GH_PAT_WORKFLOW }}
       LEAGUE: college-football
       TAB_NAME: CFB
-      DEBUG_MODE: "0"
 
     steps:
-      - name: Set up job
-        uses: actions/checkout@v4
-
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: "20"
 
+      # ⬅️ switched from `npm ci` to `npm install`
       - name: Install deps
-        run: |
-          npm --version
-          npm ci || npm i
+        run: npm install --no-audit --no-fund
 
       - name: Run CFB live updater
-        run: |
-          node live-game.mjs
-
-      # ───────── Gate for 5-minute cycle ─────────
-      # Uses orchestrator.mjs to determine whether any games are live and pre-3rd.
-      # If yes, self-dispatch to run again in ~5 minutes.
-      - name: Conditional requeue (5-min loop if live games)
-        id: requeue
         env:
-          FORCE_FIVE: ${{ github.event.inputs.force_five || 'false' }}
-          GH_TOKEN: ${{ secrets.GH_PAT_WORKFLOW || github.token }}
+          GOOGLE_SHEET_ID: ${{ env.GOOGLE_SHEET_ID }}
+          GOOGLE_SERVICE_ACCOUNT: ${{ env.GOOGLE_SERVICE_ACCOUNT }}
+          LEAGUE: college-football
+          TAB_NAME: CFB
+          DEBUG_MODE: "0"
+        run: node live-game.mjs
+
+      - name: Gate for 5-minute cycle (CFB)
+        id: gate
+        env:
+          GOOGLE_SHEET_ID: ${{ env.GOOGLE_SHEET_ID }}
+          GOOGLE_SERVICE_ACCOUNT: ${{ env.GOOGLE_SERVICE_ACCOUNT }}
+          LEAGUE: college-football
+          TAB_NAME: CFB
+        run: node orchestrator.mjs > gate.json
+
+      - name: Read gate decision
+        id: read_gate
+        run: echo "json=$(tr -d '\n' < gate.json)" >> "$GITHUB_OUTPUT"
+
+      - name: Conditional requeue (5-min loop if live games)
+        if: ${{ inputs.force_five == 'true' || (fromJson(steps.read_gate.outputs.json).shouldLoop) }}
+        env:
+          GH_TOKEN: ${{ env.GH_PAT_WORKFLOW }}
         run: |
-          # Generate decision JSON
-          node orchestrator.mjs > gate.json
-
-          echo "Gate output:"
-          cat gate.json || true
-
-          SHOULD_LOOP=$(node -e "try{const g=require('./gate.json');console.log(g.shouldLoop?'true':'false')}catch(e){console.log('false')}")
-          REASON=$(node -e "try{const g=require('./gate.json');console.log(g.reason||'') }catch(e){console.log('')}")
-          echo "should_loop=${SHOULD_LOOP}" >> $GITHUB_OUTPUT
-          echo "reason=${REASON}" >> $GITHUB_OUTPUT
-
-          # Allow manual override for debugging:
-          if [ "${FORCE_FIVE}" = "true" ]; then
-            SHOULD_LOOP=true
-            echo "Manual force_five=true → will loop."
-          fi
-
-          if [ "${SHOULD_LOOP}" = "true" ]; then
-            echo "Re-queuing workflow to run again in ~5 minutes (${REASON})."
-            sleep 300
-
-            # Self-dispatch
-            REPO="${GITHUB_REPOSITORY}"
-            WF_FILE="${{ github.workflow_ref }}"
-            # Fallback to current workflow file name:
-            if [ -z "$WF_FILE" ]; then WF_FILE=".github/workflows/CFB-Live-.yml"; fi
-
-            curl -s -X POST \
-              -H "Accept: application/vnd.github+json" \
-              -H "Authorization: Bearer ${GH_TOKEN}" \
-              https://api.github.com/repos/${REPO}/actions/workflows/CFB-Live-.yml/dispatches \
-              -d '{"ref":"main","inputs":{"force_five":"false"}}'
-          else
-            echo "No pre-3rd live games → no requeue. (${REASON})"
-          fi
+          sleep 300
+          curl -s -X POST \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/${{ github.repository }}/actions/workflows/${{ github.workflow }} \
+            -d '{"ref":"${{ github.ref_name }}","inputs":{"force_five":"false"}}'
