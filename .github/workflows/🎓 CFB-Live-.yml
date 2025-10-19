@@ -3,17 +3,17 @@ name: "🎓 CFB Live"
 on:
   workflow_dispatch: {}
   schedule:
-    # Top-of-hour in ET, regardless of DST:
-    # ET 10:00–01:00 → during EDT (UTC-4): 14–05
-    - cron: "0 14-23 * * 5"     # Fri 10:00–19:00 ET (EDT)
-    - cron: "0 0-5 * * 6"       # Sat 20:00–01:00 ET (EDT)
-    - cron: "0 14-23 * * 6"     # Sat 10:00–19:00 ET (EDT)
-    - cron: "0 0-2 * * 0"       # Sun 20:00–22:00 ET (EDT)
-    # Repeat block for EST (UTC-5) to “pin” 10:00–01:00 ET after DST switch
-    - cron: "0 15-23 * * 5"     # Fri 10:00–18:00 ET (EST)
-    - cron: "0 0-6 * * 6"       # Sat 19:00–01:00 ET (EST)
-    - cron: "0 15-23 * * 6"     # Sat 10:00–18:00 ET (EST)
-    - cron: "0 0-3 * * 0"       # Sun 19:00–22:00 ET (EST)
+    # Pin 10:00–01:59 ET runs, handling both EDT (UTC-4) and EST (UTC-5).
+    # EDT block
+    - cron: "0 14-23 * * 5"  # Fri 10:00–19:00 ET
+    - cron: "0 0-5 * * 6"    # Sat 20:00–01:00 ET
+    - cron: "0 14-23 * * 6"  # Sat 10:00–19:00 ET
+    - cron: "0 0-2 * * 0"    # Sun 20:00–22:00 ET
+    # EST block
+    - cron: "0 15-23 * * 5"  # Fri 10:00–18:00 ET
+    - cron: "0 0-6 * * 6"    # Sat 19:00–01:00 ET
+    - cron: "0 15-23 * * 6"  # Sat 10:00–18:00 ET
+    - cron: "0 0-3 * * 0"    # Sun 19:00–22:00 ET
 
 jobs:
   run:
@@ -23,6 +23,7 @@ jobs:
       TAB_NAME: "CFB"
       GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
       GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -35,15 +36,21 @@ jobs:
       - name: Install deps
         run: npm i axios googleapis
 
-      # 1) Decide if any CFB games are pre-3rd (gate looks at ESPN scoreboard)
+      # 1) Gate: are there any pre-3rd games on ESPN's CFB scoreboard?
       - name: Gate for 5-minute cycle (CFB)
         id: gate
         env:
           LEAGUE: "college-football"
           DEBUG_MODE: "0"
-        run: node .github/workflows/live-gate.mjs
+        run: |
+          set -e
+          node .github/workflows/live-gate.mjs | tee gate.log
+          FAST=$(grep -o 'FAST=[01]' gate.log | tail -n1 | cut -d= -f2 || true)
+          if [ -z "$FAST" ]; then FAST=1; fi
+          echo "FAST=$FAST"
+          echo "FAST=$FAST" >> "$GITHUB_OUTPUT"
 
-      # 2) Always run the updater (this writes Status, Score, live odds)
+      # 2) Always run updater (writes Status/Score + half-line odds)
       - name: Run live updater (CFB)
         env:
           LEAGUE: "college-football"
@@ -52,17 +59,15 @@ jobs:
           GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
         run: node live-game.mjs
 
-      # 3) If the gate said FAST=1, queue another run in ~5 minutes
-      - name: Re-queue in 5 minutes if games are pre-3rd
+      # 3) If gate says FAST=1, sleep ~5min then dispatch another run
+      - name: Sleep 5 minutes when pre-3rd games exist
+        if: steps.gate.outputs.FAST == '1'
+        run: sleep 300
+
+      - name: Re-queue workflow (self-dispatch)
         if: steps.gate.outputs.FAST == '1'
         uses: benc-uk/workflow-dispatch@v1
         with:
           workflow: "🎓 CFB Live"
           token: ${{ secrets.GITHUB_TOKEN }}
           ref: ${{ github.ref }}
-          inputs: ""
-        env:
-          # sleep ~5m before re-queue to avoid a burst; keep job alive to rate-limit
-          SNOOZE: 300
-        run: |
-          sleep "${SNOOZE}"
