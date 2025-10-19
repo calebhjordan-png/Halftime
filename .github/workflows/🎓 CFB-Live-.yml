@@ -1,36 +1,30 @@
-name: "🎓 CFB Live"
+name: 🎓 CFB Live
 
 on:
-  # manual run
+  # Manual kick
   workflow_dispatch:
     inputs:
-      forceFiveMin:
+      force_5_minute_loop:
         description: "Force 5-minute loop (debug)"
         required: false
         default: "false"
-  # top of every hour (UTC) — the gate step applies the 10:00–01:59 ET window
+  # Let the gate decide if we actually requeue every 5 minutes
   schedule:
-    - cron: "0 * * * *"
+    - cron: "0 * * * *"  # top of every hour (UTC)
+  # Used by the requeue step (avoids addressing a file by name)
+  repository_dispatch:
+    types: [cfb_live_requeue]
 
-# IMPORTANT: allow this workflow to call the Actions API
 permissions:
-  contents: read
+  contents: write
   actions: write
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    env:
-      # league wiring for live-game.mjs
-      LEAGUE: "college-football"
-      TAB_NAME: "CFB"
-      GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
-      GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
-      # toggle verbose logging in the updater
-      DEBUG_MODE: ""
     steps:
       - name: Set up job
-        run: echo "Starting CFB Live…"
+        run: echo "Start CFB Live run…"
 
       - name: Checkout
         uses: actions/checkout@v4
@@ -40,79 +34,98 @@ jobs:
         with:
           node-version: "20"
 
-      - name: Install deps
+      - name: Install deps for live updater
         run: npm i axios googleapis
 
-      # ───────────────────────────── Gate: hour window & live check ─────────────────────────────
-      # 10:00–01:59 ET always (no DST worry). Also decide whether to loop every 5 minutes.
+      # ❗️Gate script uses luxon (time window check) + axios (ESPN scoreboard API)
+      - name: Install gate deps
+        run: npm i luxon axios
+
+      # ───────────────────────── GATE ─────────────────────────
+      # Checks: ET time window + ESPN scoreboard → any live CFB game pre-3rd?
       - name: Gate for 5-minute cycle (CFB)
         id: gate
-        shell: bash
+        env:
+          FORCE_5: ${{ github.event.inputs.force_5_minute_loop }}
         run: |
           node - <<'JS'
           const { DateTime } = require('luxon');
-          const ET = DateTime.now().setZone('America/New_York');
-          const hour = ET.hour;
-          // Window: 10:00–01:59 ET
-          const inWindow = (hour >= 10 || hour < 2);
-          console.log(`ET now: ${ET.toFormat('yyyy-LL-dd HH:mm:ss ZZZZ')} (hour=${hour})`);
-          if (!inWindow) {
-            console.log('::set-output name=shouldRun::false');
-            console.log('Outside 10:00–01:59 ET — skip.');
-            process.exit(0);
-          }
-          // Default: only hourly; switch to 5-min if any ESPN scoreboard game is < 3rd Q.
-          const leaguePath = 'college-football';
-          const url = `https://site.api.espn.com/apis/site/v2/sports/football/${leaguePath}/scoreboard`;
-          require('axios').get(url, { timeout: 15000 }).then(({data})=>{
-            const evts = data?.events || [];
-            let pre3rd = false;
-            for (const e of evts) {
-              const st = e?.status?.type?.shortDetail?.toLowerCase() || '';
-              // treat Halftime / 1st / 2nd / OT* (rare) as "pre-3rd" for our updater loop
-              if (/\b(1st|2nd|half|halftime|ot|in progress)\b/.test(st) && !/\b3rd|4th|final\b/.test(st)) {
-                pre3rd = true; break;
-              }
-            }
-            // Allow forcing via manual input
-            const force = (process.env.FORCE_FIVE_MIN || '').toLowerCase() === 'true';
-            const loop5 = force || pre3rd;
-            console.log(`pre3rd=${pre3rd} force=${force} => loop5=${loop5}`);
-            console.log(`::set-output name=shouldRun::true`);
-            console.log(`::set-output name=loop5::${loop5 ? 'true' : 'false'}`);
-          }).catch(err=>{
-            console.log('Scoreboard check failed:', err?.message || err);
-            // If the check fails, be conservative and just run once (no loop)
-            console.log('::set-output name=shouldRun::true');
-            console.log('::set-output name=loop5::false');
-          });
-          JS
-        env:
-          FORCE_FIVE_MIN: ${{ github.event.inputs.forceFiveMin }}
+          const axios = require('axios');
 
-      # ───────────────────────────── Live updater ─────────────────────────────
+          const force = (process.env.FORCE_5 || '').toLowerCase() === 'true';
+
+          const nowET = DateTime.now().setZone('America/New_York');
+          const withinWindow = (nowET.hour >= 10 || nowET.hour <= 1); // 10:00–01:59 ET
+          const dateParam = nowET.toFormat('yyyyLLdd');
+
+          // Default: not in 5-min loop
+          let hasPre3rd = false;
+
+          const scoreboardUrl = `https://site.api.espn.com/apis/site/v2/sports/football/college-football/scoreboard?dates=${dateParam}`;
+
+          (async () => {
+            try {
+              const { data } = await axios.get(scoreboardUrl, { timeout: 15000 });
+              const events = Array.isArray(data?.events) ? data.events : [];
+
+              // Inspect each game's status
+              for (const ev of events) {
+                const comp = ev?.competitions?.[0];
+                const st = comp?.status;
+                const state = (st?.type?.state || '').toLowerCase();  // "in" | "pre" | "post"
+                const detail = (st?.type?.shortDetail || st?.type?.detail || '').toLowerCase();
+                const period = Number(st?.period ?? comp?.status?.period ?? 0);
+
+                const isLive = state === 'in';
+                const isHalf = /\bhalftime\b/.test(detail);
+
+                // Pre-3rd if Q1, Q2, or explicitly Halftime
+                const pre3rd = isLive && (period < 3 || isHalf);
+
+                if (pre3rd) { hasPre3rd = true; break; }
+              }
+            } catch (e) {
+              console.log('Gate warning:', e?.message || e);
+            }
+
+            // Outputs to control later steps
+            const payload = {
+              et: nowET.toFormat('EEE yyyy-LL-dd HH:mm'),
+              withinWindow, hasPre3rd, force
+            };
+            console.log('Gate:', payload);
+
+            // Write outputs
+            const fs = require('fs');
+            fs.appendFileSync(process.env.GITHUB_OUTPUT,
+              `within_window=${withinWindow}\n` +
+              `has_pre3rd=${hasPre3rd}\n` +
+              `force=${force}\n`
+            );
+          })();
+          JS
+
+      # ───────────────────── Live updater run ─────────────────────
       - name: Run live updater (CFB)
-        if: steps.gate.outputs.shouldRun == 'true'
+        env:
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+          GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
+          LEAGUE: college-football
+          TAB_NAME: CFB
         run: node live-game.mjs
 
-      # ───────────────────────────── 5-minute loop & self-dispatch ─────────────────────────────
+      # ───────────────────── 5-minute loop control ─────────────────────
       - name: Sleep 5 minutes when pre-3rd games exist
-        if: steps.gate.outputs.loop5 == 'true'
+        if: ${{ steps.gate.outputs.within_window == 'true' && (steps.gate.outputs.has_pre3rd == 'true' || steps.gate.outputs.force == 'true') }}
         run: sleep 300
 
-      # Re-queue this workflow using a PAT with "workflow" scope
-      - name: Re-queue workflow (self-dispatch)
-        if: steps.gate.outputs.loop5 == 'true'
-        uses: actions/github-script@v7
-        with:
-          # Use a PAT secret; see instructions below
-          github-token: ${{ secrets.GH_PAT_WORKFLOW }}
-          script: |
-            const ref = context.ref?.replace('refs/heads/','') || 'main';
-            await github.rest.actions.createWorkflowDispatch({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              workflow_id: "🎓 CFB-Live-.yml",
-              ref
-            });
-            core.info(`Re-dispatched ${ref} for another 5-minute cycle`);
+      - name: Re-queue workflow (repository_dispatch)
+        if: ${{ steps.gate.outputs.within_window == 'true' && (steps.gate.outputs.has_pre3rd == 'true' || steps.gate.outputs.force == 'true') }}
+        env:
+          GH_PAT_WORKFLOW: ${{ secrets.GH_PAT_WORKFLOW }}
+        run: |
+          curl -sS -X POST \
+            -H "Authorization: token ${GH_PAT_WORKFLOW}" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/${GITHUB_REPOSITORY}/dispatches \
+            -d '{"event_type":"cfb_live_requeue"}'
