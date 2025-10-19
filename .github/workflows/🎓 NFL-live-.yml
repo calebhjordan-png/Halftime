@@ -1,27 +1,13 @@
 name: NFL Live
-
 on:
   workflow_dispatch: {}
   schedule:
-    # Top of the hour, 10:00–23:00 & 00:00–02:00 ET
-    # GitHub cron uses UTC. Adjust from ET (UTC-4/5). Example here assumes EDT (UTC-4).
-    - cron: "0 14-23 * * *"   # 10:00–19:00 ET
-    - cron: "0 0-6 * * *"     # 20:00–02:00 ET
-
-concurrency:
-  group: nfl-live-${{ github.ref }}
-  cancel-in-progress: false
+    - cron: "0 14-23 * * *"
+    - cron: "0 0-6 * * *"
 
 jobs:
   live:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
-    env:
-      LEAGUE: nfl
-      TAB_NAME: NFL
-      GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
-      GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -32,83 +18,31 @@ jobs:
           node-version: "20"
 
       - name: Install deps used by live scripts
-        run: |
-          npm i googleapis
+        run: npm i googleapis
 
       - name: Collect today’s Game IDs from sheet
         id: ids
-        shell: bash
-        env:
-          GOOGLE_SHEET_ID: ${{ env.GOOGLE_SHEET_ID }}
-          GOOGLE_SERVICE_ACCOUNT: ${{ env.GOOGLE_SERVICE_ACCOUNT }}
-          TAB_NAME: ${{ env.TAB_NAME }}
+        # ... (unchanged)
         run: |
+          # existing code to find today’s IDs
           node - <<'NODE'
-          const { google } = require("googleapis");
-          const { appendFileSync } = require("node:fs");
+          # ...
 
-          const SHEET_ID = process.env.GOOGLE_SHEET_ID;
-          const SA = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT);
-          const TAB = process.env.TAB_NAME || "NFL";
-          const ET = "America/New_York";
-
-          function todayEtMDY() {
-            const parts = new Intl.DateTimeFormat("en-US", {
-              timeZone: ET, year: "2-digit", month: "2-digit", day: "2-digit"
-            }).formatToParts(new Date());
-            const g = (k) => parts.find(x => x.type === k)?.value || "";
-            return `${g("month")}/${g("day")}/${g("year")}`; // MM/DD/YY
-          }
-
-          (async () => {
-            const auth = new google.auth.JWT(
-              SA.client_email, null, SA.private_key,
-              ["https://www.googleapis.com/auth/spreadsheets"]
-            );
-            await auth.authorize();
-            const sheets = google.sheets({ version: "v4", auth });
-
-            const r = await sheets.spreadsheets.values.get({
-              spreadsheetId: SHEET_ID,
-              range: `${TAB}!A1:Z2000`,
-            });
-            const rows = r.data.values || [];
-            if (!rows.length) { appendFileSync(process.env.GITHUB_OUTPUT, `list=[]\n`); return; }
-
-            const header = rows[0] || [];
-            const h = Object.fromEntries(header.map((x,i)=>[(x||"").trim().toLowerCase(), i]));
-            const iA = h["game id"], iDate = h["date"], iStatus = h["status"];
-            if (iA == null || iDate == null) { appendFileSync(process.env.GITHUB_OUTPUT, `list=[]\n`); return; }
-
-            const today = todayEtMDY();
-            const ids = [];
-            for (let r = 1; r < rows.length; r++) {
-              const row = rows[r] || [];
-              const gid = (row[iA] || "").toString().trim();
-              const d   = (row[iDate] || "").toString().trim();
-              const st  = iStatus == null ? "" : (row[iStatus] || "").toString().trim().toLowerCase();
-              if (!gid) continue;
-              if (d !== today) continue;
-              if (st === "final") continue;
-              ids.push(gid);
-            }
-
-            appendFileSync(process.env.GITHUB_OUTPUT, `list=${JSON.stringify(ids)}\n`);
-            console.log("TODAY_IDS=" + ids.join(","));
-          })().catch(e => { console.error(e); process.exit(1); });
-          NODE
-
-      - name: Run live-game oneshot for each ID in parallel
+      # ⬇⬇ REPLACE your old "Run live-game..." step with this one ⬇⬇
+      - name: Run live-game oneshot for each ID in parallel (with odds debug)
         if: steps.ids.outputs.list != '[]'
         shell: bash
         env:
-          LEAGUE: ${{ env.LEAGUE }}
-          TAB_NAME: ${{ env.TAB_NAME }}
-          GOOGLE_SHEET_ID: ${{ env.GOOGLE_SHEET_ID }}
-          GOOGLE_SERVICE_ACCOUNT: ${{ env.GOOGLE_SERVICE_ACCOUNT }}
+          LEAGUE: nfl
+          TAB_NAME: NFL
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+          GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
           IDS_JSON: ${{ steps.ids.outputs.list }}
+          ONESHOT: "true"
+          DEBUG_ODDS: "true"         # prints all odds blocks
+          FORCE_STATUS_WRITE: "true" # ensures Status updates in oneshot
         run: |
-          ids=$(node -e "process.stdout.write((process.env.IDS_JSON||'[]'))")
+          ids=$(node -e "process.stdout.write(process.env.IDS_JSON||'[]')")
           node -e "
             const ids = JSON.parse(process.argv[1]||'[]');
             if (!ids.length) process.exit(0);
@@ -117,7 +51,7 @@ jobs:
               const procs = ids.map(id => new Promise((res, rej) => {
                 const p = spawn('node',['live-game.mjs'],{
                   stdio:'inherit',
-                  env:{...process.env, TARGET_GAME_ID:String(id), ONESHOT:'true'}
+                  env:{...process.env, TARGET_GAME_ID:String(id)}
                 });
                 p.on('exit', c => c===0 ? res() : rej(new Error('exit '+c)));
               }));
