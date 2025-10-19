@@ -1,5 +1,14 @@
-/* live-game.mjs — Status + Half Score + Live Line (strict Game ID)
-   ONESHOT=true → do a single fetch/write and exit.
+/* live-game.mjs — Status + current score + Live Odds (strict Game ID)
+   - Writes:
+       Status
+       Half Score           -> current score (away-home) on every tick
+       Live Away Spread     -> number (e.g. +13.5 / -3.5)
+       Live Away ML         -> number (e.g. +140 / -180)
+       Live Home Spread     -> number
+       Live Home ML         -> number
+       Live Total           -> number (over/under)
+   - ONESHOT=true : single fetch/write and exit
+   - DEBUG_ODDS=true : log raw odds blocks for mapping/verification
 */
 import { google } from "googleapis";
 
@@ -8,9 +17,11 @@ const SA_JSON  = process.env.GOOGLE_SERVICE_ACCOUNT;  // JSON string for SA
 const LEAGUE   = (process.env.LEAGUE || "nfl").toLowerCase();
 const TAB_NAME = process.env.TAB_NAME || (LEAGUE === "college-football" ? "CFB" : "NFL");
 const EVENT_ID = String(process.env.TARGET_GAME_ID || "").trim();
+
 const MAX_TOTAL_MIN = Number(process.env.MAX_TOTAL_MIN || "200");
-const DEBUG_MODE = process.env.DEBUG_MODE === "true";
-const ONESHOT = String(process.env.ONESHOT || "").toLowerCase() === "true";
+const DEBUG_MODE  = String(process.env.DEBUG_MODE  || "").toLowerCase()==="true";
+const ONESHOT     = String(process.env.ONESHOT     || "").toLowerCase()==="true";
+const DEBUG_ODDS  = String(process.env.DEBUG_ODDS  || "").toLowerCase()==="true";
 
 if (!SHEET_ID || !SA_JSON || !EVENT_ID) {
   console.error("Missing env: GOOGLE_SHEET_ID, GOOGLE_SERVICE_ACCOUNT, TARGET_GAME_ID");
@@ -19,10 +30,11 @@ if (!SHEET_ID || !SA_JSON || !EVENT_ID) {
 
 /* ---------- ESPN helpers ---------- */
 const pick = (o,p)=>p.replace(/\[(\d+)\]/g,'.$1').split('.').reduce((a,k)=>a?.[k],o);
+
 async function fetchJson(url, tries=3) {
   for (let i=1;i<=tries;i++){
     try{
-      const r = await fetch(url,{headers:{"User-Agent":"halftime-live/restore-1.1"}});
+      const r = await fetch(url,{headers:{"User-Agent":"halftime-live/1.2"}});
       if(!r.ok) throw new Error(`HTTP ${r.status}`);
       return await r.json();
     }catch(e){
@@ -46,6 +58,7 @@ function parseStatus(sum){
     displayClock: s.displayClock ?? "0:00",
   };
 }
+
 function getTeams(sum){
   let away,home;
   let cps = pick(sum,"header.competitions.0.competitors");
@@ -55,30 +68,76 @@ function getTeams(sum){
     home = cps.find(c=>c.homeAway==="home");
   }
   const tn=t=>t?.team?.shortDisplayName||t?.team?.abbreviation||t?.team?.displayName||"Team";
+  const keys=t=>{
+    const n1=t?.team?.shortDisplayName||"";
+    const n2=t?.team?.abbreviation||"";
+    const n3=t?.team?.displayName||"";
+    return [n1,n2,n3].filter(Boolean).map(x=>x.toLowerCase());
+  };
   const ts=t=>Number(t?.score ?? 0);
-  return { awayName: tn(away), homeName: tn(home), awayScore: ts(away), homeScore: ts(home) };
+  return {
+    awayName: tn(away), homeName: tn(home),
+    awayKeys: keys(away), homeKeys: keys(home),
+    awayScore: ts(away), homeScore: ts(home)
+  };
 }
 
-/* Live line display if available (keeps your prior behavior) */
-function getLiveLine(sum){
-  const odds = pick(sum,"competitions.0.odds.0") || pick(sum,"header.competitions.0.odds.0");
-  let spread = odds?.spread != null ? Number(odds.spread) : null;
-  let detail = odds?.details || "";
+/* ----- Live Odds extraction ----- */
+function coerceNum(v){
+  if (v===null||v===undefined||v==="") return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
 
-  if (spread==null) {
+// Decide spreads from favorite flags / details
+function spreadsFrom(spread, ctx){
+  if (!Number.isFinite(spread)) return {awaySpread:null, homeSpread:null};
+  const abs = Math.abs(spread);
+  if (ctx.awayFav === true && ctx.homeFav !== true) {
+    return { awaySpread: -abs, homeSpread: +abs };
+  }
+  if (ctx.homeFav === true && ctx.awayFav !== true) {
+    return { awaySpread: +abs, homeSpread: -abs };
+  }
+  // Try details text to infer favorite
+  const d = (ctx.detail||"").toLowerCase();
+  const hit = (keys)=>keys?.some(k=>k && d.includes(k));
+  if (hit(ctx.awayKeys) && !hit(ctx.homeKeys)) return { awaySpread: -abs, homeSpread: +abs };
+  if (hit(ctx.homeKeys) && !hit(ctx.awayKeys)) return { awaySpread: +abs, homeSpread: -abs };
+  // Fallback: assume positive for away, negative for home (won't bias favorite)
+  return { awaySpread: +abs, homeSpread: -abs };
+}
+
+function extractOdds(sum, tm){
+  // Try competitions[0].odds[0]
+  let o = pick(sum,"competitions.0.odds.0") || pick(sum,"header.competitions.0.odds.0");
+  let src = "competitions.odds[0]";
+  if (DEBUG_ODDS && o) console.log("DEBUG_ODDS competitions.odds[0]:", JSON.stringify(o, null, 2));
+
+  // If not useful, try pickcenter[0]
+  if (!o || (o.spread==null && !o.awayTeamOdds && !o.homeTeamOdds && o.overUnder==null)){
     const pc = (pick(sum,"pickcenter")||[])[0];
-    if (pc?.spread != null) spread = Number(pc.spread);
-    if (!detail && pc?.details) detail = pc.details;
+    if (DEBUG_ODDS && pc) console.log("DEBUG_ODDS pickcenter[0]:", JSON.stringify(pc, null, 2));
+    if (pc) { o = pc; src = "pickcenter[0]"; }
   }
 
-  if (spread==null && typeof detail === "string") {
-    const m = detail.match(/(-?\d+(\.\d+)?)/);
-    if (m) spread = Number(m[1]);
-  }
-  if (spread==null) return null;
+  if (!o) return { src:null, awaySpread:null, awayML:null, homeSpread:null, homeML:null, total:null, detail:null };
 
-  const d = (detail||"").trim();
-  return d || `Line ${spread > 0 ? `+${spread}` : spread}`;
+  const detail = o.details || o.detail || "";
+  const overUnder = coerceNum(o.overUnder ?? o.total);
+  const spread = coerceNum(o.spread);
+
+  const awayFav = o.awayTeamOdds?.favorite === true || o.awayTeamOdds?.underdog === false;
+  const homeFav = o.homeTeamOdds?.favorite === true || o.homeTeamOdds?.underdog === false;
+
+  const awayML = coerceNum(o.awayTeamOdds?.moneyLine ?? o.awayTeamOdds?.moneyline);
+  const homeML = coerceNum(o.homeTeamOdds?.moneyLine ?? o.homeTeamOdds?.moneyline);
+
+  const { awaySpread, homeSpread } = spreadsFrom(spread, {
+    awayFav, homeFav, detail, awayKeys: tm.awayKeys, homeKeys: tm.homeKeys
+  });
+
+  return { src, awaySpread, awayML, homeSpread, homeML, total: overUnder, detail };
 }
 
 /* ---------- Sheets helpers ---------- */
@@ -104,6 +163,7 @@ async function findRowByGameId(sheets){
   }
   return -1;
 }
+
 async function writeValues(sheets,rowNumber,kv){
   const header = (await sheets.spreadsheets.values.get({
     spreadsheetId: SHEET_ID, range: `${TAB_NAME}!A1:Z1`
@@ -111,7 +171,7 @@ async function writeValues(sheets,rowNumber,kv){
   const h = colMap(header);
   const data = [];
   for (const [name,val] of Object.entries(kv)){
-    if (val == null) continue;
+    if (val == null && val !== "") continue; // allow empty string clears
     const j = h[name.toLowerCase()];
     if (j == null) continue; // only to existing columns
     data.push({ range: `${TAB_NAME}!${A1(j)}${rowNumber}`, values: [[val]] });
@@ -146,36 +206,53 @@ async function tickOnce(sheets){
   const sum = await fetchJson(summaryUrl(EVENT_ID));
   const st  = parseStatus(sum);
   const tm  = getTeams(sum);
-  const lineDisplay = getLiveLine(sum); // may be null
+  const odds = extractOdds(sum, tm);
+
   const currentStatus = st.shortDetail || st.state || "unknown";
+  const scoreStr = `${tm.awayScore}-${tm.homeScore}`;
+  const logLine = `[${currentStatus}] ${tm.awayName} @ ${tm.homeName} Q${st.period} (${st.displayClock})` +
+                  (odds && (odds.awaySpread!=null || odds.total!=null) ? ` | odds:${odds.src}` : "");
+  console.log(`${logLine} → row ${row}`);
 
-  console.log(`[${currentStatus}] ${tm.awayName} @ ${tm.homeName} Q${st.period} (${st.displayClock}) → row ${row}${lineDisplay?` | ${lineDisplay}`:""}`);
+  if (DEBUG_ODDS && odds) {
+    console.log("DEBUG_ODDS parsed:", JSON.stringify(odds, null, 2));
+  }
 
-  // Current cell status to avoid clobbering Half/Final
+  // always keep current score in "Half Score"
+  const commonPayload = {
+    "Status": currentStatus,
+    "Half Score": scoreStr,
+    "Live Away Spread": odds.awaySpread,
+    "Live Away ML": odds.awayML,
+    "Live Home Spread": odds.homeSpread,
+    "Live Home ML": odds.homeML,
+    "Live Total": odds.total
+  };
+
+  // Avoid overwriting Half/Final in Status (still update score/odds)
   const headerRes = await sheets.spreadsheets.values.get({ spreadsheetId: SHEET_ID, range: `${TAB_NAME}!A1:Z1`});
   const hdr = headerRes.data.values?.[0] || [];
   const h   = colMap(hdr);
   const rowRes = await sheets.spreadsheets.values.get({ spreadsheetId: SHEET_ID, range: `${TAB_NAME}!A${row}:Z${row}`});
   const cells  = rowRes.data.values?.[0] || [];
-  const cur = (cells[h["status"]] || "").toString().trim();
+  const curStatus = (cells[h["status"]] || "").toString().trim();
+  if (/^(Half|Final)$/i.test(curStatus)) {
+    delete commonPayload["Status"];
+  }
 
+  // Halftime detection (still log, but we already keep score current every tick)
   const isHalf = /HALF/i.test(st.name) || (st.state==="in" && Number(st.period)===2 && /^0?:?0{1,2}\b/.test(st.displayClock||""));
+  if (isHalf) {
+    commonPayload["Status"] = "Half"; // force set at halftime
+  }
+
+  await writeValues(sheets, row, commonPayload);
 
   if (isHalf) {
-    const halfScore = `${tm.awayScore}-${tm.homeScore}`;
-    const payload = { "Status": "Half", "Half Score": halfScore };
-    if (lineDisplay && h["live line"] != null) payload["Live Line"] = lineDisplay;
-    await writeValues(sheets, row, payload);
-    console.log(`✅ Halftime written (${halfScore})`);
+    console.log(`✅ Halftime write done (score ${scoreStr})`);
     return "half";
-  } else {
-    if (!/^(Half|Final)$/i.test(cur)) {
-      const payload = { "Status": currentStatus };
-      if (lineDisplay && h["live line"] != null) payload["Live Line"] = lineDisplay;
-      await writeValues(sheets, row, payload);
-    }
-    return "continue";
   }
+  return "continue";
 }
 
 (async ()=>{
