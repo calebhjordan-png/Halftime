@@ -1,62 +1,72 @@
-name: 🎓 CFB Live
+// live-gate.mjs
+// Purpose: tell the workflow whether to run a 5-minute cycle for CFB.
+// Decides by looking at ESPN's *scoreboard* (not the sheet).
+//
+// "FAST=1"  → run every 5 minutes (there is at least one game pre-3rd)
+// "FAST=0"  → run on the top-of-hour only
+//
+// Pre-3rd definition: STATUS_IN_PROGRESS with period 1 or 2, or "Halftime".
 
-on:
-  workflow_dispatch:
-  schedule:
-    # All times are UTC. These windows map to 10:00–01:59 ET year-round.
-    # Top of every hour
-    - cron: "0 14-23 * * *"   # 10:00–19:59 ET
-    - cron: "0 0-5 * * *"     # 20:00–01:59 ET
-    # Every 5 minutes (gated below so we only run the updater when a pre-3rd game is live)
-    - cron: "*/5 14-23 * * *"
-    - cron: "*/5 0-5 * * *"
+import axios from "axios";
 
-permissions:
-  contents: read
+// --- config from env (defaults are safe) ---
+const LEAGUE = process.env.LEAGUE || "college-football"; // keep CFB here
+const DEBUG  = String(process.env.DEBUG_MODE || "") === "1";
 
-concurrency:
-  group: cfb-live-${{ github.ref_name }}
-  cancel-in-progress: false
+// Format an ET date → YYYYMMDD for ESPN scoreboard ?dates= param
+function ymdInEastern(d = new Date()) {
+  const f = new Intl.DateTimeFormat("en-US", {
+    timeZone: "America/New_York",
+    year: "numeric", month: "2-digit", day: "2-digit"
+  }).formatToParts(d);
+  const yy = f.find(p => p.type === "year").value;
+  const mm = f.find(p => p.type === "month").value;
+  const dd = f.find(p => p.type === "day").value;
+  return `${yy}${mm}${dd}`;
+}
 
-jobs:
-  run:
-    runs-on: ubuntu-latest
+function isPreThird(status) {
+  // Robust detection across ESPN variants
+  const type   = status?.type || {};
+  const name   = String(type.name || type.state || "").toUpperCase(); // STATUS_IN_PROGRESS etc.
+  const desc   = (type.shortDetail || type.detail || type.description || "").toLowerCase();
+  const period = Number(status?.period ?? status?.displayPeriod ?? 0);
 
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+  if (desc.includes("halftime")) return true;          // halftime still "pre-3rd"
+  if (name.includes("IN_PROGRESS") && period > 0 && period < 3) return true;
+  return false;
+}
 
-      - name: Setup Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: "20"
+async function fetchScoreboard() {
+  const ymd = ymdInEastern();
+  const url = `https://site.api.espn.com/apis/site/v2/sports/football/${LEAGUE}/scoreboard?dates=${ymd}`;
+  if (DEBUG) console.log("🔎 scoreboard:", url);
+  const { data } = await axios.get(url, { timeout: 15000 });
+  return data;
+}
 
-      - name: Install deps
-        run: npm i axios googleapis
+(async () => {
+  try {
+    const board = await fetchScoreboard();
+    const events = Array.isArray(board?.events) ? board.events : [];
 
-      # Gate: only allow the */5 runs to call the updater when a game is
-      # IN PROGRESS and pre-3rd (Q1, Q2, Halftime).
-      - name: Gate for 5-minute cycle
-        id: gate
-        env:
-          LEAGUE: college-football
-        run: |
-          # Top-of-hour runs ALWAYS proceed.
-          now_min=$(date -u +%M)
-          if [ "$now_min" != "00" ]; then
-            node ops/live-gate.mjs > gate.log || true
-            cat gate.log
-            v=$(grep -Eo 'run_updater=(true|false)' gate.log | cut -d= -f2)
-            echo "run_updater=${v:-false}" >> $GITHUB_OUTPUT
-          else
-            echo "run_updater=true" >> $GITHUB_OUTPUT
-          fi
+    let preThirdCount = 0;
+    for (const ev of events) {
+      const comp = ev?.competitions?.[0];
+      const st   = comp?.status || ev?.status;
+      if (isPreThird(st)) preThirdCount++;
+    }
 
-      - name: Run live updater (CFB)
-        if: steps.gate.outputs.run_updater == 'true'
-        env:
-          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
-          GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
-          LEAGUE: "college-football"
-          TAB_NAME: "CFB"
-        run: node live-game.mjs
+    const FAST = preThirdCount > 0 ? "1" : "0";
+    console.log(`Gate: pre-3rd games = ${preThirdCount} → FAST=${FAST}`);
+
+    // Emit GitHub Actions output in both modern & legacy styles
+    console.log(`::set-output name=FAST::${FAST}`);
+    console.log(`FAST=${FAST}`);
+  } catch (err) {
+    console.log("Gate error (failing open to FAST):", err?.message || err);
+    // If the gate can’t decide, fail open so we don’t miss updates.
+    console.log("::set-output name=FAST::1");
+    console.log("FAST=1");
+  }
+})();
