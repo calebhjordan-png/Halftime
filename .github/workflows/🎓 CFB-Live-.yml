@@ -1,40 +1,34 @@
-name: 🎓 CFB Live
+name: "🎓 CFB Live"
 
 on:
   workflow_dispatch:
     inputs:
-      GAME_ID:
-        description: Optional ESPN game id to focus on
+      game_id:
+        description: "Optional ESPN game id to focus on"
         required: false
         default: ""
-      DEBUG_MODE:
-        description: Enable verbose debug logging (1 to enable)
+      debug:
+        description: "Enable verbose debug logging"
         required: false
-        default: ""
+        default: "0"
   schedule:
-    # NOTE: Times are in UTC. 10:00–02:00 ET ≈ 14:00–06:59 UTC during EDT.
-    # Hourly at :00
-    - cron: "0 14-23,0-6 * * *"
-    # Every 5 minutes inside the same window
-    - cron: "*/5 14-23,0-6 * * *"
+    # ET window only (10:00 → 01:59, pinned with TZ below)
+    - cron: "0 10-23 * * *"      # top of every hour 10:00–23:00 ET
+    - cron: "0 0-1 * * *"        # top of every hour 00:00–01:00 ET
+    - cron: "*/5 10-23 * * *"    # every 5 minutes 10:00–23:59 ET
+    - cron: "*/5 0-1 * * *"      # every 5 minutes 00:00–01:59 ET
 
-concurrency:
-  group: cfb-live
-  cancel-in-progress: false
+env:
+  TZ: America/New_York
+  LEAGUE: college-football
+  TAB_NAME: CFB
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    env:
-      LEAGUE: college-football
-      TAB_NAME: CFB
-      GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
-      GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
-      GAME_ID: ${{ inputs.GAME_ID }}
-      DEBUG_MODE: ${{ inputs.DEBUG_MODE }}
 
     steps:
-      - name: Checkout
+      - name: Checkout repo
         uses: actions/checkout@v4
 
       - name: Setup Node
@@ -45,63 +39,97 @@ jobs:
       - name: Install deps
         run: npm i axios googleapis
 
-      # Gate: only run inside 10:00–02:00 ET window (roughly; UTC based)
-      - name: Early-exit if outside window
-        id: window
-        shell: bash
-        run: |
-          HOUR_UTC=$(date -u +%H)
-          # 14..23 or 00..06  => inside window
-          if [[ $HOUR_UTC -ge 14 || $HOUR_UTC -le 6 ]]; then
-            echo "ok=true" >> $GITHUB_OUTPUT
-          else
-            echo "ok=false" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Scan ESPN scoreboard (CFB) for pre-3rd live games
+      # --- Scan ESPN directly (not the sheet) to decide if we should run at 5-min cadence,
+      #     and to collect specific game IDs that are live (<= HT).
+      - name: Scan ESPN for live (≤ HT) games
         id: scan
-        if: steps.window.outputs.ok == 'true'
+        env:
+          ESPN_SPORT: football
+          ESPN_LEAGUE: college-football
         shell: bash
         run: |
-          node - <<'NODE'
-          const axios = require('axios');
-          (async () => {
-            try {
-              const { data } = await axios.get('https://site.api.espn.com/apis/site/v2/sports/football/college-football/scoreboard', { timeout: 15000 });
-              const events = data?.events || [];
-              let hasPre3rd = false;
-              for (const e of events) {
-                const c = e?.competitions?.[0];
-                const state = String(c?.status?.type?.state||'').toLowerCase(); // "in", "post", "pre"
-                const period = Number(c?.status?.period ?? 0);
-                if (state === 'in' && period < 3) { hasPre3rd = true; break; }
-              }
-              console.log('pre3rd-live:', hasPre3rd);
-              console.log(`run=${hasPre3rd ? 'true' : 'false'}`);
-              require('fs').appendFileSync(process.env.GITHUB_OUTPUT, `run=${hasPre3rd}\n`);
-            } catch (err) {
-              // Be safe: don't block hourly updates; allow run if scan fails
-              console.log('scan_error=true');
-              require('fs').appendFileSync(process.env.GITHUB_OUTPUT, `run=true\n`);
-            }
-          })();
-          NODE
+          set -euo pipefail
+          # Which cron string fired this run? (empty for workflow_dispatch)
+          SCHED="${{ github.event.schedule || '' }}"
+          echo "schedule_fired=$SCHED" >> "$GITHUB_OUTPUT"
 
-      # Decide: hourly always proceeds (within window). 5-minute runs proceed only if pre-3rd exists.
-      - name: Decide whether to run updater
-        id: decide
-        if: steps.window.outputs.ok == 'true'
-        shell: bash
-        run: |
-          SCHED="${{ github.event.schedule }}"
-          # If this run came from the 5-minute cron, require scan.run == 'true'
-          if [[ "$SCHED" == "*/5 14-23,0-6 * * *" ]]; then
-            [[ "${{ steps.scan.outputs.run }}" == "true" ]] && echo "go=true" >> $GITHUB_OUTPUT || echo "go=false" >> $GITHUB_OUTPUT
-          else
-            # Hourly tick inside window → always go
-            echo "go=true" >> $GITHUB_OUTPUT
+          # Default outputs
+          echo "live=false" >> "$GITHUB_OUTPUT"
+          echo "ids="       >> "$GITHUB_OUTPUT"
+
+          # If this is a manual run, short-circuit with any provided game_id
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" && -n "${{ github.event.inputs.game_id }}" ]]; then
+            echo "live=true"        >> "$GITHUB_OUTPUT"
+            echo "ids=${{ github.event.inputs.game_id }}" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
 
+          # Use the public “scoreboard” (site) API because it’s fast & reliable for state/period.
+          URL="https://site.api.espn.com/apis/site/v2/sports/${ESPN_SPORT}/${ESPN_LEAGUE}/scoreboard"
+          curl -sS "$URL" > /tmp/scoreboard.json
+
+          # Pull live/halftime games with jq; consider “in” state and period <= 2 (1st/2nd) or halftime.
+          IDS=$(jq -r '
+            .events[]
+            | select(.status.type.state=="in")
+            | select((.status.period|tonumber) <= 2 or (.status.type.description|ascii_downcase|test("halftime")))
+            | .id
+          ' /tmp/scoreboard.json | tr '\n' ' ' | sed 's/  */ /g' | sed 's/[[:space:]]$//')
+
+          if [[ -n "$IDS" ]]; then
+            echo "Live (≤HT) game IDs: $IDS"
+            echo "live=true" >> "$GITHUB_OUTPUT"
+            echo "ids=$IDS"  >> "$GITHUB_OUTPUT"
+          else
+            echo "No CFB games live at or before halftime."
+          fi
+
+      # --- Decide if we should run the updater on this tick.
+      # For top-of-hour: always run (catch late starts, fix statuses, etc.)
+      # For 5-minute ticks: only run if `scan.live == true`.
+      - name: Decide to run updater
+        id: decide
+        shell: bash
+        run: |
+          set -euo pipefail
+          SCHED="${{ steps.scan.outputs.schedule_fired }}"
+          LIVE="${{ steps.scan.outputs.live }}"
+          RUN="no"
+
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            RUN="yes"
+          elif [[ "$SCHED" =~ ^0[[:space:]] ]]; then
+            # a top-of-hour cron fired (starts with "0 ")
+            RUN="yes"
+          else
+            # a */5 cron fired; only run if live
+            [[ "$LIVE" == "true" ]] && RUN="yes"
+          fi
+
+          echo "run_updater=$RUN" >> "$GITHUB_OUTPUT"
+          echo "ids=${{ steps.scan.outputs.ids }}" >> "$GITHUB_OUTPUT"
+          echo "Decision: $RUN"
+
+      # --- Run updater. If we have specific live IDs, run once per ID so wrong sheet dates
+      #     can’t block updates. Otherwise run a single general pass.
       - name: Run live updater (CFB)
-        if: steps.decide.outputs.go == 'true'
-        run: node live-game.mjs
+        if: steps.decide.outputs.run_updater == 'yes'
+        env:
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+          GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
+          LEAGUE: ${{ env.LEAGUE }}
+          TAB_NAME: ${{ env.TAB_NAME }}
+          DEBUG_MODE: ${{ github.event.inputs.debug || '0' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          IDS="${{ steps.decide.outputs.ids }}"
+          if [[ -n "$IDS" ]]; then
+            for id in $IDS; do
+              echo "→ Updating focused game $id"
+              GAME_ID="$id" node live-game.mjs
+            done
+          else
+            echo "→ General pass (no focused IDs)"
+            node live-game.mjs
+          fi
