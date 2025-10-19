@@ -2,30 +2,13 @@ name: "🎓 CFB Live (Hourly + Smart 5-Minute Loop)"
 
 on:
   workflow_dispatch:
-    inputs:
-      force_five:
-        description: "Force 5-minute loop (debug)"
-        required: false
-        default: "false"
   schedule:
-    # top of every hour; the gate script decides whether to loop every 5 minutes
-    - cron: "0 * * * *"
-
-permissions:
-  contents: read
-  actions: write   # needed so we can self-dispatch for the 5-minute loop
-
-concurrency:
-  group: cfb-live
-  cancel-in-progress: true
+    - cron: "5 * * * *"   # hourly, offset
 
 jobs:
   live:
     runs-on: ubuntu-latest
-    env:
-      # Keep league/tab here; live-game.mjs reads these
-      LEAGUE: college-football
-      TAB_NAME: CFB
+    timeout-minutes: 25
 
     steps:
       - name: Checkout
@@ -37,48 +20,42 @@ jobs:
           node-version: "20"
 
       - name: Install deps
-        run: npm ci
-
-      # ── Gate: decide if we should enter 5-minute loop ──────────────────────
-      # Runs the gate script (ET window + “pre-3rd” check), captures JSON
-      # safely, and exposes it via steps.gate.outputs.json for fromJSON(...)
-      - name: Gate (ET window + pre-3rd check)
-        id: gate
-        env:
-          LEAGUE: college-football
         run: |
-          node live-gate.mjs > gate.json
-          # flatten to single line and escape for GitHub Outputs
-          ONE=$(tr -d '\n' < gate.json)
-          ONE=${ONE//'%'/'%25'}
-          ONE=${ONE//$'\r'/'%0D'}
-          ONE=${ONE//$'\n'/'%0A'}
-          echo "json=${ONE}" >> "$GITHUB_OUTPUT"
+          npm init -y >/dev/null 2>&1 || true
+          npm i googleapis playwright
+          npx playwright install --with-deps chromium
 
-      - name: Debug gate
-        run: |
-          echo "Gate JSON: ${{ steps.gate.outputs.json }}"
-          echo "shouldLoop: ${{ fromJSON(steps.gate.outputs.json).shouldLoop }}"
-          echo "reason    : ${{ fromJSON(steps.gate.outputs.json).reason }}"
-
-      # ── Run the live updater (always runs) ─────────────────────────────────
-      - name: Run live updater (CFB)
+      - name: Run CFB live updater
+        id: updater
         env:
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
           GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
           LEAGUE: college-football
           TAB_NAME: CFB
-          # Keep DEBUG_MODE blank by default
-          DEBUG_MODE: "0"
-        run: node live-game.mjs
-
-      # ── 5-minute self-dispatch when any CFB game is live (pre-3rd) ────────
-      - name: Conditional requeue (5-min loop if live games)
-        if: ${{ fromJSON(steps.gate.outputs.json).shouldLoop || github.event.inputs.force_five == 'true' }}
-        env:
-          GH_TOKEN: ${{ secrets.GH_PAT_WORKFLOW }} # PAT with 'workflow' scope
+          RUN_SCOPE: week
+          ADAPTIVE_HALFTIME: "1"
+          GHA_JSON: "1"
+        shell: bash
         run: |
-          # Re-dispatch THIS workflow on the same branch
-          gh workflow run "🎓 CFB Live (Hourly + Smart 5-Minute Loop)" \
-            -r ${{ github.ref_name }}
-          echo "Requeued 5-minute loop. reason='${{ fromJSON(steps.gate.outputs.json).reason }}' force='${{ github.event.inputs.force_five }}'"
+          json="$(node orchestrator.mjs --gha)"
+          echo "result=${json}" >> "$GITHUB_OUTPUT"
+
+      - name: Gate for 5-minute cycle (CFB)
+        id: gate
+        env:
+          LEAGUE: college-football
+          DEBUG_MODE: "0"
+          GHA_JSON: "1"
+        shell: bash
+        run: node live-gate.mjs --gha
+
+      - name: Read gate decision
+        shell: bash
+        run: echo "FAST=${{ steps.gate.outputs.FAST }}"
+
+      - name: Conditional requeue (5-min loop if live games)
+        if: ${{ steps.gate.outputs.FAST == '1' }}
+        shell: bash
+        run: |
+          echo "Re-queuing in 5 minutes because there are pre-3rd/halftime games."
+          # Your requeue action goes here
