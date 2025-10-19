@@ -8,18 +8,25 @@ on:
         required: false
         default: "false"
   schedule:
-    - cron: "0 * * * *"   # top of every hour (UTC) — gate script enforces ET window
+    # top of every hour; the gate script decides whether to loop every 5 minutes
+    - cron: "0 * * * *"
 
 permissions:
   contents: read
+  actions: write   # needed so we can self-dispatch for the 5-minute loop
 
-env:
-  LEAGUE: college-football
-  TAB_NAME: CFB
+concurrency:
+  group: cfb-live
+  cancel-in-progress: true
 
 jobs:
   live:
     runs-on: ubuntu-latest
+    env:
+      # Keep league/tab here; live-game.mjs reads these
+      LEAGUE: college-football
+      TAB_NAME: CFB
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -32,35 +39,46 @@ jobs:
       - name: Install deps
         run: npm ci
 
-      - name: Run CFB live updater
-        env:
-          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
-          GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GCP_SA_JSON }}
-          LEAGUE: college-football
-          TAB_NAME: CFB
-          DEBUG_MODE: "0"
-        run: node live-game.mjs || true
-
-      # ----- Gate: should we switch into a 5-minute loop? -----
-      - name: Evaluate 5-minute gate (ET window + pre-3rd)
+      # ── Gate: decide if we should enter 5-minute loop ──────────────────────
+      # Runs the gate script (ET window + “pre-3rd” check), captures JSON
+      # safely, and exposes it via steps.gate.outputs.json for fromJSON(...)
+      - name: Gate (ET window + pre-3rd check)
         id: gate
         env:
           LEAGUE: college-football
-          WINDOW_ET_START: "10"
-          WINDOW_ET_END: "2"
         run: |
-          node orchestrator.mjs > gate.json
-          echo "json=$(cat gate.json)" >> "$GITHUB_OUTPUT"
+          node live-gate.mjs > gate.json
+          # flatten to single line and escape for GitHub Outputs
+          ONE=$(tr -d '\n' < gate.json)
+          ONE=${ONE//'%'/'%25'}
+          ONE=${ONE//$'\r'/'%0D'}
+          ONE=${ONE//$'\n'/'%0A'}
+          echo "json=${ONE}" >> "$GITHUB_OUTPUT"
 
-      - name: Conditional requeue (5-min loop if live games)
-        if: ${{ inputs.force_five == 'true' || fromJSON(steps.gate.outputs.json).shouldLoop }}
-        env:
-          GH_PAT: ${{ secrets.GH_PAT_WORKFLOW }}
+      - name: Debug gate
         run: |
-          # Wait 5 minutes then self-dispatch
-          sleep 300
-          curl -sS -X POST \
-            -H "Accept: application/vnd.github+json" \
-            -H "Authorization: Bearer $GH_PAT" \
-            https://api.github.com/repos/${{ github.repository }}/actions/workflows/CFB-Live-.yml/dispatches \
-            -d '{"ref":"${{ github.ref_name }}"}'
+          echo "Gate JSON: ${{ steps.gate.outputs.json }}"
+          echo "shouldLoop: ${{ fromJSON(steps.gate.outputs.json).shouldLoop }}"
+          echo "reason    : ${{ fromJSON(steps.gate.outputs.json).reason }}"
+
+      # ── Run the live updater (always runs) ─────────────────────────────────
+      - name: Run live updater (CFB)
+        env:
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+          GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
+          LEAGUE: college-football
+          TAB_NAME: CFB
+          # Keep DEBUG_MODE blank by default
+          DEBUG_MODE: "0"
+        run: node live-game.mjs
+
+      # ── 5-minute self-dispatch when any CFB game is live (pre-3rd) ────────
+      - name: Conditional requeue (5-min loop if live games)
+        if: ${{ fromJSON(steps.gate.outputs.json).shouldLoop || github.event.inputs.force_five == 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT_WORKFLOW }} # PAT with 'workflow' scope
+        run: |
+          # Re-dispatch THIS workflow on the same branch
+          gh workflow run "🎓 CFB Live (Hourly + Smart 5-Minute Loop)" \
+            -r ${{ github.ref_name }}
+          echo "Requeued 5-minute loop. reason='${{ fromJSON(steps.gate.outputs.json).reason }}' force='${{ github.event.inputs.force_five }}'"
