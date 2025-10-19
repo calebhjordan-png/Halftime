@@ -1,86 +1,98 @@
 name: 🎓 NFL Live
 
 on:
-  schedule:
-    # Hourly during window (top of hour)
-    - cron: "0 14-23 * * *"
-    - cron: "0 0-6 * * *"
-    # Every 5 minutes during window
-    - cron: "*/5 14-23 * * *"
-    - cron: "*/5 0-6 * * *"
   workflow_dispatch:
+    inputs:
+      GAME_ID:
+        description: Optional ESPN game id to focus on
+        required: false
+        default: ""
+      DEBUG_MODE:
+        description: Enable verbose debug logging (1 to enable)
+        required: false
+        default: ""
+  schedule:
+    # Same UTC window as CFB; tweak later if you want a different window
+    - cron: "0 14-23,0-6 * * *"
+    - cron: "*/5 14-23,0-6 * * *"
+
+concurrency:
+  group: nfl-live
+  cancel-in-progress: false
 
 jobs:
   run:
     runs-on: ubuntu-latest
+    env:
+      LEAGUE: nfl
+      TAB_NAME: NFL
+      GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+      GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
+      GAME_ID: ${{ inputs.GAME_ID }}
+      DEBUG_MODE: ${{ inputs.DEBUG_MODE }}
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
         with:
           node-version: "20"
 
       - name: Install deps
         run: npm i axios googleapis
 
-      - name: Check ET window
+      - name: Early-exit if outside window
         id: window
+        shell: bash
         run: |
-          node - <<'NODE'
-          const { writeFileSync } = require('fs');
-          function hourET() {
-            const parts = new Intl.DateTimeFormat('en-US', {
-              timeZone: 'America/New_York', hour12: false, hour: '2-digit'
-            }).formatToParts(new Date());
-            return Number(parts.find(p=>p.type==='hour').value);
-          }
-          const h = hourET();
-          const ok = (h >= 10 && h <= 23) || (h >= 0 && h <= 2);
-          writeFileSync(process.env.GITHUB_OUTPUT, `ok=${ok}\n`);
-          console.log('ET hour =', h, 'ok_window =', ok);
-          NODE
+          HOUR_UTC=$(date -u +%H)
+          if [[ $HOUR_UTC -ge 14 || $HOUR_UTC -le 6 ]]; then
+            echo "ok=true" >> $GITHUB_OUTPUT
+          else
+            echo "ok=false" >> $GITHUB_OUTPUT
+          fi
 
-      - name: Decide from ESPN scoreboard (NFL)
-        if: steps.window.outputs.ok == 'true'
+      - name: Scan ESPN scoreboard (NFL) for pre-3rd live games
         id: scan
-        env:
-          LEAGUE: nfl
+        if: steps.window.outputs.ok == 'true'
+        shell: bash
         run: |
           node - <<'NODE'
-          const { appendFileSync } = require('fs');
           const axios = require('axios');
-          const league = process.env.LEAGUE;
-          const url = `https://site.api.espn.com/apis/site/v2/sports/football/${league}/scoreboard`;
           (async () => {
             try {
-              const { data } = await axios.get(url, { timeout: 15000 });
+              const { data } = await axios.get('https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard', { timeout: 15000 });
               const events = data?.events || [];
-              const should = events.some(ev => {
-                const st = ev?.competitions?.[0]?.status || {};
-                const name  = String(st?.type?.name || '').toLowerCase();
-                const short = String(st?.type?.shortDetail || '').toLowerCase();
-                const completed = !!st?.type?.completed;
-                const period = Number(st?.period || 0);
-
-                if (completed) return false;
-                if (short.includes('halftime')) return true;
-                if (/\b(1st|2nd)\b/.test(short)) return true;
-                if (name.includes('in') && period <= 2) return true;
-                return false;
-              });
-              console.log('should_run =', should);
-              appendFileSync(process.env.GITHUB_OUTPUT, `should_run=${should}\n`);
-            } catch (e) {
-              console.log('scoreboard error:', e.message);
-              appendFileSync(process.env.GITHUB_OUTPUT, `should_run=false\n`);
+              let hasPre3rd = false;
+              for (const e of events) {
+                const c = e?.competitions?.[0];
+                const state = String(c?.status?.type?.state||'').toLowerCase();
+                const period = Number(c?.status?.period ?? 0);
+                if (state === 'in' && period < 3) { hasPre3rd = true; break; }
+              }
+              console.log('pre3rd-live:', hasPre3rd);
+              require('fs').appendFileSync(process.env.GITHUB_OUTPUT, `run=${hasPre3rd}\n`);
+            } catch (err) {
+              console.log('scan_error=true');
+              require('fs').appendFileSync(process.env.GITHUB_OUTPUT, `run=true\n`);
             }
           })();
           NODE
 
+      - name: Decide whether to run updater
+        id: decide
+        if: steps.window.outputs.ok == 'true'
+        shell: bash
+        run: |
+          SCHED="${{ github.event.schedule }}"
+          if [[ "$SCHED" == "*/5 14-23,0-6 * * *" ]]; then
+            [[ "${{ steps.scan.outputs.run }}" == "true" ]] && echo "go=true" >> $GITHUB_OUTPUT || echo "go=false" >> $GITHUB_OUTPUT
+          else
+            echo "go=true" >> $GITHUB_OUTPUT
+          fi
+
       - name: Run live updater (NFL)
-        if: steps.window.outputs.ok == 'true' && steps.scan.outputs.should_run == 'true'
-        env:
-          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
-          GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
-          LEAGUE: "nfl"
-          TAB_NAME: "NFL"
+        if: steps.decide.outputs.go == 'true'
         run: node live-game.mjs
