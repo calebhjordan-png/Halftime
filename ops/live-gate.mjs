@@ -1,92 +1,78 @@
-// live-gate.mjs
-// Emits PURE JSON to STDOUT: { shouldLoop, reason, inProgress, preThird, gameIds }
-// Nothing except JSON goes to stdout. Any human logs go to stderr.
+// live-gate.mjs — emits a single FAST output for GitHub Actions
+// FAST=1  → run 5-min loop (there is at least one game pre-3rd or halftime)
+// FAST=0  → skip 5-min loop
 
-import axios from "axios";
-import { DateTime } from "luxon";
+const LEAGUE = (process.env.LEAGUE || "college-football").toLowerCase(); // keep default CFB
+const DEBUG  = String(process.env.DEBUG_MODE || "") === "1";
 
-const {
-  LEAGUE = "college-football",               // "college-football" | "nfl"
-} = process.env;
+// When true, send human logs to stderr and keep stdout machine-clean.
+const GHA_JSON_MODE = process.argv.includes("--gha") || process.env.GHA_JSON === "1";
 
-// ---- helpers ----
-const ET = "America/New_York";
-function inDailyWindowET(now = DateTime.now().setZone(ET)) {
-  // Active between 10:00–01:59 ET (i.e., 10am–2am next day).
-  const h = now.hour;
-  return (h >= 10) || (h <= 1);
+const log  = (...a) => GHA_JSON_MODE ? process.stderr.write(a.join(" ") + "\n") : console.log(...a);
+const elog = (...a) => process.stderr.write(a.join(" ") + "\n");
+
+function ymdInEastern(d = new Date()) {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: "America/New_York",
+    year: "numeric", month: "2-digit", day: "2-digit"
+  }).formatToParts(d);
+  const get = t => parts.find(p => p.type === t)?.value ?? "";
+  return `${get("year")}${get("month")}${get("day")}`;
 }
 
-async function fetchScoreboardIds(league) {
-  // ESPN “events” list from the scoreboard endpoint
-  const url = `https://site.api.espn.com/apis/site/v2/sports/football/${league}/scoreboard`;
-  const { data } = await axios.get(url, { timeout: 15000 });
-  const events = data?.events || [];
-  return events.map(e => String(e?.id)).filter(Boolean);
+function isPreThird(status) {
+  const type   = status?.type || {};
+  const name   = String(type.name || type.state || "").toUpperCase();
+  const desc   = String(type.shortDetail || type.detail || type.description || "").toLowerCase();
+  const period = Number(status?.period ?? status?.displayPeriod ?? 0);
+  if (desc.includes("halftime")) return true;
+  return name.includes("IN_PROGRESS") && period > 0 && period < 3;
 }
 
-async function fetchSummaries(league, ids) {
-  const got = [];
-  for (const id of ids) {
-    try {
-      const url = `https://site.api.espn.com/apis/site/v2/sports/football/${league}/summary?event=${id}`;
-      const { data } = await axios.get(url, { timeout: 15000 });
-      const comp = data?.header?.competitions?.[0];
-      const stat = comp?.status?.type?.description || comp?.status?.type?.detail || "";
-      // figure quarter number if present
-      const qNum = Number(comp?.status?.period ?? 0);
-      const short = comp?.status?.type?.shortDetail || stat || "";
-      const isInProgress = /in\s*progress|^q[1-4]\b|^1st|^2nd|^3rd|^4th|^ot/i.test(short) || /2nd|3rd|4th|OT/i.test(short);
-      const isFinal = /final/i.test(short);
-      got.push({ id, short, qNum, isInProgress, isFinal });
-    } catch (e) {
-      console.error(`summary miss ${id}:`, e?.response?.status || e?.message || e);
-    }
+async function fetchScoreboard() {
+  const ymd = ymdInEastern();
+  const url = `https://site.api.espn.com/apis/site/v2/sports/football/${LEAGUE}/scoreboard?dates=${ymd}`;
+  if (DEBUG) log("scoreboard:", url);
+  const r = await fetch(url, { headers: { "User-Agent": "live-gate/1.0" }, cache: "no-store" });
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  return r.json();
+}
+
+function writeGhaOutput(name, value) {
+  const file = process.env.GITHUB_OUTPUT;
+  if (file) {
+    // Official GA output mechanism
+    require("fs").appendFileSync(file, `${name}=${value}\n`, "utf8");
   }
-  return got;
 }
 
-function decideLoop(rows) {
-  const inProgress = rows.filter(r => r.isInProgress && !r.isFinal);
-  const preThird   = inProgress.filter(r => (r.qNum || 0) < 3);
-  if (preThird.length > 0) {
-    return { shouldLoop: true, reason: `${preThird.length} pre-3rd`, inProgress: inProgress.length, preThird: preThird.length, gameIds: preThird.map(r => r.id) };
-  }
-  if (inProgress.length > 0) {
-    return { shouldLoop: false, reason: `all ${inProgress.length} in 3Q+`, inProgress: inProgress.length, preThird: 0, gameIds: [] };
-  }
-  return { shouldLoop: false, reason: "no live games", inProgress: 0, preThird: 0, gameIds: [] };
-}
-
-// ---- main ----
 (async () => {
-  const nowET = DateTime.now().setZone(ET);
-  if (!inDailyWindowET(nowET)) {
-    // Outside window: never loop
-    const out = { shouldLoop: false, reason: "outside 10:00–01:59 ET window", inProgress: 0, preThird: 0, gameIds: [] };
-    process.stdout.write(JSON.stringify(out));
-    return;
-  }
-
-  let ids = [];
   try {
-    ids = await fetchScoreboardIds(LEAGUE);
-  } catch (e) {
-    console.error("scoreboard fetch failed:", e?.message || e);
-    const out = { shouldLoop: false, reason: "scoreboard error", inProgress: 0, preThird: 0, gameIds: [] };
-    process.stdout.write(JSON.stringify(out));
-    return;
+    const board = await fetchScoreboard();
+    const events = Array.isArray(board?.events) ? board.events : [];
+    let preThird = 0;
+    for (const ev of events) {
+      const st = ev?.competitions?.[0]?.status || ev?.status;
+      if (isPreThird(st)) preThird++;
+    }
+    const FAST = preThird > 0 ? "1" : "0";
+
+    // Write the GA output file so downstream steps can use `steps.gate.outputs.FAST`
+    writeGhaOutput("FAST", FAST);
+
+    // Keep stdout machine-readable only when --gha is set
+    if (GHA_JSON_MODE) {
+      process.stdout.write(JSON.stringify({ ok: true, FAST }) + "\n");
+    } else {
+      // Human-friendly logs go to stdout when not in GA JSON mode
+      log(`Gate: pre-3rd games = ${preThird} → FAST=${FAST}`);
+    }
+  } catch (err) {
+    // Fail open: if we can’t decide, set FAST=1 so we don’t miss updates
+    writeGhaOutput("FAST", "1");
+    if (GHA_JSON_MODE) {
+      process.stdout.write(JSON.stringify({ ok: false, error: String(err?.message || err), FAST: "1" }) + "\n");
+    }
+    elog("Gate error (failing open):", err?.message || err);
   }
-
-  if (!ids.length) {
-    const out = { shouldLoop: false, reason: "no events", inProgress: 0, preThird: 0, gameIds: [] };
-    process.stdout.write(JSON.stringify(out));
-    return;
-  }
-
-  const rows = await fetchSummaries(LEAGUE, ids);
-  const decision = decideLoop(rows);
-
-  // Emit PURE JSON
-  process.stdout.write(JSON.stringify(decision));
 })();
