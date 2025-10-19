@@ -1,19 +1,14 @@
-name: 🎓 NFL Live
+name: NFL Live
 
 on:
   schedule:
-    - cron: "*/5 * * * *"   # every 5 minutes
-    - cron: "0 * * * *"     # top of every hour
+    - cron: "0 * * * *"       # top of every hour
+    - cron: "*/5 * * * *"     # every 5 minutes (gated)
   workflow_dispatch:
 
 jobs:
-  nfl-live:
+  run:
     runs-on: ubuntu-latest
-    env:
-      GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
-      GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
-      LEAGUE: "nfl"
-      TAB_NAME: "NFL"
 
     steps:
       - name: Checkout
@@ -27,95 +22,64 @@ jobs:
       - name: Install deps
         run: npm i axios googleapis
 
-      - name: Decide cadence (scan sheet)
+      - name: Scan sheet for pre-3rd games (NFL)
         id: scan
+        env:
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+          GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
+          TAB_NAME: "NFL"
         run: |
           node - <<'NODE'
-          const { google } = require("googleapis");
-
+          const { google } = require('googleapis');
+          const TAB = process.env.TAB_NAME || 'NFL';
           const svc = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT);
           const jwt = new google.auth.JWT(
             svc.client_email, undefined, svc.private_key,
-            ["https://www.googleapis.com/auth/spreadsheets.readonly"]
+            ['https://www.googleapis.com/auth/spreadsheets']
           );
-          const sheets = google.sheets({ version: "v4", auth: jwt });
-
-          const TAB_NAME = process.env.TAB_NAME || "NFL";
-          const SPREADSHEET_ID = process.env.GOOGLE_SHEET_ID;
-
-          const todayKey = (() => {
-            const parts = new Intl.DateTimeFormat("en-US", {
-              timeZone: "America/New_York",
-              month: "2-digit", day: "2-digit", year: "2-digit",
-            }).formatToParts(new Date());
-            const mm = parts.find(p => p.type==="month")?.value ?? "00";
-            const dd = parts.find(p => p.type==="day")?.value ?? "00";
-            const yy = parts.find(p => p.type==="year")?.value ?? "00";
-            return `${mm}/${dd}/${yy}`;
-          })();
-
-          const looksEarlyLive = (s) => {
-            const x = String(s||"").toLowerCase();
-            if (/halftime|end of 2nd/.test(x)) return true;
-            if (/\b1st\b|\b2nd\b|\bin\s*progress\b|delayed/.test(x)) return true;
-            if (/\b3rd\b|\b4th\b|\bot\b|final/.test(x)) return false;
-            return false;
-          };
+          const sheets = google.sheets({ version: 'v4', auth: jwt });
 
           (async () => {
-            const range = `${TAB_NAME}!A1:Q2000`;
-            const { data } = await sheets.spreadsheets.values.get({
-              spreadsheetId: SPREADSHEET_ID, range
+            const res = await sheets.spreadsheets.values.get({
+              spreadsheetId: process.env.GOOGLE_SHEET_ID,
+              range: `${TAB}!A1:Q2000`,
             });
-            const rows = data.values || [];
-            if (rows.length === 0) {
-              console.log("No rows.");
-              console.log("fast_needed=false");
-              return;
+            const rows = res.data.values || [];
+            if (!rows.length) { console.log('rows=0'); return console.log('FAST=false'); }
+
+            const header = rows[0] || [];
+            const statusCol = header.findIndex(h => (h||'').toLowerCase().trim()==='status');
+            const PRE3 = /(1st|2nd|halftime|end\s*of\s*2nd)/i;
+
+            let fast = false;
+            for (let r = 1; r < rows.length; r++) {
+              const s = (rows[r]?.[statusCol] || '').toString();
+              if (PRE3.test(s)) { fast = true; break; }
             }
-            const header = rows[0].map(h => String(h||"").trim().toLowerCase());
-            const idxDate   = header.indexOf("date");
-            const idxStatus = header.indexOf("status");
-            if (idxDate < 0 || idxStatus < 0) {
-              console.log("Missing Date/Status columns.");
-              console.log("fast_needed=false");
-              return;
-            }
-            let earlyLive = false;
-            for (let r=1; r<rows.length; r++){
-              const row = rows[r] || [];
-              const dateCell   = String(row[idxDate]||"").trim();
-              const statusCell = String(row[idxStatus]||"").trim();
-              if (!dateCell || !statusCell) continue;
-              if (/^final$/i.test(statusCell)) continue;
-              if (dateCell === todayKey && looksEarlyLive(statusCell)) {
-                earlyLive = true; break;
-              }
-            }
-            console.log(`fast_needed=${earlyLive}`);
-            require('fs').appendFileSync(process.env.GITHUB_OUTPUT, `fast_needed=${earlyLive}\n`);
-          })().catch(e => {
-            console.error("scan error:", e?.message||e);
-            require('fs').appendFileSync(process.env.GITHUB_OUTPUT, `fast_needed=false\n`);
-          });
+            console.log(`FAST=${fast}`);
+          })().catch(e => { console.error(e); console.log('FAST=false'); });
           NODE
 
-      - name: Run live updater (fast window)
-        if: steps.scan.outputs.fast_needed == 'true'
+      - name: Decide whether to run updater
+        id: gate
+        run: |
+          NOW_MIN=$(date -u +%M)
+          IS_TOP=$([ "$NOW_MIN" = "00" ] && echo "true" || echo "false")
+          FAST=$(grep -o 'FAST=\(true\|false\)' <<<"${{ steps.scan.outputs }}" | tail -n1 | cut -d= -f2)
+          if [ -z "$FAST" ]; then
+            FAST=$(grep -o 'FAST=\(true\|false\)' "$GITHUB_STEP_SUMMARY" 2>/dev/null | tail -n1 | cut -d= -f2)
+          fi
+          [ -z "$FAST" ] && FAST=false
+
+          echo "is_top_of_hour=$IS_TOP" >> $GITHUB_OUTPUT
+          echo "fast_mode=$FAST" >> $GITHUB_OUTPUT
+          echo "TopOfHour=$IS_TOP  Fast=$FAST"
+
+      - name: Run live updater (NFL)
+        if: steps.gate.outputs.is_top_of_hour == 'true' || steps.gate.outputs.fast_mode == 'true'
         env:
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+          GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
           LEAGUE: "nfl"
           TAB_NAME: "NFL"
-          DEBUG_MODE: ""
         run: node live-game.mjs
-
-      - name: Run hourly status refresh
-        if: steps.scan.outputs.fast_needed != 'true' && ${{ startsWith(steps.get_minute.outputs.minute, '00') }}
-        env:
-          LEAGUE: "nfl"
-          TAB_NAME: "NFL"
-          DEBUG_MODE: ""
-        run: node live-game.mjs
-
-      - name: Compute current minute
-        id: get_minute
-        run: echo "minute=$(date -u +%M)" >> $GITHUB_OUTPUT
