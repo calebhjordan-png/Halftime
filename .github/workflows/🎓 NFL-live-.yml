@@ -1,82 +1,83 @@
-name: NFL Live
+name: 🎓 NFL Live
 
 on:
   schedule:
-    - cron: "0 * * * *"       # top of every hour
-    - cron: "*/5 * * * *"     # every 5 minutes (gated)
+    # Hourly during window (top of hour)
+    - cron: "0 14-23 * * *"
+    - cron: "0 0-6 * * *"
+    # Every 5 minutes during window
+    - cron: "*/5 14-23 * * *"
+    - cron: "*/5 0-6 * * *"
   workflow_dispatch:
 
 jobs:
   run:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Node
-        uses: actions/setup-node@v4
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
         with:
           node-version: "20"
 
       - name: Install deps
         run: npm i axios googleapis
 
-      - name: Scan sheet for pre-3rd games (NFL)
-        id: scan
-        env:
-          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
-          GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
-          TAB_NAME: "NFL"
+      - name: Check ET window
+        id: window
         run: |
           node - <<'NODE'
-          const { google } = require('googleapis');
-          const TAB = process.env.TAB_NAME || 'NFL';
-          const svc = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT);
-          const jwt = new google.auth.JWT(
-            svc.client_email, undefined, svc.private_key,
-            ['https://www.googleapis.com/auth/spreadsheets']
-          );
-          const sheets = google.sheets({ version: 'v4', auth: jwt });
-
-          (async () => {
-            const res = await sheets.spreadsheets.values.get({
-              spreadsheetId: process.env.GOOGLE_SHEET_ID,
-              range: `${TAB}!A1:Q2000`,
-            });
-            const rows = res.data.values || [];
-            if (!rows.length) { console.log('rows=0'); return console.log('FAST=false'); }
-
-            const header = rows[0] || [];
-            const statusCol = header.findIndex(h => (h||'').toLowerCase().trim()==='status');
-            const PRE3 = /(1st|2nd|halftime|end\s*of\s*2nd)/i;
-
-            let fast = false;
-            for (let r = 1; r < rows.length; r++) {
-              const s = (rows[r]?.[statusCol] || '').toString();
-              if (PRE3.test(s)) { fast = true; break; }
-            }
-            console.log(`FAST=${fast}`);
-          })().catch(e => { console.error(e); console.log('FAST=false'); });
+          const { writeFileSync } = require('fs');
+          function hourET() {
+            const parts = new Intl.DateTimeFormat('en-US', {
+              timeZone: 'America/New_York', hour12: false, hour: '2-digit'
+            }).formatToParts(new Date());
+            return Number(parts.find(p=>p.type==='hour').value);
+          }
+          const h = hourET();
+          const ok = (h >= 10 && h <= 23) || (h >= 0 && h <= 2);
+          writeFileSync(process.env.GITHUB_OUTPUT, `ok=${ok}\n`);
+          console.log('ET hour =', h, 'ok_window =', ok);
           NODE
 
-      - name: Decide whether to run updater
-        id: gate
+      - name: Decide from ESPN scoreboard (NFL)
+        if: steps.window.outputs.ok == 'true'
+        id: scan
+        env:
+          LEAGUE: nfl
         run: |
-          NOW_MIN=$(date -u +%M)
-          IS_TOP=$([ "$NOW_MIN" = "00" ] && echo "true" || echo "false")
-          FAST=$(grep -o 'FAST=\(true\|false\)' <<<"${{ steps.scan.outputs }}" | tail -n1 | cut -d= -f2)
-          if [ -z "$FAST" ]; then
-            FAST=$(grep -o 'FAST=\(true\|false\)' "$GITHUB_STEP_SUMMARY" 2>/dev/null | tail -n1 | cut -d= -f2)
-          fi
-          [ -z "$FAST" ] && FAST=false
+          node - <<'NODE'
+          const { appendFileSync } = require('fs');
+          const axios = require('axios');
+          const league = process.env.LEAGUE;
+          const url = `https://site.api.espn.com/apis/site/v2/sports/football/${league}/scoreboard`;
+          (async () => {
+            try {
+              const { data } = await axios.get(url, { timeout: 15000 });
+              const events = data?.events || [];
+              const should = events.some(ev => {
+                const st = ev?.competitions?.[0]?.status || {};
+                const name  = String(st?.type?.name || '').toLowerCase();
+                const short = String(st?.type?.shortDetail || '').toLowerCase();
+                const completed = !!st?.type?.completed;
+                const period = Number(st?.period || 0);
 
-          echo "is_top_of_hour=$IS_TOP" >> $GITHUB_OUTPUT
-          echo "fast_mode=$FAST" >> $GITHUB_OUTPUT
-          echo "TopOfHour=$IS_TOP  Fast=$FAST"
+                if (completed) return false;
+                if (short.includes('halftime')) return true;
+                if (/\b(1st|2nd)\b/.test(short)) return true;
+                if (name.includes('in') && period <= 2) return true;
+                return false;
+              });
+              console.log('should_run =', should);
+              appendFileSync(process.env.GITHUB_OUTPUT, `should_run=${should}\n`);
+            } catch (e) {
+              console.log('scoreboard error:', e.message);
+              appendFileSync(process.env.GITHUB_OUTPUT, `should_run=false\n`);
+            }
+          })();
+          NODE
 
       - name: Run live updater (NFL)
-        if: steps.gate.outputs.is_top_of_hour == 'true' || steps.gate.outputs.fast_mode == 'true'
+        if: steps.window.outputs.ok == 'true' && steps.scan.outputs.should_run == 'true'
         env:
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
           GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
