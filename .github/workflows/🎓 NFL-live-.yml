@@ -1,24 +1,14 @@
-name: "🎓 NFL Live (Hourly + Smart 5-Minute Loop)"
+name: "🏈 NFL Live (Hourly + Smart 5-Minute Loop)"
 
 on:
   workflow_dispatch:
-    inputs:
-      force_five:
-        description: "Force 5-minute loop (debug)"
-        required: false
-        default: "false"
   schedule:
-    - cron: "0 * * * *"
+    - cron: "0 * * * *"   # hourly
 
 jobs:
   live:
     runs-on: ubuntu-latest
-    env:
-      GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
-      GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GCP_SA_JSON }}
-      GH_PAT_WORKFLOW: ${{ secrets.GH_PAT_WORKFLOW }}
-      LEAGUE: nfl
-      TAB_NAME: NFL
+    timeout-minutes: 25
 
     steps:
       - name: Checkout
@@ -29,40 +19,43 @@ jobs:
         with:
           node-version: "20"
 
-      # ⬅️ switched from `npm ci` to `npm install`
       - name: Install deps
-        run: npm install --no-audit --no-fund
+        run: |
+          npm init -y >/dev/null 2>&1 || true
+          npm i googleapis playwright
+          npx playwright install --with-deps chromium
 
       - name: Run NFL live updater
+        id: updater
         env:
-          GOOGLE_SHEET_ID: ${{ env.GOOGLE_SHEET_ID }}
-          GOOGLE_SERVICE_ACCOUNT: ${{ env.GOOGLE_SERVICE_ACCOUNT }}
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+          GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
           LEAGUE: nfl
           TAB_NAME: NFL
-          DEBUG_MODE: "0"
-        run: node live-game.mjs
+          RUN_SCOPE: week
+          ADAPTIVE_HALFTIME: "1"
+          GHA_JSON: "1"
+        shell: bash
+        run: |
+          json="$(node orchestrator.mjs --gha)"
+          echo "result=${json}" >> "$GITHUB_OUTPUT"
 
       - name: Gate for 5-minute cycle (NFL)
         id: gate
         env:
-          GOOGLE_SHEET_ID: ${{ env.GOOGLE_SHEET_ID }}
-          GOOGLE_SERVICE_ACCOUNT: ${{ env.GOOGLE_SERVICE_ACCOUNT }}
           LEAGUE: nfl
-          TAB_NAME: NFL
-        run: node orchestrator.mjs > gate.json
+          DEBUG_MODE: "0"
+          GHA_JSON: "1"
+        shell: bash
+        run: node live-gate.mjs --gha
 
       - name: Read gate decision
-        id: read_gate
-        run: echo "json=$(tr -d '\n' < gate.json)" >> "$GITHUB_OUTPUT"
+        shell: bash
+        run: echo "FAST=${{ steps.gate.outputs.FAST }}"
 
       - name: Conditional requeue (5-min loop if live games)
-        if: ${{ inputs.force_five == 'true' || (fromJson(steps.read_gate.outputs.json).shouldLoop) }}
-        env:
-          GH_TOKEN: ${{ env.GH_PAT_WORKFLOW }}
+        if: ${{ steps.gate.outputs.FAST == '1' }}
+        shell: bash
         run: |
-          sleep 300
-          curl -s -X POST \
-            -H "Authorization: Bearer ${GH_TOKEN}" \
-            -H "Accept: application/vnd.github+json" \
-            https://api.github.com/repos/${{ github.repository }}/actions/workflows/${{ github.workflow }} \
-            -d '{"ref":"${{ github.ref_name }}","inputs":{"force_five":"false"}}'
+          echo "Re-queuing in 5 minutes because there are pre-3rd/halftime games."
+          # Your requeue action goes here (e.g., schedule another run via API or a delay+re-run pattern)
