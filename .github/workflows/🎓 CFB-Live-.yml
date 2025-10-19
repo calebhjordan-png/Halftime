@@ -2,92 +2,83 @@ name: CFB Live
 
 on:
   schedule:
-    # Top of every hour
-    - cron: "0 * * * *"
-    # Every 5 minutes (we'll gate the job so it only runs when pre-3rd)
-    - cron: "*/5 * * * *"
+    # Hourly during window (top of hour)
+    - cron: "0 14-23 * * *"   # 10:00–23:59 ET
+    - cron: "0 0-6 * * *"     # 00:00–02:59 ET
+    # Every 5 minutes during window
+    - cron: "*/5 14-23 * * *"
+    - cron: "*/5 0-6 * * *"
   workflow_dispatch:
 
 jobs:
   run:
     runs-on: ubuntu-latest
-
-    # Gate: run the heavy updater only when either
-    # - we're at top-of-hour, OR
-    # - the scanner reports fast mode is ON (i.e., there are games before 3rd)
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Node
-        uses: actions/setup-node@v4
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
         with:
           node-version: "20"
 
       - name: Install deps
         run: npm i axios googleapis
 
-      # Scanner: read the CFB sheet and see if any Status shows game prior to 3rd
-      - name: Scan sheet for pre-3rd games (CFB)
-        id: scan
-        env:
-          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
-          GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
-          TAB_NAME: "CFB"
+      # Guard: only allow runs inside 10:00–02:59 ET
+      - name: Check ET window
+        id: window
         run: |
           node - <<'NODE'
-          const { google } = require('googleapis');
-          const TAB = process.env.TAB_NAME || 'CFB';
-          const svc = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT);
-          const jwt = new google.auth.JWT(
-            svc.client_email, undefined, svc.private_key,
-            ['https://www.googleapis.com/auth/spreadsheets']
-          );
-          const sheets = google.sheets({ version: 'v4', auth: jwt });
-
-          (async () => {
-            const res = await sheets.spreadsheets.values.get({
-              spreadsheetId: process.env.GOOGLE_SHEET_ID,
-              range: `${TAB}!A1:Q2000`,
-            });
-            const rows = res.data.values || [];
-            if (!rows.length) { console.log('rows=0'); return console.log('FAST=false'); }
-
-            const header = rows[0] || [];
-            const statusCol = header.findIndex(h => (h||'').toLowerCase().trim()==='status');
-            // pre-3rd = 1st / 2nd / Halftime / End of 2nd
-            const PRE3 = /(1st|2nd|halftime|end\s*of\s*2nd)/i;
-
-            let fast = false;
-            for (let r = 1; r < rows.length; r++) {
-              const s = (rows[r]?.[statusCol] || '').toString();
-              if (PRE3.test(s)) { fast = true; break; }
-            }
-            console.log(`FAST=${fast}`);
-          })().catch(e => { console.error(e); console.log('FAST=false'); });
+          const { writeFileSync } = require('fs');
+          function hourET() {
+            const parts = new Intl.DateTimeFormat('en-US', {
+              timeZone: 'America/New_York', hour12: false, hour: '2-digit'
+            }).formatToParts(new Date());
+            return Number(parts.find(p=>p.type==='hour').value);
+          }
+          const h = hourET();
+          const ok = (h >= 10 && h <= 23) || (h >= 0 && h <= 2);
+          writeFileSync(process.env.GITHUB_OUTPUT, `ok=${ok}\n`);
+          console.log('ET hour =', h, 'ok_window =', ok);
           NODE
 
-      # Decide if we should proceed this run.
-      # - Always proceed at top-of-hour
-      # - On 5-min ticks, only proceed when FAST=true
-      - name: Decide whether to run updater
-        id: gate
+      - name: Decide from ESPN scoreboard (CFB)
+        if: steps.window.outputs.ok == 'true'
+        id: scan
+        env:
+          LEAGUE: college-football
         run: |
-          NOW_MIN=$(date -u +%M)
-          IS_TOP=$([ "$NOW_MIN" = "00" ] && echo "true" || echo "false")
-          FAST=$(grep -o 'FAST=\(true\|false\)' <<<"${{ steps.scan.outputs }}" | tail -n1 | cut -d= -f2)
-          # Fallback if grep didn't find it; parse from previous step logs
-          if [ -z "$FAST" ]; then
-            FAST=$(grep -o 'FAST=\(true\|false\)' "$GITHUB_STEP_SUMMARY" 2>/dev/null | tail -n1 | cut -d= -f2)
-          fi
-          [ -z "$FAST" ] && FAST=false
+          node - <<'NODE'
+          const { appendFileSync } = require('fs');
+          const axios = require('axios');
+          const league = process.env.LEAGUE;
+          const url = `https://site.api.espn.com/apis/site/v2/sports/football/${league}/scoreboard`;
+          (async () => {
+            try {
+              const { data } = await axios.get(url, { timeout: 15000 });
+              const events = data?.events || [];
+              const should = events.some(ev => {
+                const st = ev?.competitions?.[0]?.status || {};
+                const name  = String(st?.type?.name || '').toLowerCase();       // e.g., STATUS_IN_PROGRESS
+                const short = String(st?.type?.shortDetail || '').toLowerCase(); // "12:34 - 2nd", "Halftime"
+                const completed = !!st?.type?.completed;
+                const period = Number(st?.period || 0);
 
-          echo "is_top_of_hour=$IS_TOP" >> $GITHUB_OUTPUT
-          echo "fast_mode=$FAST" >> $GITHUB_OUTPUT
-          echo "TopOfHour=$IS_TOP  Fast=$FAST"
+                if (completed) return false;
+                if (short.includes('halftime')) return true;
+                if (/\b(1st|2nd)\b/.test(short)) return true;
+                if (name.includes('in') && period <= 2) return true; // “in progress” and pre-3rd
+                return false;
+              });
+              console.log('should_run =', should);
+              appendFileSync(process.env.GITHUB_OUTPUT, `should_run=${should}\n`);
+            } catch (e) {
+              console.log('scoreboard error:', e.message);
+              appendFileSync(process.env.GITHUB_OUTPUT, `should_run=false\n`);
+            }
+          })();
+          NODE
 
       - name: Run live updater (CFB)
-        if: steps.gate.outputs.is_top_of_hour == 'true' || steps.gate.outputs.fast_mode == 'true'
+        if: steps.window.outputs.ok == 'true' && steps.scan.outputs.should_run == 'true'
         env:
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
           GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
