@@ -1,47 +1,62 @@
-// ops/live-gate.mjs
-// Prints run_updater=true if ANY game in the league is in progress and <= halftime.
-// Uses America/New_York for "today".
-import axios from "axios";
+name: 🎓 CFB Live
 
-const LEAGUE = process.env.LEAGUE || "college-football"; // "college-football" | "nfl"
+on:
+  workflow_dispatch:
+  schedule:
+    # All times are UTC. These windows map to 10:00–01:59 ET year-round.
+    # Top of every hour
+    - cron: "0 14-23 * * *"   # 10:00–19:59 ET
+    - cron: "0 0-5 * * *"     # 20:00–01:59 ET
+    # Every 5 minutes (gated below so we only run the updater when a pre-3rd game is live)
+    - cron: "*/5 14-23 * * *"
+    - cron: "*/5 0-5 * * *"
 
-// YYYYMMDD in ET
-const et = new Date().toLocaleString("en-US", { timeZone: "America/New_York" });
-const d = new Date(et);
-const yyyy = d.getFullYear();
-const mm = String(d.getMonth() + 1).padStart(2, "0");
-const dd = String(d.getDate()).padStart(2, "0");
-const dates = `${yyyy}${mm}${dd}`;
+permissions:
+  contents: read
 
-const SPORT_PATH = LEAGUE === "nfl" ? "nfl" : "college-football";
-const url = `https://site.api.espn.com/apis/site/v2/sports/football/${SPORT_PATH}/scoreboard?dates=${dates}`;
+concurrency:
+  group: cfb-live-${{ github.ref_name }}
+  cancel-in-progress: false
 
-let run = false;
+jobs:
+  run:
+    runs-on: ubuntu-latest
 
-try {
-  const { data } = await axios.get(url, { timeout: 15000 });
-  const events = data?.events || [];
-  for (const ev of events) {
-    const comp = ev?.competitions?.[0];
-    const st = comp?.status || {};
-    const type = st?.type || {};
-    const period = Number(st?.period ?? 0);
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
 
-    // "in" means actively in progress; accept Halftime or Q1/Q2 only
-    const inProgress = String(type?.state || "").toLowerCase() === "in";
-    const halftime = /half/i.test(type?.shortDetail || type?.detail || "");
-    if (inProgress && (period <= 2 || halftime)) { run = true; break; }
-  }
-} catch (e) {
-  // If the gate can't reach ESPN, be safe and DO NOT flip to 5-minute mode
-  run = false;
-}
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
 
-const out = String(run);
-console.log(`run_updater=${out}`);
-if (process.env.GITHUB_OUTPUT) {
-  await Bun.write(process.env.GITHUB_OUTPUT, `run_updater=${out}\n`);
-} else {
-  // Node-only fallback (if not using Bun)
-  console.log(`::set-output name=run_updater::${out}`);
-}
+      - name: Install deps
+        run: npm i axios googleapis
+
+      # Gate: only allow the */5 runs to call the updater when a game is
+      # IN PROGRESS and pre-3rd (Q1, Q2, Halftime).
+      - name: Gate for 5-minute cycle
+        id: gate
+        env:
+          LEAGUE: college-football
+        run: |
+          # Top-of-hour runs ALWAYS proceed.
+          now_min=$(date -u +%M)
+          if [ "$now_min" != "00" ]; then
+            node ops/live-gate.mjs > gate.log || true
+            cat gate.log
+            v=$(grep -Eo 'run_updater=(true|false)' gate.log | cut -d= -f2)
+            echo "run_updater=${v:-false}" >> $GITHUB_OUTPUT
+          else
+            echo "run_updater=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Run live updater (CFB)
+        if: steps.gate.outputs.run_updater == 'true'
+        env:
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+          GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
+          LEAGUE: "college-football"
+          TAB_NAME: "CFB"
+        run: node live-game.mjs
