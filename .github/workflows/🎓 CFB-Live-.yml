@@ -1,30 +1,37 @@
 name: "🎓 CFB Live"
 
 on:
-  workflow_dispatch: {}
+  # manual run
+  workflow_dispatch:
+    inputs:
+      forceFiveMin:
+        description: "Force 5-minute loop (debug)"
+        required: false
+        default: "false"
+  # top of every hour (UTC) — the gate step applies the 10:00–01:59 ET window
   schedule:
-    # Pin 10:00–01:59 ET runs, handling both EDT (UTC-4) and EST (UTC-5).
-    # EDT block
-    - cron: "0 14-23 * * 5"  # Fri 10:00–19:00 ET
-    - cron: "0 0-5 * * 6"    # Sat 20:00–01:00 ET
-    - cron: "0 14-23 * * 6"  # Sat 10:00–19:00 ET
-    - cron: "0 0-2 * * 0"    # Sun 20:00–22:00 ET
-    # EST block
-    - cron: "0 15-23 * * 5"  # Fri 10:00–18:00 ET
-    - cron: "0 0-6 * * 6"    # Sat 19:00–01:00 ET
-    - cron: "0 15-23 * * 6"  # Sat 10:00–18:00 ET
-    - cron: "0 0-3 * * 0"    # Sun 19:00–22:00 ET
+    - cron: "0 * * * *"
+
+# IMPORTANT: allow this workflow to call the Actions API
+permissions:
+  contents: read
+  actions: write
 
 jobs:
   run:
     runs-on: ubuntu-latest
     env:
+      # league wiring for live-game.mjs
       LEAGUE: "college-football"
       TAB_NAME: "CFB"
       GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
       GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
-
+      # toggle verbose logging in the updater
+      DEBUG_MODE: ""
     steps:
+      - name: Set up job
+        run: echo "Starting CFB Live…"
+
       - name: Checkout
         uses: actions/checkout@v4
 
@@ -36,38 +43,76 @@ jobs:
       - name: Install deps
         run: npm i axios googleapis
 
-      # 1) Gate: are there any pre-3rd games on ESPN's CFB scoreboard?
+      # ───────────────────────────── Gate: hour window & live check ─────────────────────────────
+      # 10:00–01:59 ET always (no DST worry). Also decide whether to loop every 5 minutes.
       - name: Gate for 5-minute cycle (CFB)
         id: gate
-        env:
-          LEAGUE: "college-football"
-          DEBUG_MODE: "0"
+        shell: bash
         run: |
-          set -e
-          node .github/workflows/live-gate.mjs | tee gate.log
-          FAST=$(grep -o 'FAST=[01]' gate.log | tail -n1 | cut -d= -f2 || true)
-          if [ -z "$FAST" ]; then FAST=1; fi
-          echo "FAST=$FAST"
-          echo "FAST=$FAST" >> "$GITHUB_OUTPUT"
-
-      # 2) Always run updater (writes Status/Score + half-line odds)
-      - name: Run live updater (CFB)
+          node - <<'JS'
+          const { DateTime } = require('luxon');
+          const ET = DateTime.now().setZone('America/New_York');
+          const hour = ET.hour;
+          // Window: 10:00–01:59 ET
+          const inWindow = (hour >= 10 || hour < 2);
+          console.log(`ET now: ${ET.toFormat('yyyy-LL-dd HH:mm:ss ZZZZ')} (hour=${hour})`);
+          if (!inWindow) {
+            console.log('::set-output name=shouldRun::false');
+            console.log('Outside 10:00–01:59 ET — skip.');
+            process.exit(0);
+          }
+          // Default: only hourly; switch to 5-min if any ESPN scoreboard game is < 3rd Q.
+          const leaguePath = 'college-football';
+          const url = `https://site.api.espn.com/apis/site/v2/sports/football/${leaguePath}/scoreboard`;
+          require('axios').get(url, { timeout: 15000 }).then(({data})=>{
+            const evts = data?.events || [];
+            let pre3rd = false;
+            for (const e of evts) {
+              const st = e?.status?.type?.shortDetail?.toLowerCase() || '';
+              // treat Halftime / 1st / 2nd / OT* (rare) as "pre-3rd" for our updater loop
+              if (/\b(1st|2nd|half|halftime|ot|in progress)\b/.test(st) && !/\b3rd|4th|final\b/.test(st)) {
+                pre3rd = true; break;
+              }
+            }
+            // Allow forcing via manual input
+            const force = (process.env.FORCE_FIVE_MIN || '').toLowerCase() === 'true';
+            const loop5 = force || pre3rd;
+            console.log(`pre3rd=${pre3rd} force=${force} => loop5=${loop5}`);
+            console.log(`::set-output name=shouldRun::true`);
+            console.log(`::set-output name=loop5::${loop5 ? 'true' : 'false'}`);
+          }).catch(err=>{
+            console.log('Scoreboard check failed:', err?.message || err);
+            // If the check fails, be conservative and just run once (no loop)
+            console.log('::set-output name=shouldRun::true');
+            console.log('::set-output name=loop5::false');
+          });
+          JS
         env:
-          LEAGUE: "college-football"
-          TAB_NAME: "CFB"
-          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
-          GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
+          FORCE_FIVE_MIN: ${{ github.event.inputs.forceFiveMin }}
+
+      # ───────────────────────────── Live updater ─────────────────────────────
+      - name: Run live updater (CFB)
+        if: steps.gate.outputs.shouldRun == 'true'
         run: node live-game.mjs
 
-      # 3) If gate says FAST=1, sleep ~5min then dispatch another run
+      # ───────────────────────────── 5-minute loop & self-dispatch ─────────────────────────────
       - name: Sleep 5 minutes when pre-3rd games exist
-        if: steps.gate.outputs.FAST == '1'
+        if: steps.gate.outputs.loop5 == 'true'
         run: sleep 300
 
+      # Re-queue this workflow using a PAT with "workflow" scope
       - name: Re-queue workflow (self-dispatch)
-        if: steps.gate.outputs.FAST == '1'
-        uses: benc-uk/workflow-dispatch@v1
+        if: steps.gate.outputs.loop5 == 'true'
+        uses: actions/github-script@v7
         with:
-          workflow: "🎓 CFB Live"
-          token: ${{ secrets.GITHUB_TOKEN }}
-          ref: ${{ github.ref }}
+          # Use a PAT secret; see instructions below
+          github-token: ${{ secrets.GH_PAT_WORKFLOW }}
+          script: |
+            const ref = context.ref?.replace('refs/heads/','') || 'main';
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: "🎓 CFB-Live-.yml",
+              ref
+            });
+            core.info(`Re-dispatched ${ref} for another 5-minute cycle`);
