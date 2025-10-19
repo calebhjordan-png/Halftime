@@ -3,10 +3,11 @@ name: 🎓 CFB Live
 on:
   workflow_dispatch:
   schedule:
-    # Top of every hour, 10:00–23:00 and 00:00–01:00 ET (converted to UTC)
-    - cron: "0 14-23 * * *"
-    - cron: "0 0-5 * * *"
-    # Every 5 minutes in the same ET window (gated by live-gate)
+    # All times are UTC. These windows map to 10:00–01:59 ET year-round.
+    # Top of every hour
+    - cron: "0 14-23 * * *"   # 10:00–19:59 ET
+    - cron: "0 0-5 * * *"     # 20:00–01:59 ET
+    # Every 5 minutes (gated below so we only run the updater when a pre-3rd game is live)
     - cron: "*/5 14-23 * * *"
     - cron: "*/5 0-5 * * *"
 
@@ -33,11 +34,14 @@ jobs:
       - name: Install deps
         run: npm i axios googleapis
 
+      # Gate: only allow the */5 runs to call the updater when a game is
+      # IN PROGRESS and pre-3rd (Q1, Q2, Halftime).
       - name: Gate for 5-minute cycle
         id: gate
         env:
           LEAGUE: college-football
         run: |
+          # Top-of-hour runs ALWAYS proceed.
           now_min=$(date -u +%M)
           if [ "$now_min" != "00" ]; then
             node ops/live-gate.mjs > gate.log || true
