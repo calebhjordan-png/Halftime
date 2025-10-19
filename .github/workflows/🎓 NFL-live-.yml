@@ -1,0 +1,121 @@
+name: NFL Live (auto-cadence)
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"   # every 5 minutes
+    - cron: "0 * * * *"     # top of every hour
+  workflow_dispatch:
+
+jobs:
+  nfl-live:
+    runs-on: ubuntu-latest
+    env:
+      GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+      GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
+      LEAGUE: "nfl"
+      TAB_NAME: "NFL"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install deps
+        run: npm i axios googleapis
+
+      - name: Decide cadence (scan sheet)
+        id: scan
+        run: |
+          node - <<'NODE'
+          const { google } = require("googleapis");
+
+          const svc = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT);
+          const jwt = new google.auth.JWT(
+            svc.client_email, undefined, svc.private_key,
+            ["https://www.googleapis.com/auth/spreadsheets.readonly"]
+          );
+          const sheets = google.sheets({ version: "v4", auth: jwt });
+
+          const TAB_NAME = process.env.TAB_NAME || "NFL";
+          const SPREADSHEET_ID = process.env.GOOGLE_SHEET_ID;
+
+          const todayKey = (() => {
+            const parts = new Intl.DateTimeFormat("en-US", {
+              timeZone: "America/New_York",
+              month: "2-digit", day: "2-digit", year: "2-digit",
+            }).formatToParts(new Date());
+            const mm = parts.find(p => p.type==="month")?.value ?? "00";
+            const dd = parts.find(p => p.type==="day")?.value ?? "00";
+            const yy = parts.find(p => p.type==="year")?.value ?? "00";
+            return `${mm}/${dd}/${yy}`;
+          })();
+
+          const looksEarlyLive = (s) => {
+            const x = String(s||"").toLowerCase();
+            if (/halftime|end of 2nd/.test(x)) return true;
+            if (/\b1st\b|\b2nd\b|\bin\s*progress\b|delayed/.test(x)) return true;
+            if (/\b3rd\b|\b4th\b|\bot\b|final/.test(x)) return false;
+            return false;
+          };
+
+          (async () => {
+            const range = `${TAB_NAME}!A1:Q2000`;
+            const { data } = await sheets.spreadsheets.values.get({
+              spreadsheetId: SPREADSHEET_ID, range
+            });
+            const rows = data.values || [];
+            if (rows.length === 0) {
+              console.log("No rows.");
+              console.log("fast_needed=false");
+              return;
+            }
+            const header = rows[0].map(h => String(h||"").trim().toLowerCase());
+            const idxDate   = header.indexOf("date");
+            const idxStatus = header.indexOf("status");
+            if (idxDate < 0 || idxStatus < 0) {
+              console.log("Missing Date/Status columns.");
+              console.log("fast_needed=false");
+              return;
+            }
+            let earlyLive = false;
+            for (let r=1; r<rows.length; r++){
+              const row = rows[r] || [];
+              const dateCell   = String(row[idxDate]||"").trim();
+              const statusCell = String(row[idxStatus]||"").trim();
+              if (!dateCell || !statusCell) continue;
+              if (/^final$/i.test(statusCell)) continue;
+              if (dateCell === todayKey && looksEarlyLive(statusCell)) {
+                earlyLive = true; break;
+              }
+            }
+            console.log(`fast_needed=${earlyLive}`);
+            require('fs').appendFileSync(process.env.GITHUB_OUTPUT, `fast_needed=${earlyLive}\n`);
+          })().catch(e => {
+            console.error("scan error:", e?.message||e);
+            require('fs').appendFileSync(process.env.GITHUB_OUTPUT, `fast_needed=false\n`);
+          });
+          NODE
+
+      - name: Run live updater (fast window)
+        if: steps.scan.outputs.fast_needed == 'true'
+        env:
+          LEAGUE: "nfl"
+          TAB_NAME: "NFL"
+          DEBUG_MODE: ""
+        run: node live-game.mjs
+
+      - name: Run hourly status refresh
+        if: steps.scan.outputs.fast_needed != 'true' && ${{ startsWith(steps.get_minute.outputs.minute, '00') }}
+        env:
+          LEAGUE: "nfl"
+          TAB_NAME: "NFL"
+          DEBUG_MODE: ""
+        run: node live-game.mjs
+
+      - name: Compute current minute
+        id: get_minute
+        run: echo "minute=$(date -u +%M)" >> $GITHUB_OUTPUT
