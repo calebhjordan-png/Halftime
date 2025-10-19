@@ -1,16 +1,20 @@
-/* live-game.mjs — Status + current score + Live Odds (strict Game ID)
-   Writes:
+/* live-game.mjs — Status + current score + ESPN BET LIVE odds (strict Game ID)
+   Columns written (must already exist):
      Status
-     Half Score                -> current score (away-home) every tick
-     Live Away/Home Spread, Live Away/Home ML, Live Total
+     Half Score                 -> current score (away-home) every tick
+     Live Away Spread
+     Live Away ML
+     Live Home Spread
+     Live Home ML
+     Live Total
    Env:
      LEAGUE=nfl|college-football
      TAB_NAME=NFL|CFB
-     GOOGLE_SHEET_ID, GOOGLE_SERVICE_ACCOUNT(JSON)
+     GOOGLE_SHEET_ID, GOOGLE_SERVICE_ACCOUNT (JSON)
      TARGET_GAME_ID=4017...
-     ONESHOT=true        -> single fetch/write and exit
-     DEBUG_ODDS=true     -> print ALL odds candidates + chosen one
-     FORCE_STATUS_WRITE=true -> always write Status (except Final)
+     ONESHOT=true              -> single fetch/write and exit
+     DEBUG_ODDS=true           -> print ALL odds candidates + chosen one
+     FORCE_STATUS_WRITE=true   -> always write Status (except Final)
 */
 import { google } from "googleapis";
 
@@ -36,7 +40,7 @@ const pick = (o,p)=>p.replace(/\[(\d+)\]/g,'.$1').split('.').reduce((a,k)=>a?.[k
 async function fetchJson(url, tries=3) {
   for (let i=1;i<=tries;i++){
     try{
-      const r = await fetch(url,{headers:{"User-Agent":"halftime-live/1.4"}});
+      const r = await fetch(url,{headers:{"User-Agent":"halftime-live/1.5"}});
       if(!r.ok) throw new Error(`HTTP ${r.status}`);
       return await r.json();
     }catch(e){
@@ -70,19 +74,17 @@ function getTeams(sum){
     home = cps.find(c=>c.homeAway==="home");
   }
   const tn=t=>t?.team?.shortDisplayName||t?.team?.abbreviation||t?.team?.displayName||"Team";
-  const keys=t=>{
-    const k=[t?.team?.shortDisplayName,t?.team?.abbreviation,t?.team?.displayName].filter(Boolean);
-    return k.map(x=>x.toLowerCase());
-  };
+  const keys=t=>[t?.team?.shortDisplayName,t?.team?.abbreviation,t?.team?.displayName].filter(Boolean).map(x=>x.toLowerCase());
   const ts=t=>Number(t?.score ?? 0);
   return {
     awayName: tn(away), homeName: tn(home),
     awayKeys: keys(away), homeKeys: keys(home),
-    awayScore: ts(away), homeScore: ts(home)
+    awayScore: ts(away),  homeScore: ts(home)
   };
 }
 
 /* ---- Live Odds helpers ---- */
+const ESPNBET = /espn\s*bet/i;
 function coerceNum(v){ if(v===null||v===undefined||v==="") return null; const n=Number(v); return Number.isFinite(n)?n:null; }
 function toTs(x){ if(!x) return 0; const n=Date.parse(x); return Number.isFinite(n)?n:0; }
 function looksLive(obj){
@@ -105,50 +107,81 @@ function spreadsFrom(spread, ctx){
   const hit=(keys)=>keys?.some(k=>k && d.includes(k));
   if (hit(ctx.awayKeys) && !hit(ctx.homeKeys)) return { awaySpread:-abs, homeSpread:+abs };
   if (hit(ctx.homeKeys) && !hit(ctx.awayKeys)) return { awaySpread:+abs, homeSpread:-abs };
+  // neutral fallback
   return { awaySpread:+abs, homeSpread:-abs };
 }
 
 function extractOdds(sum, tm){
+  const compsOdds = pick(sum,"competitions.0.odds") || [];
+  const pickCenter = pick(sum,"pickcenter") || [];
   const candidates = [];
-  const add = (src, arr) => { if(Array.isArray(arr)) arr.forEach((o, i) => candidates.push({src:`${src}[${i}]`, o})); };
-  add("competitions.odds", pick(sum,"competitions.0.odds"));
-  add("header.competitions.odds", pick(sum,"header.competitions.0.odds"));
-  add("pickcenter", pick(sum,"pickcenter"));
+
+  // Prefer ESPN BET live objects from competitions[0].odds[*]
+  if (Array.isArray(compsOdds)) {
+    compsOdds.forEach((o,i)=>candidates.push({src:`competitions.odds[${i}]`, o, group:"comp"}));
+  }
+  // We can still see pickcenter (pregame/consensus) for debugging
+  if (Array.isArray(pickCenter)) {
+    pickCenter.forEach((o,i)=>candidates.push({src:`pickcenter[${i}]`, o, group:"pc"}));
+  }
 
   if (DEBUG_ODDS) {
     console.log("DEBUG_ODDS candidates:", candidates.length);
-    candidates.forEach(c => {
+    for (const c of candidates) {
       const o=c.o;
       console.log(
         `# ${c.src} | provider="${providerName(o)}" live=${looksLive(o)} updatedTs=${updatedTs(o)} ` +
         `spread=${o?.spread} ou=${o?.overUnder ?? o?.total} ` +
         `awayML=${o?.awayTeamOdds?.moneyLine ?? o?.awayTeamOdds?.moneyline} homeML=${o?.homeTeamOdds?.moneyLine ?? o?.homeTeamOdds?.moneyline}`
       );
-    });
-    candidates.forEach(c => console.log(`DEBUG_ODDS FULL ${c.src}:`, JSON.stringify(c.o, null, 2)));
+    }
+    // Full JSON (use once to identify correct source)
+    for (const c of candidates) {
+      console.log(`DEBUG_ODDS FULL ${c.src}:`, JSON.stringify(c.o, null, 2));
+    }
   }
 
-  if (!candidates.length) {
+  // Selection:
+  // 1) competitions.odds where provider is ESPN BET and 'live'
+  let chosen = candidates.find(c => c.group==="comp" && ESPNBET.test(providerName(c.o)) && looksLive(c.o));
+
+  // 2) competitions.odds latest ESPN BET (even if not explicitly flagged live)
+  if (!chosen) {
+    chosen = candidates
+      .filter(c => c.group==="comp" && ESPNBET.test(providerName(c.o)))
+      .map(c => ({...c, ts:updatedTs(c.o)}))
+      .sort((a,b)=>b.ts-a.ts)[0];
+  }
+
+  // 3) any competitions.odds live
+  if (!chosen) chosen = candidates.find(c => c.group==="comp" && looksLive(c.o));
+
+  // 4) last resort: most recent competitions.odds (still better than pickcenter for in-game)
+  if (!chosen) {
+    chosen = candidates
+      .filter(c => c.group==="comp")
+      .map(c => ({...c, ts:updatedTs(c.o)}))
+      .sort((a,b)=>b.ts-a.ts)[0];
+  }
+
+  // 5) absolute fallback: pickcenter[0] (pregame) — not ideal but avoids blanks
+  if (!chosen) chosen = candidates[0];
+
+  if (!chosen) {
     return { src:null, awaySpread:null, awayML:null, homeSpread:null, homeML:null, total:null, detail:null };
   }
-
-  // 1) prefer explicit live/in-game items
-  let chosen = candidates.find(c => looksLive(c.o));
-
-  // 2) else pick most recently updated
-  if (!chosen) chosen = candidates.map(c=>({...c, ts:updatedTs(c.o)})).sort((a,b)=>b.ts-a.ts)[0];
-
-  // 3) else prefer ESPN BET, else first usable
-  if (!chosen || !chosen.o) chosen = candidates.find(c => /espn\s*bet/i.test(providerName(c.o))) || candidates[0];
 
   const o = chosen.o;
   const detail = o?.details || o?.detail || "";
   const total  = coerceNum(o?.overUnder ?? o?.total);
   const spread = coerceNum(o?.spread);
+
   const awayFav = o?.awayTeamOdds?.favorite === true || o?.awayTeamOdds?.underdog === false;
   const homeFav = o?.homeTeamOdds?.favorite === true || o?.homeTeamOdds?.underdog === false;
+
   const awayML = coerceNum(o?.awayTeamOdds?.moneyLine ?? o?.awayTeamOdds?.moneyline);
   const homeML = coerceNum(o?.homeTeamOdds?.moneyLine ?? o?.homeTeamOdds?.moneyline);
+
   const { awaySpread, homeSpread } = spreadsFrom(spread, {
     awayFav, homeFav, detail, awayKeys: tm.awayKeys, homeKeys: tm.homeKeys
   });
@@ -224,11 +257,12 @@ async function tickOnce(sheets){
 
   const currentStatus = st.shortDetail || st.state || "unknown";
   const scoreStr = `${tm.awayScore}-${tm.homeScore}`;
+
   console.log(`[${currentStatus}] ${tm.awayName} @ ${tm.homeName} Q${st.period} (${st.displayClock})${odds?.src?` | odds:${odds.src}`:""} → row ${row}`);
 
   const payload = {
     "Status": currentStatus,
-    "Half Score": scoreStr,
+    "Half Score": scoreStr,                 // keep current score in this column
     "Live Away Spread": odds.awaySpread,
     "Live Away ML": odds.awayML,
     "Live Home Spread": odds.homeSpread,
@@ -236,7 +270,7 @@ async function tickOnce(sheets){
     "Live Total": odds.total
   };
 
-  // Don't clobber Final; Half can be set again while at halftime
+  // Don't clobber Final; optionally avoid clobbering Half unless forced
   const headerRes = await sheets.spreadsheets.values.get({ spreadsheetId: SHEET_ID, range: `${TAB_NAME}!A1:Z1`});
   const hdr = headerRes.data.values?.[0] || [];
   const h   = colMap(hdr);
@@ -245,9 +279,9 @@ async function tickOnce(sheets){
   const curStatus = (cells[h["status"]] || "").toString().trim();
 
   if (/^Final$/i.test(curStatus)) delete payload["Status"];
-  if (!FORCE_STATUS_WRITE && /^(Half)$/i.test(curStatus)) delete payload["Status"];
+  if (!FORCE_STATUS_WRITE && /^Half$/i.test(curStatus)) delete payload["Status"];
 
-  // When ESPN marks halftime / clock 0:00 Q2, force Half
+  // Halftime detection
   const isHalf = /HALF/i.test(st.name) || (st.state==="in" && Number(st.period)===2 && /^0?:?0{1,2}\b/.test(st.displayClock||""));
   if (isHalf) payload["Status"] = "Half";
 
