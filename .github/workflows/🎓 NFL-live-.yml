@@ -3,7 +3,7 @@ name: NFL Live
 on:
   workflow_dispatch: {}
   schedule:
-    # Top of the hour windows (adjust to your timezone needs)
+    # Top of the hour windows (adjust as needed for ET/UTC)
     - cron: "0 14-23 * * *"   # 10:00–19:00 ET if EDT (UTC-4)
     - cron: "0 0-6 * * *"     # 20:00–02:00 ET if EDT (UTC-4)
 
@@ -31,21 +31,27 @@ jobs:
         with:
           node-version: "20"
 
-      # Install repo deps AND make sure googleapis + playwright exist
+      # Install repo deps; if lockfile is out of sync, fall back to npm install
       - name: Install deps (repo)
+        shell: bash
         run: |
+          set -e
           if [ -f package-lock.json ]; then
-            npm ci
+            echo "Lockfile present — trying npm ci"
+            if ! npm ci --no-audit --ignore-scripts; then
+              echo "npm ci failed — falling back to npm install to sync lockfile"
+              npm install --no-audit
+            fi
           else
-            npm i
+            echo "No lockfile — installing with npm install"
+            npm install --no-audit
           fi
-          npm i googleapis playwright
+          # Ensure these libs exist even if not listed in package.json
+          npm install --no-audit googleapis playwright
 
-      # Install Playwright browser binaries (Chromium) for the scrape fallback
       - name: Install Playwright browsers (Chromium only)
         run: npx playwright install --with-deps chromium
 
-      # Robust ID collector: don’t rely on Date only; include rows with live-ish Status
       - name: Collect today’s Game IDs from sheet (robust)
         id: ids
         shell: bash
@@ -107,9 +113,9 @@ jobs:
             const lower = s => (s || "").trim().toLowerCase();
             const h = Object.fromEntries(header.map((x,i)=>[lower(x), i]));
 
-            const iA = h["game id"];      // A
-            const iDate = h["date"];      // B
-            const iStatus = h["status"];  // D (typically)
+            const iA = h["game id"];      // col A
+            const iDate = h["date"];      // col B
+            const iStatus = h["status"];  // col D
 
             if (iA == null) { appendFileSync(process.env.GITHUB_OUTPUT, `list=[]\n`); return; }
 
@@ -139,7 +145,6 @@ jobs:
           })().catch(e => { console.error(e); process.exit(1); });
           NODE
 
-      # Run live-game once per Game ID, in parallel. Includes DEBUG_ODDS + forced Status write.
       - name: Run live-game oneshot for each ID in parallel (with odds debug)
         if: steps.ids.outputs.list != '[]'
         shell: bash
