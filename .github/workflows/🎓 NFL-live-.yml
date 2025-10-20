@@ -30,8 +30,19 @@ jobs:
         with:
           node-version: "20"
 
-      - name: Install deps used by live scripts
-        run: npm i googleapis
+    - name: Install deps (repo)
+  run: |
+    if [ -f package-lock.json ]; then
+      npm ci
+    else
+      npm i
+    fi
+    # Ensure these are present even if not in package.json
+    npm i googleapis playwright
+
+- name: Install Playwright browsers (Chromium only)
+  run: npx playwright install --with-deps chromium
+
 
       # === Get today's Game IDs from NFL tab (A: Game ID), skip Finals ===
       - name: Collect today’s Game IDs from sheet
