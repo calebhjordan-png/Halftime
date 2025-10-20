@@ -3,7 +3,7 @@ name: NFL Live
 on:
   workflow_dispatch: {}
   schedule:
-    # Top of the hour (example windows; adjust for ET/UTC as you like)
+    # Top of the hour windows (adjust to your timezone needs)
     - cron: "0 14-23 * * *"   # 10:00–19:00 ET if EDT (UTC-4)
     - cron: "0 0-6 * * *"     # 20:00–02:00 ET if EDT (UTC-4)
 
@@ -15,6 +15,7 @@ jobs:
   live:
     runs-on: ubuntu-latest
     timeout-minutes: 60
+
     env:
       LEAGUE: nfl
       TAB_NAME: NFL
@@ -30,22 +31,22 @@ jobs:
         with:
           node-version: "20"
 
-    - name: Install deps (repo)
-  run: |
-    if [ -f package-lock.json ]; then
-      npm ci
-    else
-      npm i
-    fi
-    # Ensure these are present even if not in package.json
-    npm i googleapis playwright
+      # Install repo deps AND make sure googleapis + playwright exist
+      - name: Install deps (repo)
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci
+          else
+            npm i
+          fi
+          npm i googleapis playwright
 
-- name: Install Playwright browsers (Chromium only)
-  run: npx playwright install --with-deps chromium
+      # Install Playwright browser binaries (Chromium) for the scrape fallback
+      - name: Install Playwright browsers (Chromium only)
+        run: npx playwright install --with-deps chromium
 
-
-      # === Get today's Game IDs from NFL tab (A: Game ID), skip Finals ===
-      - name: Collect today’s Game IDs from sheet
+      # Robust ID collector: don’t rely on Date only; include rows with live-ish Status
+      - name: Collect today’s Game IDs from sheet (robust)
         id: ids
         shell: bash
         env:
@@ -62,13 +63,30 @@ jobs:
           const TAB = process.env.TAB_NAME || "NFL";
           const ET = "America/New_York";
 
-          function todayEtMDY() {
-            const parts = new Intl.DateTimeFormat("en-US", {
-              timeZone: ET, year: "2-digit", month: "2-digit", day: "2-digit"
-            }).formatToParts(new Date());
-            const g = (k) => parts.find(x => x.type === k)?.value || "";
-            return `${g("month")}/${g("day")}/${g("year")}`; // MM/DD/YY
+          const fmt = new Intl.DateTimeFormat("en-US", {
+            timeZone: ET, year: "numeric", month: "2-digit", day: "2-digit"
+          });
+
+          function parseMDY(s) {
+            const m = /^(\d{1,2})\/(\d{1,2})\/(\d{2}|\d{4})$/.exec(String(s || "").trim());
+            if (!m) return null;
+            let [ , mm, dd, yy ] = m;
+            let y = yy.length === 2 ? 2000 + Number(yy) : Number(yy);
+            return new Date(`${y}-${mm.padStart(2,"0")}-${dd.padStart(2,"0")}T12:00:00-05:00`);
           }
+          function todayEt() {
+            const parts = fmt.formatToParts(new Date());
+            const g = k => parts.find(p => p.type === k)?.value || "00";
+            return new Date(`${g("year")}-${g("month")}-${g("day")}T12:00:00-05:00`);
+          }
+          function withinDays(d, center, k=2) {
+            if (!d) return false;
+            const ms = 24*60*60*1000;
+            const diff = Math.abs((d - center) / ms);
+            return diff <= k;
+          }
+
+          const LIVE_RE = /(?:\bQ[1-4]\b|\bHalf\b|\d{1,2}:\d{2}\s*-\s*(?:1st|2nd|3rd|4th)|\bEnd\b|\bStart\b)/i;
 
           (async () => {
             const auth = new google.auth.JWT(
@@ -86,21 +104,34 @@ jobs:
             if (!rows.length) { appendFileSync(process.env.GITHUB_OUTPUT, `list=[]\n`); return; }
 
             const header = rows[0] || [];
-            const h = Object.fromEntries(header.map((x,i)=>[(x||"").trim().toLowerCase(), i]));
-            const iA = h["game id"], iDate = h["date"], iStatus = h["status"];
-            if (iA == null || iDate == null) { appendFileSync(process.env.GITHUB_OUTPUT, `list=[]\n`); return; }
+            const lower = s => (s || "").trim().toLowerCase();
+            const h = Object.fromEntries(header.map((x,i)=>[lower(x), i]));
 
-            const today = todayEtMDY();
+            const iA = h["game id"];      // A
+            const iDate = h["date"];      // B
+            const iStatus = h["status"];  // D (typically)
+
+            if (iA == null) { appendFileSync(process.env.GITHUB_OUTPUT, `list=[]\n`); return; }
+
+            const today = todayEt();
             const ids = [];
+
             for (let r = 1; r < rows.length; r++) {
               const row = rows[r] || [];
               const gid = (row[iA] || "").toString().trim();
-              const d   = (row[iDate] || "").toString().trim();
-              const st  = iStatus == null ? "" : (row[iStatus] || "").toString().trim().toLowerCase();
               if (!gid) continue;
-              if (d !== today) continue;      // only today's games
-              if (st === "final") continue;   // skip finished
-              ids.push(gid);
+
+              const status = iStatus != null ? String(row[iStatus] || "").trim() : "";
+              if (/^final$/i.test(status)) continue;
+
+              const looksLive = LIVE_RE.test(status);
+              let inWindow = false;
+              if (iDate != null) {
+                const d = parseMDY(row[iDate]);
+                inWindow = withinDays(d, today, 2);
+              }
+
+              if (looksLive || inWindow) ids.push(gid);
             }
 
             appendFileSync(process.env.GITHUB_OUTPUT, `list=${JSON.stringify(ids)}\n`);
@@ -108,7 +139,7 @@ jobs:
           })().catch(e => { console.error(e); process.exit(1); });
           NODE
 
-      # === Run live-game.mjs once per ID in parallel, with full odds debugging ===
+      # Run live-game once per Game ID, in parallel. Includes DEBUG_ODDS + forced Status write.
       - name: Run live-game oneshot for each ID in parallel (with odds debug)
         if: steps.ids.outputs.list != '[]'
         shell: bash
@@ -118,10 +149,9 @@ jobs:
           GOOGLE_SHEET_ID: ${{ env.GOOGLE_SHEET_ID }}
           GOOGLE_SERVICE_ACCOUNT: ${{ env.GOOGLE_SERVICE_ACCOUNT }}
           IDS_JSON: ${{ steps.ids.outputs.list }}
-          # flags inherited by each spawned live-game.mjs
           ONESHOT: "true"
-          DEBUG_ODDS: "true"         # prints ALL odds candidates + FULL JSON
-          FORCE_STATUS_WRITE: "true" # ensure Status updates even in oneshot
+          DEBUG_ODDS: "true"
+          FORCE_STATUS_WRITE: "true"
         run: |
           ids=$(node -e "process.stdout.write(process.env.IDS_JSON||'[]')")
           node -e "
@@ -132,7 +162,7 @@ jobs:
               const procs = ids.map(id => new Promise((res, rej) => {
                 const p = spawn('node',['live-game.mjs'],{
                   stdio:'inherit',
-                  env:{ ...process.env, TARGET_GAME_ID:String(id) }  // inherits debug flags
+                  env:{ ...process.env, TARGET_GAME_ID:String(id) }
                 });
                 p.on('exit', c => c===0 ? res() : rej(new Error('exit '+c)));
               }));
