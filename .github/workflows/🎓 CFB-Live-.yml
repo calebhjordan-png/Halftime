@@ -1,61 +1,176 @@
-name: "🎓 CFB Live (Hourly + Smart 5-Minute Loop)"
+name: CFB Live
 
 on:
-  workflow_dispatch:
+  workflow_dispatch: {}
   schedule:
-    - cron: "5 * * * *"   # hourly, offset
+    # Top of the hour windows (adjust as needed for ET/UTC)
+    - cron: "0 14-23 * * *"   # 10:00–19:00 ET if EDT (UTC-4)
+    - cron: "0 0-6 * * *"     # 20:00–02:00 ET if EDT (UTC-4)
+
+concurrency:
+  group: cfb-live-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   live:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 60
+
+    env:
+      LEAGUE: college-football
+      TAB_NAME: CFB
+      GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+      GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Node
+      - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: "20"
 
-      - name: Install deps
+      # Install repo deps; if lockfile is out of sync, fall back to npm install
+      - name: Install deps (repo)
+        shell: bash
         run: |
-          npm init -y >/dev/null 2>&1 || true
-          npm i googleapis playwright
-          npx playwright install --with-deps chromium
+          set -e
+          if [ -f package-lock.json ]; then
+            echo "Lockfile present — trying npm ci"
+            if ! npm ci --no-audit --ignore-scripts; then
+              echo "npm ci failed — falling back to npm install to sync lockfile"
+              npm install --no-audit
+            fi
+          else
+            echo "No lockfile — installing with npm install"
+            npm install --no-audit
+          fi
+          # Ensure required libs exist even if not listed in package.json
+          npm install --no-audit googleapis playwright
 
-      - name: Run CFB live updater
-        id: updater
+      - name: Install Playwright browsers (Chromium only)
+        run: npx playwright install --with-deps chromium
+
+      # Robust collector: includes live-looking Status rows; doesn’t trust Date alone
+      - name: Collect today’s Game IDs from sheet (robust)
+        id: ids
+        shell: bash
         env:
-          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
-          GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
-          LEAGUE: college-football
-          TAB_NAME: CFB
-          RUN_SCOPE: week
-          ADAPTIVE_HALFTIME: "1"
-          GHA_JSON: "1"
-        shell: bash
+          GOOGLE_SHEET_ID: ${{ env.GOOGLE_SHEET_ID }}
+          GOOGLE_SERVICE_ACCOUNT: ${{ env.GOOGLE_SERVICE_ACCOUNT }}
+          TAB_NAME: ${{ env.TAB_NAME }}
         run: |
-          json="$(node orchestrator.mjs --gha)"
-          echo "result=${json}" >> "$GITHUB_OUTPUT"
+          node - <<'NODE'
+          const { google } = require("googleapis");
+          const { appendFileSync } = require("node:fs");
 
-      - name: Gate for 5-minute cycle (CFB)
-        id: gate
+          const SHEET_ID = process.env.GOOGLE_SHEET_ID;
+          const SA = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT);
+          const TAB = process.env.TAB_NAME || "CFB";
+          const ET = "America/New_York";
+
+          const fmt = new Intl.DateTimeFormat("en-US", {
+            timeZone: ET, year: "numeric", month: "2-digit", day: "2-digit"
+          });
+
+          function parseMDY(s) {
+            const m = /^(\d{1,2})\/(\d{1,2})\/(\d{2}|\d{4})$/.exec(String(s || "").trim());
+            if (!m) return null;
+            let [ , mm, dd, yy ] = m;
+            let y = yy.length === 2 ? 2000 + Number(yy) : Number(yy);
+            return new Date(`${y}-${mm.padStart(2,"0")}-${dd.padStart(2,"0")}T12:00:00-05:00`);
+          }
+          function todayEt() {
+            const parts = fmt.formatToParts(new Date());
+            const g = k => parts.find(p => p.type === k)?.value || "00";
+            return new Date(`${g("year")}-${g("month")}-${g("day")}T12:00:00-05:00`);
+          }
+          function withinDays(d, center, k=2) {
+            if (!d) return false;
+            const ms = 24*60*60*1000;
+            const diff = Math.abs((d - center) / ms);
+            return diff <= k;
+          }
+
+          const LIVE_RE = /(?:\bQ[1-4]\b|\bHalf\b|\d{1,2}:\d{2}\s*-\s*(?:1st|2nd|3rd|4th)|\bEnd\b|\bStart\b)/i;
+
+          (async () => {
+            const auth = new google.auth.JWT(
+              SA.client_email, null, SA.private_key,
+              ["https://www.googleapis.com/auth/spreadsheets"]
+            );
+            await auth.authorize();
+            const sheets = google.sheets({ version: "v4", auth });
+
+            const r = await sheets.spreadsheets.values.get({
+              spreadsheetId: SHEET_ID,
+              range: `${TAB}!A1:Z2000`,
+            });
+            const rows = r.data.values || [];
+            if (!rows.length) { appendFileSync(process.env.GITHUB_OUTPUT, `list=[]\n`); return; }
+
+            const header = rows[0] || [];
+            const lower = s => (s || "").trim().toLowerCase();
+            const h = Object.fromEntries(header.map((x,i)=>[lower(x), i]));
+
+            const iA = h["game id"];      // col A
+            const iDate = h["date"];      // col B
+            const iStatus = h["status"];  // col D
+
+            if (iA == null) { appendFileSync(process.env.GITHUB_OUTPUT, `list=[]\n`); return; }
+
+            const today = todayEt();
+            const ids = [];
+
+            for (let r = 1; r < rows.length; r++) {
+              const row = rows[r] || [];
+              const gid = (row[iA] || "").toString().trim();
+              if (!gid) continue;
+
+              const status = iStatus != null ? String(row[iStatus] || "").trim() : "";
+              if (/^final$/i.test(status)) continue;
+
+              const looksLive = LIVE_RE.test(status);
+              let inWindow = false;
+              if (iDate != null) {
+                const d = parseMDY(row[iDate]);
+                inWindow = withinDays(d, today, 2);
+              }
+
+              if (looksLive || inWindow) ids.push(gid);
+            }
+
+            appendFileSync(process.env.GITHUB_OUTPUT, `list=${JSON.stringify(ids)}\n`);
+            console.log("TODAY_IDS=" + ids.join(","));
+          })().catch(e => { console.error(e); process.exit(1); });
+          NODE
+
+      - name: Run live-game oneshot for each ID in parallel (with odds debug)
+        if: steps.ids.outputs.list != '[]'
+        shell: bash
         env:
-          LEAGUE: college-football
-          DEBUG_MODE: "0"
-          GHA_JSON: "1"
-        shell: bash
-        run: node live-gate.mjs --gha
-
-      - name: Read gate decision
-        shell: bash
-        run: echo "FAST=${{ steps.gate.outputs.FAST }}"
-
-      - name: Conditional requeue (5-min loop if live games)
-        if: ${{ steps.gate.outputs.FAST == '1' }}
-        shell: bash
+          LEAGUE: ${{ env.LEAGUE }}
+          TAB_NAME: ${{ env.TAB_NAME }}
+          GOOGLE_SHEET_ID: ${{ env.GOOGLE_SHEET_ID }}
+          GOOGLE_SERVICE_ACCOUNT: ${{ env.GOOGLE_SERVICE_ACCOUNT }}
+          IDS_JSON: ${{ steps.ids.outputs.list }}
+          ONESHOT: "true"
+          DEBUG_ODDS: "true"          # toggle to "false" to quiet logs
         run: |
-          echo "Re-queuing in 5 minutes because there are pre-3rd/halftime games."
-          # Your requeue action goes here
+          ids=$(node -e "process.stdout.write(process.env.IDS_JSON||'[]')")
+          node -e "
+            const ids = JSON.parse(process.argv[1]||'[]');
+            if (!ids.length) process.exit(0);
+            (async () => {
+              const { spawn } = await import('node:child_process');
+              const procs = ids.map(id => new Promise((res, rej) => {
+                const p = spawn('node',['live-game.mjs'],{
+                  stdio:'inherit',
+                  env:{ ...process.env, TARGET_GAME_ID:String(id) }
+                });
+                p.on('exit', c => c===0 ? res() : rej(new Error('exit '+c)));
+              }));
+              await Promise.allSettled(procs);
+            })().catch(e => { console.error(e); process.exit(1); });
+          " "$ids"
