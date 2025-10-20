@@ -1,5 +1,5 @@
 /**
- * live-game.mjs — Status + current score + LIVE odds with ESPN BET fallback
+ * live-game.mjs — Status + current score + LIVE odds with ESPN BET fallback + DEBUG dump
  * Writes: Status | Half Score | Live Away/ML/Spread | Live Home/ML/Spread | Live Total
  */
 
@@ -26,7 +26,7 @@ if (!SHEET_ID || !SA_JSON || !EVENT_ID) {
 /* ─────────── ESPN helpers ─────────── */
 const pick = (o, p) => p.replace(/\[(\d+)\]/g, ".$1").split(".").reduce((a, k) => a?.[k], o);
 async function fetchJson(url) {
-  const r = await fetch(url, { headers: { "User-Agent": "halftime-live/2.3" } });
+  const r = await fetch(url, { headers: { "User-Agent": "halftime-live/2.4" } });
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
   return await r.json();
 }
@@ -71,7 +71,7 @@ function extractJsonOdds(sum) {
   if (Array.isArray(pickcenter)) pickcenter.forEach((o, i) => all.push({ src: `pickcenter[${i}]`, o, group: "pc" }));
 
   if (DEBUG_ODDS) {
-    console.log("DEBUG_ODDS candidates:", all.length);
+    console.log("DEBUG_ODDS JSON candidates:", all.length);
     for (const c of all) {
       console.log(`# ${c.src} ${c.o?.provider?.name} live=${looksLive(c.o)} spread=${c.o?.spread} ou=${c.o?.overUnder}`);
     }
@@ -89,7 +89,7 @@ function extractJsonOdds(sum) {
   return {
     src,
     provider,
-    isLive: looksLive(o) && src.startsWith("comp"), // treat only competitions.* as potentially live
+    isLive: looksLive(o) && src.startsWith("comp"),
     awaySpread: coerceNum(o.spread),
     homeSpread: o.spread ? -coerceNum(o.spread) : null,
     total: coerceNum(o.overUnder ?? o.total),
@@ -99,71 +99,58 @@ function extractJsonOdds(sum) {
   };
 }
 
-/* ─────────── Fallback via ESPN BET page scrape (strict positional parse) ─────────── */
+/* ─────────── Fallback via ESPN BET page scrape (debug + positional parse) ─────────── */
 
-function evenTo100Str(s){ return /^even$/i.test(String(s)) ? "+100" : s; }
 function evenToNum(s){ return /^even$/i.test(String(s)) ? 100 : Number(s); }
+function normalizeTxt(s){ return String(s||"").replace(/\u00a0/g," ").replace(/[–—−]/g,"-").replace(/\s+/g," ").trim(); }
 
 /**
- * Parses the LIVE ODDS grid text by position:
- * After the header "SPREAD TOTAL ML", tokens appear as:
- *   Away: <spreadLine> <spreadJuice> <totalLine> <totalJuice> <moneyline>
- *   Home: <spreadLine> <spreadJuice> <totalLine> <totalJuice> <moneyline>
+ * Positional parse right of the header "SPREAD TOTAL ML".
+ * We take 10 tokens: 5 for AWAY, 5 for HOME:
+ *   AWAY: <spread> <spreadJuice> <total> <totalJuice> <ml>
+ *   HOME: <spread> <spreadJuice> <total> <totalJuice> <ml>
+ * This naturally **skips CLOSE**.
  */
-function parseLiveGridTextByPosition(text) {
-  const t = text.replace(/\u00a0/g," ").replace(/[–—−]/g,"-").replace(/\s+/g," ").trim();
-  const m = t.match(/SPREAD\s+TOTAL\s+ML\s+(.+)$/i);
-  if (!m) return null;
+function parseLiveGridTokens(text) {
+  const t = normalizeTxt(text);
+  const idx = t.indexOf("SPREAD TOTAL ML");
+  if (idx < 0) return null;
 
-  const rawTokens = m[1].split(" ").filter(Boolean);
-  // Accept tokens that can appear in the 5-tuple sequence per row
-  const tokenOk = (tok) =>
-    /^[+\-]\d+(?:\.\d+)?$/.test(tok) ||      // spread line (+3.5) or spread juice (-120) — both signed numbers
-    /^[ou]\d+(?:\.\d+)?$/i.test(tok) ||      // totals o35.5/u35.5
-    /^EVEN$/i.test(tok) ||                   // EVEN
-    /^[+\-]?\d{2,5}$/.test(tok);             // ML / price
+  const after = t.slice(idx + "SPREAD TOTAL ML".length);
+  const rawTokens = after.split(" ").filter(Boolean);
+
+  // Keep only tokens we care about for the 5-tuple pattern
+  const tokenOk =
+    (tok) =>
+      /^[+\-]\d+(?:\.\d+)?$/.test(tok) ||      // spread line or price
+      /^[ou]\d+(?:\.\d+)?$/i.test(tok) ||      // totals o/u
+      /^EVEN$/i.test(tok) ||
+      /^[+\-]?\d{2,5}$/.test(tok);             // ML
 
   const tokens = rawTokens.filter(tokenOk);
 
-  // Need at least 10 tokens for the two rows (5 each)
+  if (DEBUG_ODDS) {
+    console.log("SCRAPE DEBUG: header context →", t.slice(Math.max(0, idx - 120), Math.min(t.length, idx + 280)));
+    console.log("SCRAPE DEBUG: tokens[0..19] →", tokens.slice(0, 20));
+  }
+
   if (tokens.length < 10) return null;
 
-  // Pick first 10 tokens only — ignore any extras from other widgets
   const t10 = tokens.slice(0, 10);
+  const seg = (i) => t10[i];
 
-  const seg = (a,i) => a[i];
-  const awaySpreadLine = seg(t10,0);
-  const awaySpreadJuice = seg(t10,1);
-  const awayTotalLine = seg(t10,2);
-  const awayTotalJuice = seg(t10,3);
-  const awayML = seg(t10,4);
+  const awaySpread = Number(seg(0));
+  const awayTotal  = Number(String(seg(2)).slice(1));
+  const awayML     = evenToNum(seg(4));
 
-  const homeSpreadLine = seg(t10,5);
-  const homeSpreadJuice = seg(t10,6);
-  const homeTotalLine = seg(t10,7);
-  const homeTotalJuice = seg(t10,8);
-  const homeML = seg(t10,9);
+  const homeSpread = Number(seg(5));
+  const homeTotal  = Number(String(seg(7)).slice(1));
+  const homeML     = evenToNum(seg(9));
 
-  // Convert values
-  const awaySpread = Number(awaySpreadLine);
-  const homeSpread = Number(homeSpreadLine);
-  const liveTotalA = Number(String(awayTotalLine).slice(1));
-  const liveTotalH = Number(String(homeTotalLine).slice(1));
-  const liveTotal = Number.isFinite(liveTotalA) ? liveTotalA :
-                    Number.isFinite(liveTotalH) ? liveTotalH : null;
+  const liveTotal = Number.isFinite(awayTotal) ? awayTotal :
+                    Number.isFinite(homeTotal) ? homeTotal : null;
 
-  return {
-    awaySpread,
-    homeSpread,
-    awayML: evenToNum(awayML),
-    homeML: evenToNum(homeML),
-    liveTotal,
-    // extras if you ever want them:
-    awaySpreadJuice: evenTo100Str(awaySpreadJuice),
-    homeSpreadJuice: evenTo100Str(homeSpreadJuice),
-    awayTotalJuice: evenTo100Str(awayTotalJuice),
-    homeTotalJuice: evenTo100Str(homeTotalJuice),
-  };
+  return { awaySpread, homeSpread, awayML, homeML, liveTotal, tokens: t10 };
 }
 
 async function scrapeEspnBet(gameId, league) {
@@ -176,24 +163,22 @@ async function scrapeEspnBet(gameId, league) {
   try {
     await page.goto(url, { timeout: 60000, waitUntil: "domcontentloaded" });
 
-    // Primary: read innerText of LIVE ODDS container
-    const locator = page.locator("section:has-text('LIVE ODDS'), div:has(h2:has-text('LIVE ODDS'))").first();
-    await locator.waitFor({ timeout: 20000 }); // give ESPN a bit more time
-    const raw = await locator.innerText();
-    let parsed = parseLiveGridTextByPosition(raw);
+    // Prefer the LIVE ODDS container text; fall back to whole body
+    const loc = page.locator("section:has-text('LIVE ODDS'), div:has(h2:has-text('LIVE ODDS'))").first();
+    await loc.waitFor({ timeout: 20000 }).catch(()=>{});
+    const liveText = await (async () => {
+      try { return await loc.innerText(); } catch { return ""; }
+    })();
+    const bodyText = await page.evaluate(() => document.body.innerText || "");
 
-    // Fallback: parse whole page text if the specific section didn't resolve well
+    const parsed = parseLiveGridTokens(liveText) || parseLiveGridTokens(bodyText);
     if (!parsed) {
-      const bodyTxt = (await page.evaluate(() => document.body.innerText || "")) || "";
-      parsed = parseLiveGridTextByPosition(bodyTxt);
-    }
-
-    if (!parsed) {
-      console.log("⚠️ ESPN BET: could not parse live grid from text");
+      console.log("⚠️ ESPN BET: could not locate/parse tokens right of SPREAD TOTAL ML");
       return null;
     }
 
-    const { awaySpread, homeSpread, awayML, homeML, liveTotal } = parsed;
+    const { awaySpread, homeSpread, awayML, homeML, liveTotal, tokens } = parsed;
+    if (DEBUG_ODDS) console.log("SCRAPE DEBUG: t10 →", tokens);
     console.log("📊 ESPN BET parsed:", { awaySpread, homeSpread, awayML, homeML, liveTotal });
 
     return {
@@ -269,7 +254,7 @@ async function tickOnce(sheets){
     "Live Total": odds.total
   };
 
-  // Trigger fallback whenever JSON is not a true live odds source
+  // Scrape whenever JSON is not true-live
   const needFallback = !odds.isLive || odds.src.startsWith("pickcenter");
   if (needFallback) {
     const scraped = await scrapeEspnBet(EVENT_ID, LEAGUE);
