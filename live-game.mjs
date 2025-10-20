@@ -1,7 +1,6 @@
 /**
  * live-game.mjs — Status + current score + LIVE odds with ESPN BET fallback
- * Columns required:
- *   Status | Half Score | Live Away Spread | Live Away ML | Live Home Spread | Live Home ML | Live Total
+ * Writes: Status | Half Score | Live Away/ML/Spread | Live Home/ML/Spread | Live Total
  */
 
 import { google } from "googleapis";
@@ -12,6 +11,7 @@ const SA_JSON  = process.env.GOOGLE_SERVICE_ACCOUNT;
 const LEAGUE   = (process.env.LEAGUE || "nfl").toLowerCase();
 const TAB_NAME = process.env.TAB_NAME || (LEAGUE === "college-football" ? "CFB" : "NFL");
 const EVENT_ID = String(process.env.TARGET_GAME_ID || "").trim();
+
 const MAX_TOTAL_MIN = Number(process.env.MAX_TOTAL_MIN || "200");
 const DEBUG_MODE  = String(process.env.DEBUG_MODE || "").toLowerCase() === "true";
 const ONESHOT     = String(process.env.ONESHOT || "").toLowerCase() === "true";
@@ -26,7 +26,7 @@ if (!SHEET_ID || !SA_JSON || !EVENT_ID) {
 /* ─────────── ESPN helpers ─────────── */
 const pick = (o, p) => p.replace(/\[(\d+)\]/g, ".$1").split(".").reduce((a, k) => a?.[k], o);
 async function fetchJson(url) {
-  const r = await fetch(url, { headers: { "User-Agent": "halftime-live/2.0" } });
+  const r = await fetch(url, { headers: { "User-Agent": "halftime-live/2.1" } });
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
   return await r.json();
 }
@@ -43,7 +43,6 @@ function parseStatus(sum) {
     displayClock: s.displayClock ?? "0:00"
   };
 }
-
 function getTeams(sum) {
   const comps = pick(sum, "header.competitions.0.competitors") || pick(sum, "competitions.0.competitors") || [];
   const away = comps.find(c => c.homeAway === "away") || {};
@@ -75,17 +74,22 @@ function extractJsonOdds(sum) {
   if (Array.isArray(pickcenter)) pickcenter.forEach((o, i) => all.push({ src: `pickcenter[${i}]`, o }));
 
   if (DEBUG_ODDS) {
-    console.log("DEBUG_ODDS found", all.length);
+    console.log("DEBUG_ODDS candidates:", all.length);
     for (const c of all)
       console.log(`# ${c.src} ${c.o.provider?.name} live=${looksLive(c.o)} spread=${c.o.spread} ou=${c.o.overUnder}`);
   }
 
-  let chosen = all.find(c => ESPNBET.test(c.o?.provider?.name) && looksLive(c.o));
-  if (!chosen) chosen = all.find(c => ESPNBET.test(c.o?.provider?.name));
-  if (!chosen) chosen = all.find(c => looksLive(c.o)) || all[0];
+  // Prefer ESPN BET live from competitions
+  let chosen = all.find(c => c.src.startsWith("comp") && ESPNBET.test(c.o?.provider?.name) && looksLive(c.o));
+  if (!chosen) chosen = all.find(c => c.src.startsWith("comp") && ESPNBET.test(c.o?.provider?.name));
+  if (!chosen) chosen = all.find(c => c.src.startsWith("comp") && looksLive(c.o));
+  if (!chosen) chosen = all.find(c => c.src.startsWith("comp")) || all[0];
+
   const o = chosen?.o || {};
   return {
     src: chosen?.src,
+    // NOTE: ESPN JSON often keeps pregame spread/OU here; we still read them,
+    // but we’ll override with scrape if they look pregame/empty.
     awaySpread: coerceNum(o.spread),
     homeSpread: o.spread ? -coerceNum(o.spread) : null,
     total: coerceNum(o.overUnder ?? o.total),
@@ -95,7 +99,45 @@ function extractJsonOdds(sum) {
   };
 }
 
-/* ─────────── Fallback via ESPN BET page scrape ─────────── */
+/* ─────────── Fallback via ESPN BET page scrape (precise grid parse) ─────────── */
+function evenTo100(s) {
+  return /^even$/i.test(String(s)) ? 100 : Number(s);
+}
+function parseLiveGridText(text) {
+  // Keep only the LIVE columns, discard CLOSE numbers.
+  // Find the chunk starting at "SPREAD TOTAL ML" and tokenize from there.
+  const m = text.replace(/\u00a0/g, " ").replace(/[–—−]/g, "-")
+                .replace(/\s+/g, " ").match(/SPREAD\s+TOTAL\s+ML\s+(.+)$/i);
+  if (!m) return null;
+  const chunk = m[1];
+
+  // Tokens to capture: spreads (+/-N.N), totals (o/uN.N), ML (EVEN or +/-number)
+  const tokens = chunk.split(" ").filter(Boolean);
+
+  const spreadRe = /^[+\-]\d+(?:\.\d+)?$/;
+  const totalRe  = /^[ou]\d+(?:\.\d+)?$/i;
+  const mlRe     = /^(EVEN|[+\-]?\d{2,5})$/i;
+
+  const spreads = tokens.filter(t => spreadRe.test(t));
+  const totals  = tokens.filter(t => totalRe.test(t));
+  const mls     = tokens.filter(t => mlRe.test(t));
+
+  if (spreads.length < 2 || totals.length < 2 || mls.length < 2) return null;
+
+  const awaySpread = Number(spreads[0]);
+  const homeSpread = Number(spreads[1]);
+  const awayML = evenTo100(mls[0]);
+  const homeML = evenTo100(mls[1]);
+
+  // totals: use numeric part; away row shows 'o36.5', home row 'u36.5' → 36.5
+  const totAway = Number(totals[0].slice(1));
+  const totHome = Number(totals[1].slice(1));
+  const liveTotal = Number.isFinite(totAway) ? totAway :
+                    Number.isFinite(totHome) ? totHome : null;
+
+  return { awaySpread, homeSpread, awayML, homeML, liveTotal };
+}
+
 async function scrapeEspnBet(gameId, league) {
   try {
     const { chromium } = await import("playwright");
@@ -104,23 +146,26 @@ async function scrapeEspnBet(gameId, league) {
     const browser = await chromium.launch({ headless: true });
     const page = await browser.newPage();
     await page.goto(url, { timeout: 60000, waitUntil: "domcontentloaded" });
+
+    // Locate the LIVE ODDS block and get its visible text
     const section = page.locator("section:has-text('LIVE ODDS'), div:has(h2:has-text('LIVE ODDS'))").first();
     await section.waitFor({ timeout: 10000 });
-    const text = (await section.innerText()).replace(/\u00a0/g, " ").replace(/\s+/g, " ").trim();
+    const raw = await section.innerText();
+
     await browser.close();
 
-    const nums = text.match(/[-+]?\d+(?:\.\d+)?/g) || [];
-    const values = nums.map(Number);
-    const spread = values.find(v => Math.abs(v) <= 60) ?? "";
-    const total = values.find(v => v >= 30 && v <= 100) ?? "";
-    const ml = values.find(v => Math.abs(v) >= 100) ?? "";
-    console.log("📊 Scraped ESPN BET fallback:", { spread, total, ml });
+    const parsed = parseLiveGridText(raw);
+    if (!parsed) return null;
+
+    const { awaySpread, homeSpread, awayML, homeML, liveTotal } = parsed;
+    console.log("📊 ESPN BET parsed:", { awaySpread, homeSpread, awayML, homeML, liveTotal });
+
     return {
-      liveAwaySpread: spread,
-      liveHomeSpread: -spread,
-      liveAwayML: ml,
-      liveHomeML: -ml,
-      liveTotal: total
+      liveAwaySpread: awaySpread,
+      liveHomeSpread: homeSpread,
+      liveAwayML: awayML,
+      liveHomeML: homeML,
+      liveTotal
     };
   } catch (e) {
     console.log("⚠️ ESPN BET scrape failed:", e.message);
@@ -128,7 +173,7 @@ async function scrapeEspnBet(gameId, league) {
   }
 }
 
-/* ─────────── Google Sheets helpers ─────────── */
+/* ─────────── Sheets helpers ─────────── */
 async function sheetsClient() {
   const creds = JSON.parse(SA_JSON);
   const jwt = new google.auth.JWT(
@@ -145,13 +190,10 @@ function colMap(hdr = []) {
   hdr.forEach((h, i) => (m[(h || "").trim().toLowerCase()] = i));
   return m;
 }
-function A1(i) {
-  return String.fromCharCode("A".charCodeAt(0) + i);
-}
+function A1(i) { return String.fromCharCode("A".charCodeAt(0) + i); }
 async function findRow(sheets) {
   const r = await sheets.spreadsheets.values.get({
-    spreadsheetId: SHEET_ID,
-    range: `${TAB_NAME}!A1:A2000`
+    spreadsheetId: SHEET_ID, range: `${TAB_NAME}!A1:A2000`
   });
   const vals = r.data.values || [];
   for (let i = 1; i < vals.length; i++) {
@@ -161,8 +203,7 @@ async function findRow(sheets) {
 }
 async function writeValues(sheets, row, kv) {
   const header = (await sheets.spreadsheets.values.get({
-    spreadsheetId: SHEET_ID,
-    range: `${TAB_NAME}!A1:Z1`
+    spreadsheetId: SHEET_ID, range: `${TAB_NAME}!A1:Z1`
   })).data.values?.[0] || [];
   const h = colMap(header);
   const data = [];
@@ -180,7 +221,7 @@ async function writeValues(sheets, row, kv) {
   return data.length;
 }
 
-/* ─────────── Core tick ─────────── */
+/* ─────────── tick ─────────── */
 async function tickOnce(sheets) {
   const row = await findRow(sheets);
   if (row < 0) return console.log(`No row with Game ID ${EVENT_ID}`);
@@ -188,12 +229,12 @@ async function tickOnce(sheets) {
   const sum = await fetchJson(summaryUrl(EVENT_ID));
   const st = parseStatus(sum);
   const tm = getTeams(sum);
-  let odds = extractJsonOdds(sum);
-
   const status = st.shortDetail || st.state || "unknown";
   const score = `${tm.awayScore}-${tm.homeScore}`;
-  console.log(`[${status}] ${tm.awayName} @ ${tm.homeName} Q${st.period} (${st.displayClock})`);
 
+  let odds = extractJsonOdds(sum);
+
+  // Build payload from JSON first
   const payload = {
     Status: status,
     "Half Score": score,
@@ -204,37 +245,45 @@ async function tickOnce(sheets) {
     "Live Total": odds.total
   };
 
-  const looksPregame = !odds.awayML && !odds.homeML && !odds.total;
-
-  if (looksPregame) {
+  // Scrape fallback if JSON looks pregame/empty
+  const jsonLooksPregame = !odds.awayML && !odds.homeML && !odds.total;
+  if (jsonLooksPregame) {
     const scraped = await scrapeEspnBet(EVENT_ID, LEAGUE);
-    if (scraped) Object.assign(payload, {
-      "Live Away Spread": scraped.liveAwaySpread,
-      "Live Away ML": scraped.liveAwayML,
-      "Live Home Spread": scraped.liveHomeSpread,
-      "Live Home ML": scraped.liveHomeML,
-      "Live Total": scraped.liveTotal
-    });
+    if (scraped) {
+      payload["Live Away Spread"] = scraped.liveAwaySpread ?? payload["Live Away Spread"];
+      payload["Live Home Spread"] = scraped.liveHomeSpread ?? payload["Live Home Spread"];
+      payload["Live Away ML"]     = scraped.liveAwayML     ?? payload["Live Away ML"];
+      payload["Live Home ML"]     = scraped.liveHomeML     ?? payload["Live Home ML"];
+      payload["Live Total"]       = scraped.liveTotal       ?? payload["Live Total"];
+    }
   }
+
+  // Don’t clobber Final; optionally don’t clobber Half unless forced
+  const headerRes = await sheets.spreadsheets.values.get({ spreadsheetId: SHEET_ID, range: `${TAB_NAME}!A1:Z1`});
+  const hdr = headerRes.data.values?.[0] || [];
+  const h = colMap(hdr);
+  const rowRes = await sheets.spreadsheets.values.get({ spreadsheetId: SHEET_ID, range: `${TAB_NAME}!A${row}:Z${row}`});
+  const cells = rowRes.data.values?.[0] || [];
+  const curStatus = (cells[h["status"]] || "").toString().trim();
+  if (/^Final$/i.test(curStatus)) delete payload["Status"];
+  if (!FORCE_STATUS_WRITE && /^Half$/i.test(curStatus)) delete payload["Status"];
 
   await writeValues(sheets, row, payload);
+
+  console.log(`[${status}] ${tm.awayName} @ ${tm.homeName} → row ${row} | wrote live odds.`);
 }
 
-/* ─────────── Run ─────────── */
+/* ─────────── run ─────────── */
 (async () => {
   const sheets = await sheetsClient();
-  if (ONESHOT) {
-    await tickOnce(sheets);
-    return;
-  }
+  if (ONESHOT) { await tickOnce(sheets); return; }
+
   let total = 0;
   for (;;) {
     await tickOnce(sheets);
-    await new Promise(r => setTimeout(r, 5 * 60 * 1000));
-    total += 5;
+    const sleepMin = DEBUG_MODE ? 0.2 : 5;
+    await new Promise(r => setTimeout(r, Math.max(60_000, sleepMin * 60_000)));
+    total += sleepMin;
     if (total >= MAX_TOTAL_MIN) return;
   }
-})().catch(e => {
-  console.error("Fatal:", e);
-  process.exit(1);
-});
+})().catch(e => { console.error("Fatal:", e); process.exit(1); });
