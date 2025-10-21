@@ -1,25 +1,25 @@
 name: Orchestrator Finals (sweeper)
 
 on:
-  schedule:
-    # 1 PM–11 PM UTC (9 AM–7 PM ET)
-    - cron: "*/15 17-23 * * *"
-    # 12 AM–2 AM UTC (8 PM–10 PM ET)
-    - cron: "*/15 0-2 * * *"
   workflow_dispatch:
+    inputs:
+      target_game_ids:
+        description: "Comma-separated ESPN Game IDs to force update (e.g. 401752740,401756924)"
+        required: false
+        default: ""
+      league:
+        description: "Which league to run"
+        type: choice
+        options:
+          - both
+          - nfl
+          - college-football
+        default: both
 
 jobs:
-  sweep:
+  sweep-nfl:
+    if: ${{ inputs.league == 'both' || inputs.league == 'nfl' }}
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        league: [nfl, college-football]
-        include:
-          - league: nfl
-            tab: NFL
-          - league: college-football
-            tab: CFB
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -27,25 +27,56 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: "20"
 
-      # ✅ Install axios + googleapis in the repo workspace, and verify
-      - name: Install runtime deps
-        working-directory: ${{ github.workspace }}
+      - name: Install runtime deps (repo or ad-hoc)
         run: |
-          echo "Workspace:" && pwd
-          # Create a minimal package.json if none exists so npm doesn't complain
-          test -f package.json || echo '{}' > package.json
-          npm install --no-save axios googleapis
-          echo "Installed modules:" && ls -la node_modules | head -n 50
-          echo "npm ls axios:" && npm ls axios || true
+          if [ -f package.json ]; then
+            npm i --no-audit --no-fund
+          else
+            npm i googleapis playwright axios --no-audit --no-fund
+          fi
 
-      - name: Run orchestrator finals sweep
-        working-directory: ${{ github.workspace }}
+      # No browsers needed; orchestrator doesn't rely on Playwright here.
+
+      - name: Run orchestrator finals sweep (NFL)
         env:
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
           GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
-          LEAGUE: ${{ matrix.league }}
-          TAB_NAME: ${{ matrix.tab }}
-          PREFILL_MODE: finals       # your script reads this as the finals sweep mode
-        run: node orchestrator.mjs
+          LEAGUE: nfl
+          TAB_NAME: NFL
+          RUN_SCOPE: week
+          TARGET_GAME_ID: ${{ inputs.target_game_ids }}
+          GHA_JSON: "1"
+        run: node orchestrator.mjs --gha
+
+  sweep-college:
+    if: ${{ inputs.league == 'both' || inputs.league == 'college-football' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install runtime deps (repo or ad-hoc)
+        run: |
+          if [ -f package.json ]; then
+            npm i --no-audit --no-fund
+          else
+            npm i googleapis playwright axios --no-audit --no-fund
+          fi
+
+      - name: Run orchestrator finals sweep (CFB)
+        env:
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+          GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
+          LEAGUE: college-football
+          TAB_NAME: CFB
+          RUN_SCOPE: week
+          TARGET_GAME_ID: ${{ inputs.target_game_ids }}
+          GHA_JSON: "1"
+        run: node orchestrator.mjs --gha
