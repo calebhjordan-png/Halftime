@@ -1,62 +1,91 @@
-name: Orchestrator (Prefill + Finals)
+name: Orchestrator
 
 on:
+  # Manual runs with knobs
   workflow_dispatch:
     inputs:
-      leagues:
-        description: "Leagues"
+      league:
+        description: "League to run (nfl | college-football)"
         type: choice
-        options:
-          - both
-          - nfl
-          - college-football
-        default: both
-      target_game_ids:
-        description: "Game ID"
+        required: true
+        default: nfl
+        options: [nfl, college-football]
+      tab_name:
+        description: "Sheet tab (NFL or CFB; leave blank to let script pick)"
         required: false
         default: ""
+      run_scope:
+        description: "Time window (today | week)"
+        type: choice
+        required: true
+        default: today
+        options: [today, week]
+      adaptive_halftime:
+        description: "Enable adaptive halftime (1=yes, 0=no)"
+        required: true
+        default: "1"
 
+  # (Optional) Uncomment to auto-prefill each morning ET and do game-day passes
+  # schedule:
+  #   # Daily prefill at 10:30 ET
+  #   - cron: "30 14 * * *"
+  #   # Game windows: every 15 minutes Fri/Sat/Sun ET
+  #   - cron: "*/15 16-06 * * 5-7"
+
+# Avoid overlapping runs per league
 concurrency:
-  group: orchestrator-${{ github.ref }}
+  group: orchestrator-${{ github.workflow }}-${{ inputs.league || 'nfl' }}
   cancel-in-progress: false
 
 jobs:
-  nfl:
-    if: ${{ inputs.leagues == 'both' || inputs.leagues == 'nfl' }}
+  run:
     runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with: { node-version: '20' }
-      - name: Install deps
-        run: npm i --no-audit --no-fund axios googleapis
-      - name: Run orchestrator (NFL)
-        env:
-          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
-          GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
-          LEAGUE: nfl
-          TAB_NAME: NFL
-          RUN_SCOPE: week
-          TARGET_GAME_ID: ${{ inputs.target_game_ids }}
-          GHA_JSON: "1"
-        run: node orchestrator.mjs --gha
+    timeout-minutes: 30
+    env:
+      # Required secrets (add in repo settings → Secrets and variables → Actions)
+      GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+      GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
 
-  cfb:
-    if: ${{ inputs.leagues == 'both' || inputs.leagues == 'college-football' }}
-    runs-on: ubuntu-latest
+      # Optional knobs (script has sane defaults if blank)
+      LEAGUE: ${{ inputs.league }}
+      TAB_NAME: ${{ inputs.tab_name }}
+      RUN_SCOPE: ${{ inputs.run_scope }}
+      ADAPTIVE_HALFTIME: ${{ inputs.adaptive_halftime }}
+
+      # Keep everything consistently in ET (script already formats in ET, this just helps logs)
+      TZ: America/New_York
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with: { node-version: '20' }
-      - name: Install deps
-        run: npm i --no-audit --no-fund axios googleapis
-      - name: Run orchestrator (CFB)
-        env:
-          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
-          GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
-          LEAGUE: college-football
-          TAB_NAME: CFB
-          RUN_SCOPE: week
-          TARGET_GAME_ID: ${{ inputs.target_game_ids }}
-          GHA_JSON: "1"
-        run: node orchestrator.mjs --gha
+      - name: 🧰 Checkout
+        uses: actions/checkout@v4
+
+      - name: ⚙️ Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: 📦 Install dependencies
+        run: |
+          npm ci
+          # Install Playwright Chromium and its OS deps for the halftime scrape
+          npx playwright install --with-deps chromium
+
+      - name: 🔎 Show config
+        run: |
+          echo "LEAGUE=${LEAGUE:-nfl}"
+          echo "TAB_NAME=${TAB_NAME:-'(script default)'}"
+          echo "RUN_SCOPE=${RUN_SCOPE:-today}"
+          echo "ADAPTIVE_HALFTIME=${ADAPTIVE_HALFTIME:-1}"
+
+      - name: 🏈 Run orchestrator
+        run: node orchestrator.mjs
+
+      # Optional: surface logs/artifacts if you want to debug runs
+      # - name: Upload logs
+      #   if: always()
+      #   uses: actions/upload-artifact@v4
+      #   with:
+      #     name: orchestrator-logs
+      #     path: |
+      #       playwright/. # if you keep traces
