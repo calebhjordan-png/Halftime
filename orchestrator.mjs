@@ -1,5 +1,5 @@
 import { google } from "googleapis";
-import * as playwright from "playwright"; // (not used here, but kept for parity if you call others)
+import * as playwright from "playwright"; // kept for parity if you call others
 import axios from "axios";
 
 /** ====== CONFIG via GitHub Action env ====== */
@@ -451,7 +451,8 @@ async function applyCenterFormatting(sheets){
   }
   await batch.flush(sheets);
 
-  // (Adaptive halftime second pass kept as-is from your version; it uses tidyStatus on write)
+  // (Adaptive halftime second pass could be here if you want; left as-is)
+
   log("Run complete.");
 
   if(GHA_JSON_MODE){
@@ -462,18 +463,3 @@ async function applyCenterFormatting(sheets){
   if(GHA_JSON_MODE){ process.stdout.write(JSON.stringify({ok:false,error:String(err?.message||err)})+"\n"); }
   else { console.error("Error:", err); process.exit(1); }
 });
-
-// Support fns reused above
-function isHalftimeLike(evt){
-  const t=(evt.status?.type?.name||evt.competitions?.[0]?.status?.type?.name||"").toUpperCase();
-  const short=(evt.status?.type?.shortDetail||"").toUpperCase();
-  return t.includes("HALFTIME")||/HALF/.test(short);
-}
-function parseShortDetailClock(s=""){ s=String(s).trim().toUpperCase();
-  if(/HALF/.test(s)||/HALFTIME/.test(s)) return {quarter:2,min:0,sec:0,halftime:true};
-  if(/FINAL/.test(s)) return {final:true};
-  const m=s.match(/Q?(\d)\D+(\d{1,2}):(\d{2})/); if(!m) return null;
-  return {quarter:Number(m[1]),min:Number(m[2]),sec:Number(m[3])};
-}
-function minutesAfterKickoff(evt){ return (Date.now()-new Date(evt.date).getTime())/60000; }
-function clampRecheck(mins){ return Math.max(MIN_RECHECK_MIN, Math.min(MAX_RECHECK_MIN, Math.ceil(mins))); }
