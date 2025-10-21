@@ -1,8 +1,9 @@
 /**
- * live-game.mjs — Status + halftime score + LIVE odds (team-segmented parser)
- * - Writes Status always; Half Score at halftime.
- * - Writes Live columns ONLY when game is actually live/halftime.
- * - LIVE odds parsed from ESPN BET grid by team segments; CLOSE is ignored.
+ * live-game.mjs — Status + halftime/current score + LIVE odds (team-segmented parser)
+ * Freeze rule:
+ *   - "Half Score" + all Live odds (M–Q) update through Q1, Q2, and Halftime
+ *   - Freeze as soon as Q3 starts (period >= 3)
+ *   - "Status" always updates
  */
 
 import { google } from "googleapis";
@@ -27,7 +28,7 @@ if (!SHEET_ID || !SA_JSON || !EVENT_ID) {
 /* ───────────── ESPN helpers ───────────── */
 const pick = (o, p) => p.replace(/\[(\d+)\]/g, ".$1").split(".").reduce((a, k) => a?.[k], o);
 async function fetchJson(url) {
-  const r = await fetch(url, { headers: { "User-Agent": "halftime-live/2.6" } });
+  const r = await fetch(url, { headers: { "User-Agent": "halftime-live/2.7" } });
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
   return await r.json();
 }
@@ -39,7 +40,7 @@ function parseStatus(sum) {
   return {
     shortDetail: t.shortDetail || s.shortDetail || "",
     state: (t.state || "").toUpperCase(),          // SCHEDULED / IN / FINAL
-    name: (t.name || "").toUpperCase(),            // STATUS_SCHEDULED / STATUS_IN_PROGRESS / STATUS_FINAL
+    name: (t.name || "").toUpperCase(),            // STATUS_SCHEDULED / STATUS_IN_PROGRESS / STATUS_FINAL / HALFTIME
     period: Number(s.period ?? 0),
     displayClock: s.displayClock ?? "0:00"
   };
@@ -56,13 +57,15 @@ function getTeams(sum) {
   };
 }
 
-/* ───────────── LIVE detection ───────────── */
+/* ───────────── Freeze / Live gating ───────────── */
 function isLiveOrHalf(st) {
   if (/FINAL/.test(st.name) || /FINAL/.test(st.state)) return false;
   if (/IN/.test(st.state) || /IN_PROGRESS/.test(st.name)) return true;
   if (/HALF/.test(st.name) || /HALF/i.test(st.shortDetail)) return true;
   return /\bQ[1-4]\b|\b\d{1,2}:\d{2}\s*-\s*(1st|2nd|3rd|4th)/i.test(st.shortDetail || "");
 }
+const isPreThird = st => Number(st.period || 0) < 3;   // Q1/Q2/halftime
+const isFinal    = st => /FINAL/.test(st.name) || /FINAL/.test(st.state);
 
 /* ───────────── Sheets helpers ───────────── */
 async function sheetsClient() {
@@ -120,17 +123,12 @@ function tokensFromSegment(text) {
   return text.split(" ").filter(Boolean).filter(tokenOK);
 }
 
-/**
- * Parse live odds by splitting the LIVE block into team segments
- * and taking the **last 5 tokens** in each segment.
- */
 function parseLiveByTeams(text, awayName, homeName) {
   const t = normalizeTxt(text);
   const headIdx = t.indexOf("SPREAD TOTAL ML");
   if (headIdx < 0) return null;
   const after = t.slice(headIdx + "SPREAD TOTAL ML".length);
 
-  // Find segments using team names (robust to extra text around)
   const aRe = new RegExp(awayName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
   const hRe = new RegExp(homeName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
   const aIdx = after.search(aRe);
@@ -144,7 +142,6 @@ function parseLiveByTeams(text, awayName, homeName) {
   const toksH = tokensFromSegment(segHome);
 
   if (DEBUG_ODDS) {
-    console.log("SCRAPE DEBUG: header context →", t.slice(Math.max(0, headIdx-140), Math.min(t.length, headIdx+320)));
     console.log("SCRAPE DEBUG: away seg tokens (last 10) →", toksA.slice(-10));
     console.log("SCRAPE DEBUG: home seg tokens (last 10) →", toksH.slice(-10));
   }
@@ -154,10 +151,9 @@ function parseLiveByTeams(text, awayName, homeName) {
   const last5A = toksA.slice(-5); // spread, spreadJuice, total, totalJuice, ML
   const last5H = toksH.slice(-5);
 
-  // Map to numbers (we only keep the numeric lines, not the juices)
-  const awaySpread = Number(last5A[0]);                // ±N(.5)
+  const awaySpread = Number(last5A[0]);
   const awayTotal  = Number(String(last5A[2]).slice(1)); // o/uN(.5) -> N(.5)
-  const awayML     = evenToNum(last5A[4]);             // EVEN or ±###
+  const awayML     = evenToNum(last5A[4]);
   const homeSpread = Number(last5H[0]);
   const homeTotal  = Number(String(last5H[2]).slice(1));
   const homeML     = evenToNum(last5H[4]);
@@ -165,9 +161,7 @@ function parseLiveByTeams(text, awayName, homeName) {
   const liveTotal = Number.isFinite(awayTotal) ? awayTotal :
                     Number.isFinite(homeTotal) ? homeTotal : null;
 
-  if (!Number.isFinite(awaySpread) || !Number.isFinite(homeSpread) || !Number.isFinite(awayML) || !Number.isFinite(homeML) || !Number.isFinite(liveTotal)) {
-    return null;
-  }
+  if (![awaySpread,homeSpread,awayML,homeML,liveTotal].every(Number.isFinite)) return null;
 
   return { awaySpread, homeSpread, awayML, homeML, liveTotal };
 }
@@ -207,7 +201,7 @@ async function scrapeEspnBet(gameId, league, awayName, homeName) {
   }
 }
 
-/* ───────────── main loop ───────────── */
+/* ───────────── loop ───────────── */
 function sleepMin(m){ return new Promise(r=>setTimeout(r, Math.max(60_000, Math.round(m*60_000)))); }
 
 async function tickOnce(sheets){
@@ -222,17 +216,18 @@ async function tickOnce(sheets){
   const scoreTxt  = `${tm.awayScore}-${tm.homeScore}`;
   console.log(`[${statusTxt}] ${tm.awayName} @ ${tm.homeName} | period=${st.period} clock=${st.displayClock}`);
 
-  // Always keep Status fresh.
+  // STATUS: always
   await writeValues(sheets, row, { "Status": statusTxt });
 
-  // Half-time score
-  const atHalf = /HALF/.test(st.name) || /HALF/i.test(st.shortDetail);
-  if (atHalf) {
+  // HALF SCORE: update through Q1/Q2/halftime; freeze at start of Q3
+  if (!isFinal(st) && isPreThird(st)) {
     await writeValues(sheets, row, { "Half Score": scoreTxt });
+  } else {
+    console.log("Half Score frozen (Q3+ or Final).");
   }
 
-  // Only write LIVE odds when event is live/halftime
-  if (isLiveOrHalf(st)) {
+  // LIVE LINES: only when live/halftime AND before Q3; otherwise frozen
+  if (isLiveOrHalf(st) && isPreThird(st)) {
     const scraped = await scrapeEspnBet(EVENT_ID, LEAGUE, tm.awayName, tm.homeName);
     if (scraped) {
       const payload = {
@@ -248,7 +243,7 @@ async function tickOnce(sheets){
       console.log("No live tokens parsed — leaving live columns unchanged.");
     }
   } else {
-    console.log("Game not live — skipping live columns.");
+    console.log("Live odds frozen (not live/half OR Q3+).");
   }
 }
 
