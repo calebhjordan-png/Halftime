@@ -193,7 +193,6 @@ function pregameRowFactory(sbForDay){
       } else if (o0.details){
         const m=o0.details.match(/([+-]?\d+(\.\d+)?)/);
         if(m){const line=parseFloat(m[1]);
-          // Determine favorite by which side takes the minus
           if(line<0){ favorite="away"; awaySpread = `${line}`; homeSpread = `+${Math.abs(line)}`; }
           else if(line>0){ favorite="home"; homeSpread = `-${Math.abs(line)}`; awaySpread = `+${Math.abs(line)}`; }
         }
@@ -201,7 +200,6 @@ function pregameRowFactory(sbForDay){
       const ml=await extractMLWithFallback(event,o0,away,home);
       awayML=ml.awayML||""; homeML=ml.homeML||"";
 
-      // If favorite still unknown, infer from moneyline (more negative)
       if(!favorite && awayML && homeML){
         const a = parseInt(String(awayML),10), h = parseInt(String(homeML),10);
         if(Number.isFinite(a)&&Number.isFinite(h)){
@@ -236,7 +234,7 @@ function pregameRowFactory(sbForDay){
         dateET,                // Date
         weekText || "",        // Week
         statusClean,           // Status
-        matchup,               // Matchup (rich text written later to underline/bolt)
+        matchup,               // Matchup (rich text written later)
         finalScore,            // Final Score
         awaySpread || "",      // A Spread
         String(awayML || ""),  // A ML
@@ -448,7 +446,7 @@ function buildMatchupRichText({ awayName, homeName, favorite, isFinal, awayFinal
 
   const buildPregame=pregameRowFactory(firstDaySB);
   let appendBatch=[];
-  const matchupFormatQueue = []; // collect rich text updates
+  const formatRequests = []; // Sheets API requests for rich text
 
   // Append pregame rows only for events not present by **Game ID**
   for(const ev of events){
@@ -458,7 +456,6 @@ function buildMatchupRichText({ awayName, homeName, favorite, isFinal, awayFinal
     if(!keyToRowNum.has(key)){
       appendBatch.push(rowVals);
     }
-    // We'll format the matchup for all (existing and new) after index refresh
   }
   if(appendBatch.length){
     await sheets.spreadsheets.values.append({spreadsheetId:SHEET_ID, range:`${TAB_NAME}!A1`, valueInputOption:"RAW", requestBody:{values:appendBatch}});
@@ -469,10 +466,9 @@ function buildMatchupRichText({ awayName, homeName, favorite, isFinal, awayFinal
     log(`Appended ${appendBatch.length} pregame row(s).`);
   }
 
-  // Pass 1: finals/halftime + collect adaptive delay + collect matchup formatting
+  // Pass 1: finals/halftime + collect adaptive delay + queue matchup formatting
   const batch=new BatchWriter(TAB_NAME);
   let masterDelayMin=null;
-  const formatRequests = []; // Sheets API requests for rich text
 
   for(const ev of events){
     const comp=ev.competitions?.[0]||{};
@@ -487,7 +483,7 @@ function buildMatchupRichText({ awayName, homeName, favorite, isFinal, awayFinal
     const rowNum=keyToRowNum.get(key);
     if(!rowNum) continue;
 
-    // Compute formatting meta (favorite + winner when final)
+    // compute favorite (pregame) and winner (if final) for formatting
     let favorite = null;
     const o0 = pickOdds(comp.odds||ev.odds||[]);
     const favId = String(o0?.favorite||o0?.favoriteTeamId||"");
@@ -495,7 +491,6 @@ function buildMatchupRichText({ awayName, homeName, favorite, isFinal, awayFinal
       if(String(away?.team?.id||"")===favId) favorite="away";
       else if(String(home?.team?.id||"")===favId) favorite="home";
     } else {
-      // fall back to moneyline comparison
       const ml = await extractMLWithFallback(ev, o0, away, home);
       const a = parseInt(String(ml.awayML||""),10), h = parseInt(String(ml.homeML||""),10);
       if(Number.isFinite(a)&&Number.isFinite(h)){
@@ -505,6 +500,7 @@ function buildMatchupRichText({ awayName, homeName, favorite, isFinal, awayFinal
         else if(Math.abs(h) > Math.abs(a)) favorite="home";
       }
     }
+
     const statusName=(ev.status?.type?.name||comp.status?.type?.name||"").toUpperCase();
     const scorePair=`${away?.score??""}-${home?.score??""}`;
     const isFinalGame = statusName.includes("FINAL");
@@ -624,7 +620,7 @@ function buildMatchupRichText({ awayName, homeName, favorite, isFinal, awayFinal
 
   if(GHA_JSON_MODE){
     const payload={ ok:true, league:normLeague(LEAGUE), scope:RUN_SCOPE, tab:TAB_NAME };
-    process.stdout.write(JSON.stringify(payload)+"n");
+    process.stdout.write(JSON.stringify(payload)+"\n");
   }
 })().catch(err=>{
   if(GHA_JSON_MODE){ process.stdout.write(JSON.stringify({ok:false,error:String(err?.message||err)})+"\n"); }
