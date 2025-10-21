@@ -8,6 +8,8 @@ const LEAGUE        = (process.env.LEAGUE || "nfl").toLowerCase();          // "
 const TAB_NAME      = (process.env.TAB_NAME || "NFL").trim();
 const RUN_SCOPE     = (process.env.RUN_SCOPE || "today").toLowerCase();     // "today" | "week"
 const ADAPTIVE_HALFTIME = String(process.env.ADAPTIVE_HALFTIME ?? "1") !== "0";
+/** Optional: comma-separated game IDs to force update regardless of date */
+const TARGET_GAME_ID = (process.env.TARGET_GAME_ID || "").trim();
 
 /** GitHub Actions JSON-output mode (stdout = JSON only) */
 const GHA_JSON_MODE = process.argv.includes("--gha") || String(process.env.GHA_JSON || "") === "1";
@@ -20,7 +22,7 @@ const MAX_RECHECK_MIN = 20;
 const COLS = [
   "Game ID","Date","Week","Status","Matchup","Final Score",
   "A Spread","A ML","H Spread","H ML","Total",
-  "Score","Half A Spread","Half A ML","Half H Spread","Half H ML","Half Total"
+  "Score","H A Spread","H A ML","H H Spread","H H ML","H Total"
 ];
 
 /** ===== Helpers ===== */
@@ -325,11 +327,18 @@ function reconcileHeaderRow(header){
   rename("Half Score","Score");
 
   // Live → Half
-  rename("Live Away Spread","Half A Spread");
-  rename("Live Away ML","Half A ML");
-  rename("Live Home Spread","Half H Spread");
-  rename("Live Home ML","Half H ML");
-  rename("Live Total","Half Total");
+  rename("Live Away Spread","H A Spread");
+  rename("Live Away ML","H A ML");
+  rename("Live Home Spread","H H Spread");
+  rename("Live Home ML","H H ML");
+  rename("Live Total","H Total");
+
+  // Also allow “Half …” → “H …”
+  rename("Half A Spread","H A Spread");
+  rename("Half A ML","H A ML");
+  rename("Half H Spread","H H Spread");
+  rename("Half H ML","H H ML");
+  rename("Half Total","H Total");
 
   if(renamed.length===0) return COLS.slice();
 
@@ -389,22 +398,18 @@ async function applyCenterAndCF(sheets){
   return sheetId;
 }
 
-/** Rich text for Matchup — exactly two runs, indices strictly increasing */
+/** Rich text for Matchup — exactly two runs, clear any links */
 function matchupRuns(fullText, awayName, homeName, favorite, winner){
-  const awayFmt = { underline: favorite==='away'||false, bold: winner==='away'||false };
-  const homeFmt = { underline: favorite==='home'||false, bold: winner==='home'||false };
+  const awayFmt = { underline: favorite==='away'||false, bold: winner==='away'||false, link: null };
+  const homeFmt = { underline: favorite==='home'||false, bold: winner==='home'||false, link: null };
 
   const awayStart = 0;
   const homeStart = awayName.length + 3; // " @ "
   const len = fullText.length;
 
   const runs = [];
-  // away segment (always at 0)
   runs.push({ startIndex: awayStart, format: awayFmt });
-  // home segment (must be < len and > 0)
-  if (homeStart > 0 && homeStart < len) {
-    runs.push({ startIndex: homeStart, format: homeFmt });
-  }
+  if (homeStart > 0 && homeStart < len) runs.push({ startIndex: homeStart, format: homeFmt });
   return runs;
 }
 
@@ -450,13 +455,37 @@ function matchupRuns(fullText, awayName, homeName, favorite, winner){
 
   const sheetId = await applyCenterAndCF(sheets);
 
-  // Pull events (today or week)
+  // Pull events (today/week) + forced IDs
   const datesList = RUN_SCOPE==="week"
     ? (()=>{const start=new Date(); return Array.from({length:7},(_,i)=>yyyymmddInET(new Date(start.getTime()+i*86400000)));})()
     : [yyyymmddInET(new Date())];
 
   let firstDaySB=null, events=[];
   for(const d of datesList){ const sb=await fetchJson(scoreboardUrl(LEAGUE,d)); if(!firstDaySB) firstDaySB=sb; events=events.concat(sb?.events||[]); }
+
+  // Force-add specific IDs (any date)
+  if (TARGET_GAME_ID) {
+    const ids = TARGET_GAME_ID.split(",").map(s=>s.trim()).filter(Boolean);
+    for (const id of ids) {
+      try {
+        const sum = await fetchJson(summaryUrl(LEAGUE, id));
+        const evt = {
+          id,
+          date: sum?.header?.competitions?.[0]?.date || sum?.boxscore?.gameInfo?.gameClock || new Date().toISOString(),
+          competitions: [{
+            status: sum?.header?.competitions?.[0]?.status,
+            competitors: sum?.header?.competitions?.[0]?.competitors,
+            odds: sum?.header?.competitions?.[0]?.odds || sum?.odds || sum?.pickcenter || []
+          }],
+          status: sum?.header?.competitions?.[0]?.status
+        };
+        events.push(evt);
+      } catch(e) {
+        warn("Force-add ID failed:", id, e?.message||e);
+      }
+    }
+  }
+
   const seen=new Set(); events=events.filter(e=>!seen.has(e.id)&&seen.add(e.id));
   log(`Events found: ${events.length}`);
 
@@ -499,7 +528,7 @@ function matchupRuns(fullText, awayName, homeName, favorite, winner){
     const rowNum=keyToRowNum.get(key);
     if(!rowNum) continue;
 
-    // who’s favorite (for underline)
+    // favorite (for underline)
     let favorite=null;
     const o0=pickOdds(comp.odds||ev.odds||[]);
     const favId=String(o0?.favorite||o0?.favoriteTeamId||"");
@@ -521,7 +550,7 @@ function matchupRuns(fullText, awayName, homeName, favorite, winner){
     const isFinalGame = statusName.includes("FINAL");
     const scorePair=`${away?.score??""}-${home?.score??""}`;
 
-    // rich text: underline favorite, bold winner if final
+    // rich text: underline favorite, bold winner if final (and clear any links)
     if(sheetId!=null){
       const winner = isFinalGame
         ? (Number(away?.score)>Number(home?.score) ? "away"
@@ -544,7 +573,7 @@ function matchupRuns(fullText, awayName, homeName, favorite, winner){
       continue;
     }
 
-    // (Adaptive halftime scheduling left as-is; not shown)
+    // (Adaptive halftime scheduling left as-is)
     if(ADAPTIVE_HALFTIME){
       const short=(ev.status?.type?.shortDetail||"").trim();
       const parsed=parseShortDetailClock(short);
@@ -559,7 +588,11 @@ function matchupRuns(fullText, awayName, homeName, favorite, winner){
       if(q2Cand  !=null) masterDelayMin = masterDelayMin==null?q2Cand  :Math.min(masterDelayMin,q2Cand);
     }
   }
-  await batch.flush(sheets);
+  await sheets.spreadsheets.values.batchUpdate({
+    spreadsheetId:SHEET_ID,
+    requestBody:{ valueInputOption:"RAW", data: batch.acc }
+  });
+  batch.acc = [];
 
   if(formatRequests.length){
     await sheets.spreadsheets.batchUpdate({
