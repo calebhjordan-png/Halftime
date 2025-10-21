@@ -1,262 +1,280 @@
-/**
- * live-game.mjs — Status + halftime/current score + LIVE odds (team-segmented parser)
- * Freeze rule:
- *   - "Half Score" + all Live odds (M–Q) update through Q1, Q2, and Halftime
- *   - Freeze as soon as Q3 starts (period >= 3)
- *   - "Status" always updates
- */
+// live-game.mjs
+// Status + halftime live odds updater.
+// - Status uses "MM/DD – h:mm AM/PM" for scheduled (no EDT/EST/ET).
+// - Strips ET token from other ESPN status strings (e.g., Q1 7:12).
+// - Writes halftime odds and score once (frozen after Q3 begins).
 
+import axios from "axios";
 import { google } from "googleapis";
+import * as playwright from "playwright";
 
-/* ───────────── ENV ───────────── */
-const SHEET_ID = process.env.GOOGLE_SHEET_ID;
-const SA_JSON  = process.env.GOOGLE_SERVICE_ACCOUNT;
-const LEAGUE   = (process.env.LEAGUE || "nfl").toLowerCase();
-const TAB_NAME = process.env.TAB_NAME || (LEAGUE === "college-football" ? "CFB" : "NFL");
-const EVENT_ID = String(process.env.TARGET_GAME_ID || "").trim();
+/* ─────────────────────────────── ENV ─────────────────────────────── */
+const {
+  GOOGLE_SHEET_ID,
+  GOOGLE_SERVICE_ACCOUNT,
+  LEAGUE = "nfl",          // "nfl" | "college-football"
+  TAB_NAME = (LEAGUE === "nfl" ? "NFL" : "CFB"),
+  TARGET_GAME_ID = "",     // optional: force one ID
+  ONESHOT = "",            // if "true", do a single pass
+  DEBUG_ODDS = "",         // if "true", print odds parse info
+  FORCE_STATUS_WRITE = "", // if "true", write Status even in oneshot
+} = process.env;
 
-const MAX_TOTAL_MIN = Number(process.env.MAX_TOTAL_MIN || "200");
-const DEBUG_MODE  = String(process.env.DEBUG_MODE || "").toLowerCase() === "true";
-const ONESHOT     = String(process.env.ONESHOT || "").toLowerCase() === "true";
-const DEBUG_ODDS  = String(process.env.DEBUG_ODDS || "").toLowerCase() === "true";
+const DEBUG = String(DEBUG_ODDS || "").toLowerCase() === "true";
+const log = (...a) => console.log(...a);
 
-if (!SHEET_ID || !SA_JSON || !EVENT_ID) {
-  console.error("❌ Missing env: GOOGLE_SHEET_ID, GOOGLE_SERVICE_ACCOUNT, TARGET_GAME_ID");
+/* ───────────────────── Google Sheets bootstrap ───────────────────── */
+if (!GOOGLE_SHEET_ID || !GOOGLE_SERVICE_ACCOUNT) {
+  console.error("Missing GOOGLE_SHEET_ID or GOOGLE_SERVICE_ACCOUNT");
   process.exit(1);
 }
+const svc = JSON.parse(GOOGLE_SERVICE_ACCOUNT);
+const jwt = new google.auth.JWT(
+  svc.client_email,
+  undefined,
+  svc.private_key,
+  ["https://www.googleapis.com/auth/spreadsheets"]
+);
+const sheets = google.sheets({ version: "v4", auth: jwt });
 
-/* ───────────── ESPN helpers ───────────── */
-const pick = (o, p) => p.replace(/\[(\d+)\]/g, ".$1").split(".").reduce((a, k) => a?.[k], o);
-async function fetchJson(url) {
-  const r = await fetch(url, { headers: { "User-Agent": "halftime-live/2.7" } });
-  if (!r.ok) throw new Error(`HTTP ${r.status}`);
-  return await r.json();
+/* ───────────────────────────── Helpers ───────────────────────────── */
+function idxToA1(n0) {
+  let n = n0 + 1, s = "";
+  while (n > 0) { n--; s = String.fromCharCode(65 + (n % 26)) + s; n = Math.floor(n / 26); }
+  return s;
 }
-const summaryUrl = id => `https://site.api.espn.com/apis/site/v2/sports/football/${LEAGUE}/summary?event=${id}`;
+function a1For(row0, col0, tab = TAB_NAME) {
+  const row1 = row0 + 1;
+  const colA = idxToA1(col0);
+  return `${tab}!${colA}${row1}:${colA}${row1}`;
+}
+function makeValue(range, val) { return { range, values: [[val]] }; }
 
-function parseStatus(sum) {
-  const s = pick(sum, "header.competitions.0.status") || pick(sum, "competitions.0.status") || {};
-  const t = s.type || {};
-  return {
-    shortDetail: t.shortDetail || s.shortDetail || "",
-    state: (t.state || "").toUpperCase(),          // SCHEDULED / IN / FINAL
-    name: (t.name || "").toUpperCase(),            // STATUS_SCHEDULED / STATUS_IN_PROGRESS / STATUS_FINAL / HALFTIME
-    period: Number(s.period ?? 0),
-    displayClock: s.displayClock ?? "0:00"
-  };
-}
-function getTeams(sum) {
-  const comps = pick(sum, "header.competitions.0.competitors") || pick(sum, "competitions.0.competitors") || [];
-  const away = comps.find(c => c.homeAway === "away") || {};
-  const home = comps.find(c => c.homeAway === "home") || {};
-  return {
-    awayName: away.team?.shortDisplayName || away.team?.displayName || "Away",
-    homeName: home.team?.shortDisplayName || home.team?.displayName || "Home",
-    awayScore: Number(away.score ?? 0),
-    homeScore: Number(home.score ?? 0)
-  };
-}
+const ET_TZ = "America/New_York";
+const fmtETDateOnly = (d) =>
+  new Intl.DateTimeFormat("en-US", { timeZone: ET_TZ, month: "2-digit", day: "2-digit" })
+    .format(new Date(d));
+const fmtETTimeOnly = (d) =>
+  new Intl.DateTimeFormat("en-US", { timeZone: ET_TZ, hour: "numeric", minute: "2-digit", hour12: true })
+    .format(new Date(d));
+const fmtETDateTime = (d) => `${fmtETDateOnly(d)} - ${fmtETTimeOnly(d)}`;
+const stripET = (s = "") => String(s).replace(/\s+E[DS]?T\b/i, "").trim();
 
-/* ───────────── Freeze / Live gating ───────────── */
-function isLiveOrHalf(st) {
-  if (/FINAL/.test(st.name) || /FINAL/.test(st.state)) return false;
-  if (/IN/.test(st.state) || /IN_PROGRESS/.test(st.name)) return true;
-  if (/HALF/.test(st.name) || /HALF/i.test(st.shortDetail)) return true;
-  return /\bQ[1-4]\b|\b\d{1,2}:\d{2}\s*-\s*(1st|2nd|3rd|4th)/i.test(st.shortDetail || "");
-}
-const isPreThird = st => Number(st.period || 0) < 3;   // Q1/Q2/halftime
-const isFinal    = st => /FINAL/.test(st.name) || /FINAL/.test(st.state);
+const normLeague = (x) => (x === "ncaaf" || x === "college-football") ? "college-football" : "nfl";
+const summaryUrl = (lg, id) => `https://site.api.espn.com/apis/site/v2/sports/football/${normLeague(lg)}/summary?event=${id}`;
+const gameUrl = (lg, id) => `https://www.espn.com/${normLeague(lg)}/game/_/gameId/${id}`;
 
-/* ───────────── Sheets helpers ───────────── */
-async function sheetsClient() {
-  const creds = JSON.parse(SA_JSON);
-  const jwt = new google.auth.JWT(
-    creds.client_email, null, creds.private_key,
-    ["https://www.googleapis.com/auth/spreadsheets"]
-  );
-  await jwt.authorize();
-  return google.sheets({ version: "v4", auth: jwt });
+function shortStatusFromEspn(statusObj) {
+  const t = statusObj?.type || {};
+  return t.shortDetail || t.detail || t.description || "";
 }
-function colMap(hdr = []) { const m = {}; hdr.forEach((h,i)=> m[(h||"").trim().toLowerCase()] = i); return m; }
-function A1(i){ return String.fromCharCode("A".charCodeAt(0)+i); }
-async function findRow(sheets){
-  const r = await sheets.spreadsheets.values.get({ spreadsheetId: SHEET_ID, range: `${TAB_NAME}!A1:Z2000` });
-  const v = r.data.values || [];
-  if (!v.length) return -1;
-  const hdr = v[0] || [];
-  const h = colMap(hdr);
-  const gi = h["game id"];
-  if (gi != null) {
-    for (let i=1;i<v.length;i++){
-      if ((v[i][gi]||"").toString().trim() === EVENT_ID) return i+1;
-    }
-  }
-  return -1;
+function isFinalFromEspn(statusObj) {
+  return /final/i.test(String(statusObj?.type?.name || statusObj?.type?.description || ""));
 }
-async function writeValues(sheets,row,kv){
-  const header=(await sheets.spreadsheets.values.get({ spreadsheetId:SHEET_ID, range:`${TAB_NAME}!A1:Z1`})).data.values?.[0]||[];
-  const h=colMap(header);
-  const data=[];
-  for(const [key,val] of Object.entries(kv)){
-    const j=h[key.toLowerCase()];
-    if (j==null || val==null) continue;
-    data.push({ range:`${TAB_NAME}!${A1(j)}${row}`, values:[[val]] });
-  }
-  if (!data.length) return 0;
-  await sheets.spreadsheets.values.batchUpdate({
-    spreadsheetId:SHEET_ID,
-    requestBody:{ valueInputOption:"USER_ENTERED", data }
-  });
-  return data.length;
+function isScheduled(statusObj) {
+  return /SCHEDULED/i.test(String(statusObj?.type?.name || ""));
 }
 
-/* ───────────── ESPN BET scrape (team-segmented) ───────────── */
-function normalizeTxt(s){ return String(s||"").replace(/\u00a0/g," ").replace(/[–—−]/g,"-").replace(/\s+/g," ").trim(); }
-function evenToNum(s){ return /^even$/i.test(String(s)) ? 100 : Number(s); }
-const tokenOK = (tok) =>
-  /^[+\-]\d+(?:\.\d+)?$/.test(tok) ||   // spreads, prices
-  /^[ou]\d+(?:\.\d+)?$/i.test(tok) ||  // totals o/u
-  /^EVEN$/i.test(tok) ||
-  /^[+\-]?\d{2,5}$/.test(tok);         // ML
-
-function tokensFromSegment(text) {
-  return text.split(" ").filter(Boolean).filter(tokenOK);
+/* parse current score (away-home) */
+function parseScore(summary) {
+  try {
+    const comp = summary?.header?.competitions?.[0];
+    const home = comp?.competitors?.find(c => c.homeAway === "home");
+    const away = comp?.competitors?.find(c => c.homeAway === "away");
+    const hHome = home?.score ?? 0;
+    const hAway = away?.score ?? 0;
+    return `${hAway}-${hHome}`;
+  } catch { return ""; }
 }
 
-function parseLiveByTeams(text, awayName, homeName) {
-  const t = normalizeTxt(text);
-  const headIdx = t.indexOf("SPREAD TOTAL ML");
-  if (headIdx < 0) return null;
-  const after = t.slice(headIdx + "SPREAD TOTAL ML".length);
-
-  const aRe = new RegExp(awayName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
-  const hRe = new RegExp(homeName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
-  const aIdx = after.search(aRe);
-  const hIdx = after.search(hRe);
-  if (aIdx < 0 || hIdx < 0) return null;
-
-  const segAway = after.slice(aIdx, hIdx);
-  const segHome = after.slice(hIdx);
-
-  const toksA = tokensFromSegment(segAway);
-  const toksH = tokensFromSegment(segHome);
-
-  if (DEBUG_ODDS) {
-    console.log("SCRAPE DEBUG: away seg tokens (last 10) →", toksA.slice(-10));
-    console.log("SCRAPE DEBUG: home seg tokens (last 10) →", toksH.slice(-10));
-  }
-
-  if (toksA.length < 5 || toksH.length < 5) return null;
-
-  const last5A = toksA.slice(-5); // spread, spreadJuice, total, totalJuice, ML
-  const last5H = toksH.slice(-5);
-
-  const awaySpread = Number(last5A[0]);
-  const awayTotal  = Number(String(last5A[2]).slice(1)); // o/uN(.5) -> N(.5)
-  const awayML     = evenToNum(last5A[4]);
-  const homeSpread = Number(last5H[0]);
-  const homeTotal  = Number(String(last5H[2]).slice(1));
-  const homeML     = evenToNum(last5H[4]);
-
-  const liveTotal = Number.isFinite(awayTotal) ? awayTotal :
-                    Number.isFinite(homeTotal) ? homeTotal : null;
-
-  if (![awaySpread,homeSpread,awayML,homeML,liveTotal].every(Number.isFinite)) return null;
-
-  return { awaySpread, homeSpread, awayML, homeML, liveTotal };
+/* ───────────── ESPN fetchers ───────────── */
+async function espnSummary(gameId) {
+  const url = summaryUrl(LEAGUE, gameId);
+  const { data } = await axios.get(url, { timeout: 15000 });
+  return data;
 }
 
-async function scrapeEspnBet(gameId, league, awayName, homeName) {
-  const { chromium } = await import("playwright");
-  const lg = league === "college-football" ? "college-football" : "nfl";
-  const url = `https://www.espn.com/${lg}/game/_/gameId/${gameId}`;
+/* ───────────── ESPN BET quick scraper (LIVE ODDS box) ───────────── */
+function normalizeDashes(s) {
+  return s.replace(/\u2212|\u2013|\u2014/g, "-").replace(/\uFE63|\uFF0B/g, "+");
+}
+function scrapeLiveOddsTextBlock(textBlock) {
+  // textBlock: normalized text of the "LIVE ODDS" section
+  // We want: away spread, away ML, total; and home spread, home ML.
+  // Strategy: tokens → pick the *live* numbers (ignore first “close” pair).
+  const t = normalizeDashes(textBlock).replace(/\s+/g, " ");
+  // Extract numeric tokens with their +/- and o/u labels (keep numbers only for ML/Spread/Total)
+  // We detect structures like: "+3.5", "-140", "o35.5", "u35.5".
+  const spreads = [...t.matchAll(/(?:^|\s)([+-]\d+(?:\.\d+)?)(?=\s)/g)].map(m => m[1]);
+  const mls     = [...t.matchAll(/(?:^|\s)([+-]\d{2,4})(?=\s)/g)].map(m => m[1]);
+  const totO    = t.match(/\bo\s?(\d+(?:\.\d+)?)\b/i)?.[1] || "";
+  const totU    = t.match(/\bu\s?(\d+(?:\.\d+)?)\b/i)?.[1] || "";
+  const liveTotal = totO || totU || "";
 
-  const browser = await chromium.launch({ headless: true });
+  // Heuristic: first spread after headers is away live, second is home live.
+  const liveAwaySpread = spreads[0] || "";
+  const liveHomeSpread = spreads[1] || "";
+  const liveAwayML = mls[0] || "";
+  const liveHomeML = mls[1] || "";
+
+  return { liveAwaySpread, liveHomeSpread, liveAwayML, liveHomeML, liveTotal };
+}
+
+async function scrapeLiveOddsOnce(league, gameId) {
+  const url = gameUrl(league, gameId);
+  const browser = await playwright.chromium.launch({ headless: true });
   const page = await browser.newPage();
   try {
     await page.goto(url, { timeout: 60000, waitUntil: "domcontentloaded" });
-    const loc = page.locator("section:has-text('LIVE ODDS'), div:has(h2:has-text('LIVE ODDS'))").first();
-    await loc.waitFor({ timeout: 20000 }).catch(()=>{});
-    const liveText = await (async () => { try { return await loc.innerText(); } catch { return ""; }})();
-    const bodyText = await page.evaluate(() => document.body.innerText || "");
+    await page.waitForLoadState("networkidle", { timeout: 6000 }).catch(() => {});
+    const section = page.locator("section:has-text('LIVE ODDS'), div:has(h2:has-text('LIVE ODDS'))").first();
+    await section.waitFor({ timeout: 8000 });
 
-    const parsed =
-      parseLiveByTeams(liveText, awayName, homeName) ||
-      parseLiveByTeams(bodyText, awayName, homeName);
+    const txt = (await section.innerText()).replace(/\u00a0/g, " ").trim();
+    if (DEBUG) {
+      console.log("SCRAPE DEBUG: header context →", txt.slice(0, 1800));
+    }
 
-    if (!parsed) return null;
-    const { awaySpread, homeSpread, awayML, homeML, liveTotal } = parsed;
-    console.log("📊 ESPN BET parsed:", { awaySpread, homeSpread, awayML, homeML, liveTotal });
-    return {
-      liveAwaySpread: awaySpread, liveHomeSpread: homeSpread,
-      liveAwayML: awayML,         liveHomeML: homeML,
-      liveTotal
-    };
-  } catch (e) {
-    console.log("⚠️ ESPN BET scrape failed:", e.message);
+    // Try to identify the *live* set (ignore the first "CLOSE" numbers)
+    const { liveAwaySpread, liveHomeSpread, liveAwayML, liveHomeML, liveTotal } = scrapeLiveOddsTextBlock(txt);
+
+    // Also try to pull the visible score as "away-home"
+    let halfScore = "";
+    try {
+      const allTxt = (await page.locator("body").innerText()).replace(/\s+/g, " ");
+      const sc = allTxt.match(/(\b\d{1,2}\b)\s*-\s*(\b\d{1,2}\b)/);
+      if (sc) halfScore = `${sc[1]}-${sc[2]}`;
+    } catch {}
+
+    return { liveAwaySpread, liveHomeSpread, liveTotal, liveAwayML, liveHomeML, halfScore };
+  } catch (err) {
+    console.warn("ESPN BET scrape failed:", err?.message || err);
     return null;
   } finally {
-    await page.close().catch(()=>{});
-    await browser.close().catch(()=>{});
+    await browser.close();
   }
 }
 
-/* ───────────── loop ───────────── */
-function sleepMin(m){ return new Promise(r=>setTimeout(r, Math.max(60_000, Math.round(m*60_000)))); }
+/* ─────────────────────────────── MAIN ────────────────────────────── */
+async function getValues() {
+  const range = `${TAB_NAME}!A1:Q2000`;
+  const res = await sheets.spreadsheets.values.get({ spreadsheetId: GOOGLE_SHEET_ID, range });
+  return res.data.values || [];
+}
+function mapCols(header) {
+  const lower = s => (s || "").trim().toLowerCase();
+  const find = (name, fb) => {
+    const i = header.findIndex(h => lower(h) === lower(name));
+    return i >= 0 ? i : fb;
+  };
+  return {
+    GAME_ID: find("Game ID", 0),
+    DATE: find("Date", 1),
+    STATUS: find("Status", 3),
+    SCORE: find("Half Score", 11), // sheet label "Half Score" holds current score snapshot
+    LA_S: find("Live Away Spread", 12),
+    LA_ML: find("Live Away ML", 13),
+    LH_S: find("Live Home Spread", 14),
+    LH_ML: find("Live Home ML", 15),
+    L_TOT: find("Live Total", 16),
+  };
+}
 
-async function tickOnce(sheets){
-  const row = await findRow(sheets);
-  if (row < 0) return console.log(`No row for Game ID ${EVENT_ID}`);
+async function main() {
+  const values = await getValues();
+  if (!values.length) return;
 
-  const sum = await fetchJson(summaryUrl(EVENT_ID));
-  const st  = parseStatus(sum);
-  const tm  = getTeams(sum);
+  const header = values[0];
+  const col = mapCols(header);
+  const rows = values.slice(1);
 
-  const statusTxt = st.shortDetail || st.state || "unknown";
-  const scoreTxt  = `${tm.awayScore}-${tm.homeScore}`;
-  console.log(`[${statusTxt}] ${tm.awayName} @ ${tm.homeName} | period=${st.period} clock=${st.displayClock}`);
-
-  // STATUS: always
-  await writeValues(sheets, row, { "Status": statusTxt });
-
-  // HALF SCORE: update through Q1/Q2/halftime; freeze at start of Q3
-  if (!isFinal(st) && isPreThird(st)) {
-    await writeValues(sheets, row, { "Half Score": scoreTxt });
-  } else {
-    console.log("Half Score frozen (Q3+ or Final).");
+  const targets = [];
+  for (let r = 0; r < rows.length; r++) {
+    const row = rows[r] || [];
+    const id = (row[col.GAME_ID] || "").toString().trim();
+    if (!id) continue;
+    if (TARGET_GAME_ID && !TARGET_GAME_ID.split(",").map(s => s.trim()).includes(id)) continue;
+    targets.push({ row0: r + 1, id });
   }
+  if (!targets.length) return;
 
-  // LIVE LINES: only when live/halftime AND before Q3; otherwise frozen
-  if (isLiveOrHalf(st) && isPreThird(st)) {
-    const scraped = await scrapeEspnBet(EVENT_ID, LEAGUE, tm.awayName, tm.homeName);
-    if (scraped) {
-      const payload = {
-        "Live Away Spread": scraped.liveAwaySpread,
-        "Live Away ML":     scraped.liveAwayML,
-        "Live Home Spread": scraped.liveHomeSpread,
-        "Live Home ML":     scraped.liveHomeML,
-        "Live Total":       scraped.liveTotal
-      };
-      await writeValues(sheets, row, payload);
-      console.log(`→ row ${row} | live odds written.`);
-    } else {
-      console.log("No live tokens parsed — leaving live columns unchanged.");
+  for (const t of targets) {
+    try {
+      const summary = await espnSummary(t.id);
+      const comp = summary?.header?.competitions?.[0] || {};
+      const statusObj = comp?.status || {};
+      const period = statusObj?.period ?? 0;
+
+      // Status formatting (scheduled → "MM/DD – h:mm AM/PM", else strip ET token)
+      let newStatus = shortStatusFromEspn(statusObj);
+      if (isScheduled(statusObj)) {
+        const compDate = comp?.date || summary?.header?.date || new Date().toISOString();
+        newStatus = fmtETDateTime(compDate);
+      } else {
+        newStatus = stripET(newStatus);
+      }
+
+      // Always write Status when FORCE_STATUS_WRITE, otherwise during normal runs
+      if (newStatus && (String(FORCE_STATUS_WRITE).toLowerCase() === "true" || !ONESHOT)) {
+        await sheets.spreadsheets.values.batchUpdate({
+          spreadsheetId: GOOGLE_SHEET_ID,
+          requestBody: {
+            valueInputOption: "RAW",
+            data: [makeValue(a1For(t.row0 + 1, col.STATUS), newStatus)],
+          },
+        });
+      }
+
+      // write live score snapshot to "Half Score" col until Q3 begins (frozen after 3rd starts)
+      const scoreSnap = parseScore(summary);
+      if (scoreSnap && period < 3) {
+        await sheets.spreadsheets.values.batchUpdate({
+          spreadsheetId: GOOGLE_SHEET_ID,
+          requestBody: {
+            valueInputOption: "RAW",
+            data: [makeValue(a1For(t.row0 + 1, col.SCORE), scoreSnap)],
+          },
+        });
+      }
+
+      // If halftime and live odds not yet frozen, scrape odds and write once
+      const rowNowRes = await sheets.spreadsheets.values.get({
+        spreadsheetId: GOOGLE_SHEET_ID,
+        range: `${TAB_NAME}!A${t.row0 + 2}:Q${t.row0 + 2}`,
+      });
+      const rowNow = (rowNowRes.data.values || [])[0] || [];
+      const alreadyHasLive = (rowNow[col.L_TOT] || "").toString().trim() ||
+                             (rowNow[col.LA_S] || "").toString().trim();
+
+      if (period >= 3) continue; // frozen after Q3 starts
+
+      const isHalftime = /HALF/i.test(String(statusObj?.type?.name || "")) ||
+                         /HALF/i.test(String(statusObj?.type?.shortDetail || ""));
+
+      if (isHalftime && !alreadyHasLive) {
+        const live = await scrapeLiveOddsOnce(LEAGUE, t.id);
+        if (live) {
+          const { liveAwaySpread, liveHomeSpread, liveTotal, liveAwayML, liveHomeML, halfScore } = live;
+          const payload = [];
+          const add = (cIdx, v) => { if (cIdx != null && v !== "" && v != null) payload.push(makeValue(a1For(t.row0 + 1, cIdx), v)); };
+          add(col.SCORE, halfScore || scoreSnap);
+          add(col.LA_S, liveAwaySpread);
+          add(col.LA_ML, liveAwayML);
+          add(col.LH_S, liveHomeSpread);
+          add(col.LH_ML, liveHomeML);
+          add(col.L_TOT, liveTotal);
+          if (payload.length) {
+            await sheets.spreadsheets.values.batchUpdate({
+              spreadsheetId: GOOGLE_SHEET_ID,
+              requestBody: { valueInputOption: "RAW", data: payload },
+            });
+          }
+        }
+      }
+    } catch (e) {
+      console.warn(`⚠️ ${t.id} failed:`, e?.message || e);
     }
-  } else {
-    console.log("Live odds frozen (not live/half OR Q3+).");
   }
 }
 
-(async () => {
-  const sheets = await sheetsClient();
-  if (ONESHOT) { await tickOnce(sheets); return; }
-
-  let total = 0;
-  for (;;) {
-    await tickOnce(sheets);
-    const wait = DEBUG_MODE ? 0.2 : 5; // minutes
-    await sleepMin(wait);
-    total += wait;
-    if (total >= MAX_TOTAL_MIN) return;
-  }
-})().catch(e => { console.error("Fatal:", e); process.exit(1); });
+main().catch(e => { console.error(e); process.exit(1); });
