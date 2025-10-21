@@ -1,4 +1,4 @@
-// orchestrator.mjs — drop-in replacement
+// orchestrator.mjs — with GAME_IDS filter, Game ID–first row targeting, team-correct spreads, live status, week per-day
 
 import { google } from "googleapis";
 import * as playwright from "playwright";
@@ -9,15 +9,20 @@ const CREDS_RAW     = (process.env.GOOGLE_SERVICE_ACCOUNT || "").trim();
 const LEAGUE        = (process.env.LEAGUE || "nfl").toLowerCase();          // "nfl" | "college-football"
 const TAB_NAME      = (process.env.TAB_NAME || (LEAGUE === "college-football" ? "CFB" : "NFL")).trim();
 const RUN_SCOPE     = (process.env.RUN_SCOPE || "today").toLowerCase();     // "today" | "week"
-const ADAPTIVE_HALFTIME = String(process.env.ADAPTIVE_HALFTIME ?? "1") !== "0";
+const ADAPTIVE_HALFTIME = "1"; // always on as requested
+
+// NEW: optional filter list of game IDs (comma/space separated)
+const GAME_IDS = (() => {
+  const raw = (process.env.GAME_IDS || "").trim();
+  if (!raw) return null;
+  return raw.split(/[,\s]+/).map(s => s.trim()).filter(Boolean);
+})();
 
 /** Kickoff window and adaptive bounds */
-const HALF_EARLY_MIN = Number(process.env.HALFTIME_EARLY_MIN ?? 60);
-const HALF_LATE_MIN  = Number(process.env.HALFTIME_LATE_MIN  ?? 90);
 const MIN_RECHECK_MIN = 2;
 const MAX_RECHECK_MIN = 20;
 
-/** Column names (Half Score header) */
+/** Column names */
 const COLS = [
   "Date","Week","Status","Matchup","Final Score",
   "Away Spread","Away ML","Home Spread","Home ML","Total",
@@ -116,7 +121,7 @@ function tidyStatus(evt) {
   if (name.includes("IN_PROGRESS") || name.includes("LIVE")) {
     return short || "In Progress";
   }
-  // scheduled → format directly in ET (no TZ suffix)
+  // scheduled → format in ET
   return fmtETTime(evt.date);
 }
 
@@ -157,7 +162,6 @@ function resolveWeekLabelCFB(sb, eventDateISO) {
 function extractMoneylines(o, awayId, homeId, competitors = []) {
   let awayML = "", homeML = "";
 
-  // PickCenter blocks
   if (o && (o.awayTeamOdds || o.homeTeamOdds)) {
     const aObj = o.awayTeamOdds || {};
     const hObj = o.homeTeamOdds || {};
@@ -173,7 +177,6 @@ function extractMoneylines(o, awayId, homeId, competitors = []) {
     if (awayML || homeML) return { awayML, homeML };
   }
 
-  // teamOdds[]
   if (Array.isArray(o?.teamOdds)) {
     for (const t of o.teamOdds) {
       const tid = String(t?.teamId ?? t?.team?.id ?? "");
@@ -185,7 +188,6 @@ function extractMoneylines(o, awayId, homeId, competitors = []) {
     if (awayML || homeML) return { awayML, homeML };
   }
 
-  // nested competitors odds
   if (Array.isArray(o?.competitors)) {
     const findML = c => numOrBlank(c?.moneyLine ?? c?.moneyline ?? c?.odds?.moneyLine ?? c?.odds?.moneyline);
     const aML = findML(o.competitors.find(c => String(c?.id ?? c?.teamId) === String(awayId)));
@@ -194,12 +196,10 @@ function extractMoneylines(o, awayId, homeId, competitors = []) {
     if (awayML || homeML) return { awayML, homeML };
   }
 
-  // direct fields
   awayML = awayML || numOrBlank(o?.moneyLineAway ?? o?.awayTeamMoneyLine ?? o?.awayMoneyLine ?? o?.awayMl);
   homeML = homeML || numOrBlank(o?.moneyLineHome ?? o?.homeTeamMoneyLine ?? o?.homeMoneyLine ?? o?.homeMl);
   if (awayML || homeML) return { awayML, homeML };
 
-  // favorite mapping
   const favId = String(o?.favorite ?? o?.favoriteId ?? o?.favoriteTeamId ?? "");
   const favML = numOrBlank(o?.favoriteMoneyLine);
   const dogML = numOrBlank(o?.underdogMoneyLine);
@@ -208,7 +208,6 @@ function extractMoneylines(o, awayId, homeId, competitors = []) {
     if (String(homeId) === favId) { homeML = homeML || favML; awayML = awayML || dogML; return { awayML, homeML }; }
   }
 
-  // competitors[] variant
   if (Array.isArray(competitors)) {
     for (const c of competitors) {
       const ml = numOrBlank(c?.odds?.moneyLine ?? c?.odds?.moneyline ?? c?.odds?.money_line);
@@ -244,7 +243,7 @@ async function extractMLWithFallback(event, baseOdds, away, home) {
   return base;
 }
 
-/** ===== NEW: robust spread extractor (team-specific lines) ===== */
+/** ===== robust spread extractor (team-specific lines) ===== */
 function extractSpreads(o, awayId, homeId) {
   let away = "", home = "";
 
@@ -256,12 +255,10 @@ function extractSpreads(o, awayId, homeId) {
     else if (String(favId) === String(homeId)) { home = `-${s}`; away = `+${s}`; }
   };
 
-  // favorite + numeric spread
   const favId = o?.favorite ?? o?.favoriteTeamId ?? o?.favoriteId;
   const line  = o?.spread ?? o?.pointSpread ?? o?.handicap;
   if (favId != null && line != null) setFromFav(favId, line);
 
-  // per-team lines
   if (!(away && home) && Array.isArray(o?.teamOdds)) {
     for (const t of o.teamOdds) {
       const tid = String(t?.teamId ?? t?.team?.id ?? "");
@@ -273,7 +270,6 @@ function extractSpreads(o, awayId, homeId) {
     }
   }
 
-  // competitors[] fallback
   if (!(away && home) && Array.isArray(o?.competitors)) {
     for (const c of o.competitors) {
       const n = Number.parseFloat(c?.odds?.spread ?? c?.odds?.handicap ?? c?.odds?.pointSpread);
@@ -283,7 +279,6 @@ function extractSpreads(o, awayId, homeId) {
     }
   }
 
-  // text like "TeamX -3.5"
   if (!(away && home) && o?.details) {
     const m = String(o.details).match(/([+-]?\d+(\.\d+)?)/);
     if (m) {
@@ -347,7 +342,7 @@ function pregameRowFactory(sbForDay) {
         homeSpread || "",       // Home Spread
         String(homeML || ""),   // Home ML
         String(total || ""),    // Total
-        "", "", "", "", "", ""  // live cols (later)
+        "", "", "", "", "", ""  // live cols
       ],
       dateET,
       matchup
@@ -355,14 +350,12 @@ function pregameRowFactory(sbForDay) {
   };
 }
 
-/** ===== Halftime-ish? ===== */
+/** ===== Halftime-ish? and delays ===== */
 function isHalftimeLike(evt) {
   const t = (evt.status?.type?.name || evt.competitions?.[0]?.status?.type?.name || "").toUpperCase();
   const short = (evt.status?.type?.shortDetail || "").toUpperCase();
   return t.includes("HALFTIME") || /Q2.*0:0?0/.test(short) || /HALF/.test(short);
 }
-
-/** ===== Parse clock / candidates / master delay ===== */
 function parseShortDetailClock(shortDetail="") {
   const s = String(shortDetail).trim().toUpperCase();
   if (/HALF/.test(s) || /HALFTIME/.test(s)) return { quarter: 2, min: 0, sec: 0, halftime: true };
@@ -371,21 +364,8 @@ function parseShortDetailClock(shortDetail="") {
   if (!m) return null;
   return { quarter: Number(m[1]), min: Number(m[2]), sec: Number(m[3]) };
 }
-function minutesAfterKickoff(evt) {
-  const kickoff = new Date(evt.date).getTime();
-  const now = Date.now();
-  return (now - kickoff) / 60000;
-}
 function clampRecheck(mins) {
   return Math.max(MIN_RECHECK_MIN, Math.min(MAX_RECHECK_MIN, Math.ceil(mins)));
-}
-function kickoff65CandidateMinutes(evt, rowValues, hmap) {
-  const halfScore = (rowValues?.[hmap["half score"]] || "").toString().trim();
-  if (halfScore) return null; // halftime already captured
-  const mins = minutesAfterKickoff(evt);
-  if (mins < 60 || mins > 80) return null;
-  const remaining = 65 - mins;
-  return clampRecheck(remaining <= 0 ? MIN_RECHECK_MIN : remaining);
 }
 function q2AdaptiveCandidateMinutes(evt) {
   const short = (evt.status?.type?.shortDetail || "").trim();
@@ -525,12 +505,8 @@ async function applyCenterFormatting(sheets) {
   rows.forEach((r, i) => {
     const rowNum = i + 2;
     const gid = hGameId != null ? (r[hGameId] || "").toString().trim() : "";
-    if (gid) {
-      keyToRowNum.set(`id:${gid}`, rowNum);
-    } else {
-      const k = keyOf(r[hmap["date"]], r[hmap["matchup"]]);
-      keyToRowNum.set(k, rowNum);
-    }
+    if (gid) keyToRowNum.set(`id:${gid}`, rowNum);
+    else keyToRowNum.set(keyOf(r[hmap["date"]], r[hmap["matchup"]]), rowNum);
   });
 
   // Apply centering (A..P)
@@ -548,6 +524,11 @@ async function applyCenterFormatting(sheets) {
     sbByDate.set(d, sb);
     events = events.concat(sb?.events || []);
   }
+  // Optional: only selected games
+  if (Array.isArray(GAME_IDS) && GAME_IDS.length) {
+    events = events.filter(e => GAME_IDS.includes(String(e.id)));
+  }
+
   const seen = new Set(); events = events.filter(e => !seen.has(e.id) && seen.add(e.id));
   log(`Events found: ${events.length}`);
 
@@ -626,7 +607,7 @@ async function applyCenterFormatting(sheets) {
       continue;
     }
 
-    // Live status clock (e.g., "Q2 5:32")
+    // Live status clock
     if ((/IN_PROGRESS|LIVE/i).test(statusName) && hmap["status"] !== undefined) {
       batch.add(rowNum, hmap["status"], statusShort || "In Progress");
     }
@@ -665,20 +646,15 @@ async function applyCenterFormatting(sheets) {
       }
     }
 
-    // Collect adaptive candidate delays
-    if (ADAPTIVE_HALFTIME) {
-      const kickCand = kickoff65CandidateMinutes(ev, currentRow, hmap);
-      if (kickCand != null) masterDelayMin = masterDelayMin == null ? kickCand : Math.min(masterDelayMin, kickCand);
-
-      const q2Cand = q2AdaptiveCandidateMinutes(ev);
-      if (q2Cand != null) masterDelayMin = masterDelayMin == null ? q2Cand : Math.min(masterDelayMin, q2Cand);
-    }
+    // Adaptive recheck candidate (Q2 under 10:00 → 2x minutes remaining)
+    const q2Cand = q2AdaptiveCandidateMinutes(ev);
+    if (q2Cand != null) masterDelayMin = masterDelayMin == null ? q2Cand : Math.min(masterDelayMin, q2Cand);
   }
 
   await batch.flush(sheets);
 
   // ===== Single master sleep (if any) and one more halftime pass
-  if (ADAPTIVE_HALFTIME && masterDelayMin != null) {
+  if (ADAPTIVE_HALFTIME === "1" && masterDelayMin != null) {
     const ms = Math.ceil(masterDelayMin * 60 * 1000);
     log(`⏳ Adaptive master wait: ${masterDelayMin} minute(s).`);
     await new Promise(r => setTimeout(r, ms));
@@ -688,6 +664,9 @@ async function applyCenterFormatting(sheets) {
     for (const d of datesList) {
       const sb2 = await fetchJson(scoreboardUrl(LEAGUE, d));
       events2 = events2.concat(sb2?.events || []);
+    }
+    if (Array.isArray(GAME_IDS) && GAME_IDS.length) {
+      events2 = events2.filter(e => GAME_IDS.includes(String(e.id)));
     }
     const seen2 = new Set(); events2 = events2.filter(e => !seen2.has(e.id) && seen2.add(e.id));
 
