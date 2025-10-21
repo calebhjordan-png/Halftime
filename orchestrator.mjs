@@ -16,11 +16,12 @@ const GHA_JSON_MODE = process.argv.includes("--gha") || String(process.env.GHA_J
 const MIN_RECHECK_MIN = 2;
 const MAX_RECHECK_MIN = 20;
 
-/** Column names — includes Game ID in col A */
+/** Column names — includes Game ID in col A (labels updated per request) */
 const COLS = [
   "Game ID", "Date","Week","Status","Matchup","Final Score",
-  "Away Spread","Away ML","Home Spread","Home ML","Total",
-  "Half Score","Live Away Spread","Live Away ML","Live Home Spread","Live Home ML","Live Total"
+  "A Spread","A ML","H Spread","H ML","Total",
+  "Score",                   // was "Half Score"
+  "Half A Spread","Half A ML","Half H Spread","Half H ML","Half Total" // was "Live …"
 ];
 
 /** ===== Helpers ===== */
@@ -180,22 +181,48 @@ function pregameRowFactory(sbForDay){
     const finalScore=isFinal?`${away?.score??""}-${home?.score??""}`:"";
 
     const o0=pickOdds(comp.odds||event.odds||[]); let awaySpread="",homeSpread="",total="",awayML="",homeML="";
+    let favorite = null; // 'away'|'home'|null
+
     if(o0){
       total=(o0.overUnder??o0.total)??"";
       const favId=String(o0.favorite||o0.favoriteTeamId||"");
       const spread=Number.isFinite(o0.spread)?o0.spread:(typeof o0.spread==="string"?parseFloat(o0.spread):NaN);
       if(!Number.isNaN(spread)&&favId){
-        if(String(away?.team?.id||"")===favId){awaySpread=`-${Math.abs(spread)}`; homeSpread=`+${Math.abs(spread)}`;}
-        else if(String(home?.team?.id||"")===favId){homeSpread=`-${Math.abs(spread)}`; awaySpread=`+${Math.abs(spread)}`;}
+        if(String(away?.team?.id||"")===favId){favorite="away"; awaySpread=`-${Math.abs(spread)}`; homeSpread=`+${Math.abs(spread)}`;}
+        else if(String(home?.team?.id||"")===favId){favorite="home"; homeSpread=`-${Math.abs(spread)}`; awaySpread=`+${Math.abs(spread)}`;}
       } else if (o0.details){
         const m=o0.details.match(/([+-]?\d+(\.\d+)?)/);
-        if(m){const line=parseFloat(m[1]); awaySpread=line>0?`+${Math.abs(line)}`:`${line}`; homeSpread=line>0?`-${Math.abs(line)}`:`+${Math.abs(line)}`;}
+        if(m){const line=parseFloat(m[1]);
+          // Determine favorite by which side takes the minus
+          if(line<0){ favorite="away"; awaySpread = `${line}`; homeSpread = `+${Math.abs(line)}`; }
+          else if(line>0){ favorite="home"; homeSpread = `-${Math.abs(line)}`; awaySpread = `+${Math.abs(line)}`; }
+        }
       }
       const ml=await extractMLWithFallback(event,o0,away,home);
       awayML=ml.awayML||""; homeML=ml.homeML||"";
+
+      // If favorite still unknown, infer from moneyline (more negative)
+      if(!favorite && awayML && homeML){
+        const a = parseInt(String(awayML),10), h = parseInt(String(homeML),10);
+        if(Number.isFinite(a)&&Number.isFinite(h)){
+          if(a<0 && h>=0) favorite="away";
+          else if(h<0 && a>=0) favorite="home";
+          else if(Math.abs(a) > Math.abs(h)) favorite="away";
+          else if(Math.abs(h) > Math.abs(a)) favorite="home";
+        }
+      }
     } else {
       const ml=await extractMLWithFallback(event,{},away,home);
       awayML=ml.awayML||""; homeML=ml.homeML||"";
+      if(awayML && homeML){
+        const a = parseInt(String(awayML),10), h = parseInt(String(homeML),10);
+        if(Number.isFinite(a)&&Number.isFinite(h)){
+          if(a<0 && h>=0) favorite="away";
+          else if(h<0 && a>=0) favorite="home";
+          else if(Math.abs(a) > Math.abs(h)) favorite="away";
+          else if(Math.abs(h) > Math.abs(a)) favorite="home";
+        }
+      }
     }
 
     const weekText=(normLeague(LEAGUE)==="nfl")?resolveWeekLabelNFL(sbForDay,event.date):resolveWeekLabelCFB(sbForDay,event.date);
@@ -209,17 +236,22 @@ function pregameRowFactory(sbForDay){
         dateET,                // Date
         weekText || "",        // Week
         statusClean,           // Status
-        matchup,               // Matchup
+        matchup,               // Matchup (rich text written later to underline/bolt)
         finalScore,            // Final Score
-        awaySpread || "",      // Away Spread
-        String(awayML || ""),  // Away ML
-        homeSpread || "",      // Home Spread
-        String(homeML || ""),  // Home ML
+        awaySpread || "",      // A Spread
+        String(awayML || ""),  // A ML
+        homeSpread || "",      // H Spread
+        String(homeML || ""),  // H ML
         String(total || ""),   // Total
-        "", "", "", "", "", "" // live cols
+        "", "", "", "", "", "" // Half cols
       ],
       dateET,
-      matchup
+      matchup,
+      meta: {
+        awayName, homeName, favorite, isFinal,
+        awayFinal: Number(away?.score ?? NaN),
+        homeFinal: Number(home?.score ?? NaN),
+      }
     };
   };
 }
@@ -238,7 +270,7 @@ function parseShortDetailClock(s=""){ s=String(s).trim().toUpperCase();
 }
 function minutesAfterKickoff(evt){ return (Date.now()-new Date(evt.date).getTime())/60000; }
 function clampRecheck(mins){ return Math.max(MIN_RECHECK_MIN, Math.min(MAX_RECHECK_MIN, Math.ceil(mins))); }
-function kickoff65CandidateMinutes(evt,row,h){ const half=(row?.[h["half score"]]||"").toString().trim(); if(half) return null; const m=minutesAfterKickoff(evt); if(m<60||m>80) return null; const rem=65-m; return clampRecheck(rem<=0?MIN_RECHECK_MIN:rem); }
+function kickoff65CandidateMinutes(evt,row,h){ const half=(row?.[h["score"]]||"").toString().trim(); if(half) return null; const m=minutesAfterKickoff(evt); if(m<60||m>80) return null; const rem=65-m; return clampRecheck(rem<=0?MIN_RECHECK_MIN:rem); }
 function q2AdaptiveCandidateMinutes(evt){ const p=parseShortDetailClock((evt.status?.type?.shortDetail||"").trim()); if(!p||p.final||p.halftime) return null; if(p.quarter!==2) return null; const left=p.min+p.sec/60; if(left>=10) return null; return clampRecheck(2*left); }
 
 /** Live odds scrape (one-time at halftime) */
@@ -281,15 +313,91 @@ class BatchWriter{
   async flush(sheets){ if(!this.acc.length) return; await sheets.spreadsheets.values.batchUpdate({ spreadsheetId:SHEET_ID, requestBody:{valueInputOption:"RAW", data:this.acc}}); log(`Batched ${this.acc.length} cell update(s).`); this.acc=[]; }
 }
 
-/** Center-align A..Q (17 cols) */
+/** Center-align A..Q (17 cols) + add conditional rules for H Spread (col I) */
 async function applyCenterFormatting(sheets){
   const meta=await sheets.spreadsheets.get({spreadsheetId:SHEET_ID});
-  const sheetId=(meta.data.sheets||[]).find(s=>s.properties?.title===TAB_NAME)?.properties?.sheetId;
-  if(sheetId==null) return;
+  const sheet = (meta.data.sheets||[]).find(s=>s.properties?.title===TAB_NAME);
+  const sheetId = sheet?.properties?.sheetId;
+  if(sheetId==null) return null;
+
+  const reqs = [];
+
+  // center A..Q
+  reqs.push({
+    repeatCell:{
+      range:{sheetId,startRowIndex:0,startColumnIndex:0,endColumnIndex:17},
+      cell:{userEnteredFormat:{horizontalAlignment:"CENTER"}},
+      fields:"userEnteredFormat.horizontalAlignment"
+    }
+  });
+
+  // Conditional formatting for H Spread (column I index = 8)
+  const rangeI = { sheetId, startRowIndex:1, startColumnIndex:8, endColumnIndex:9 };
+  reqs.push(
+    {
+      addConditionalFormatRule:{
+        index:0,
+        rule:{
+          ranges:[rangeI],
+          booleanRule:{
+            condition:{type:"NUMBER_GREATER", values:[{userEnteredValue:"0"}]},
+            format:{ backgroundColor:{ red:1, green:0.85, blue:0.85 } }
+          }
+        }
+      }
+    },
+    {
+      addConditionalFormatRule:{
+        index:0,
+        rule:{
+          ranges:[rangeI],
+          booleanRule:{
+            condition:{type:"NUMBER_LESS", values:[{userEnteredValue:"0"}]},
+            format:{ backgroundColor:{ red:0.85, green:1, blue:0.85 } }
+          }
+        }
+      }
+    }
+  );
+
   await sheets.spreadsheets.batchUpdate({
     spreadsheetId:SHEET_ID,
-    requestBody:{requests:[{repeatCell:{range:{sheetId,startRowIndex:0,startColumnIndex:0,endColumnIndex:17},cell:{userEnteredFormat:{horizontalAlignment:"CENTER"}},fields:"userEnteredFormat.horizontalAlignment"}}]}
+    requestBody:{ requests:reqs }
   });
+
+  return sheetId;
+}
+
+/** Rich text builder for Matchup cell */
+function buildMatchupRichText({ awayName, homeName, favorite, isFinal, awayFinal, homeFinal }) {
+  const winner =
+    isFinal && Number.isFinite(awayFinal) && Number.isFinite(homeFinal)
+      ? (awayFinal > homeFinal ? "away" : awayFinal < homeFinal ? "home" : null)
+      : null;
+
+  const fullText = `${awayName} @ ${homeName}`;
+  const awayStart = 0;
+  const awayEnd   = awayName.length;
+  const homeStart = awayEnd + 3; // " @ "
+  const homeEnd   = homeStart + homeName.length;
+
+  const runs = [
+    {
+      startIndex: awayStart,
+      format: {
+        underline: favorite === "away" || undefined,
+        bold:      winner   === "away" || undefined,
+      }
+    },
+    {
+      startIndex: homeStart,
+      format: {
+        underline: favorite === "home" || undefined,
+        bold:      winner   === "home" || undefined,
+      }
+    }
+  ];
+  return { fullText, runs };
 }
 
 /** ===== MAIN ===== */
@@ -326,7 +434,7 @@ async function applyCenterFormatting(sheets){
     if(key) keyToRowNum.set(key, i+2);
   });
 
-  await applyCenterFormatting(sheets);
+  const sheetId = await applyCenterFormatting(sheets);
 
   // Pull events (today or week)
   const datesList = RUN_SCOPE==="week"
@@ -340,14 +448,17 @@ async function applyCenterFormatting(sheets){
 
   const buildPregame=pregameRowFactory(firstDaySB);
   let appendBatch=[];
+  const matchupFormatQueue = []; // collect rich text updates
 
   // Append pregame rows only for events not present by **Game ID**
   for(const ev of events){
-    const {values:rowVals, dateET, matchup}=await buildPregame(ev);
+    const pr=await buildPregame(ev);
+    const {values:rowVals, dateET, matchup, meta} = pr;
     const {key}=keyForEvent(ev, dateET, matchup);
     if(!keyToRowNum.has(key)){
       appendBatch.push(rowVals);
     }
+    // We'll format the matchup for all (existing and new) after index refresh
   }
   if(appendBatch.length){
     await sheets.spreadsheets.values.append({spreadsheetId:SHEET_ID, range:`${TAB_NAME}!A1`, valueInputOption:"RAW", requestBody:{values:appendBatch}});
@@ -358,9 +469,10 @@ async function applyCenterFormatting(sheets){
     log(`Appended ${appendBatch.length} pregame row(s).`);
   }
 
-  // Pass 1: finals/halftime + collect adaptive delay
+  // Pass 1: finals/halftime + collect adaptive delay + collect matchup formatting
   const batch=new BatchWriter(TAB_NAME);
   let masterDelayMin=null;
+  const formatRequests = []; // Sheets API requests for rich text
 
   for(const ev of events){
     const comp=ev.competitions?.[0]||{};
@@ -375,8 +487,44 @@ async function applyCenterFormatting(sheets){
     const rowNum=keyToRowNum.get(key);
     if(!rowNum) continue;
 
+    // Compute formatting meta (favorite + winner when final)
+    let favorite = null;
+    const o0 = pickOdds(comp.odds||ev.odds||[]);
+    const favId = String(o0?.favorite||o0?.favoriteTeamId||"");
+    if(favId){
+      if(String(away?.team?.id||"")===favId) favorite="away";
+      else if(String(home?.team?.id||"")===favId) favorite="home";
+    } else {
+      // fall back to moneyline comparison
+      const ml = await extractMLWithFallback(ev, o0, away, home);
+      const a = parseInt(String(ml.awayML||""),10), h = parseInt(String(ml.homeML||""),10);
+      if(Number.isFinite(a)&&Number.isFinite(h)){
+        if(a<0 && h>=0) favorite="away";
+        else if(h<0 && a>=0) favorite="home";
+        else if(Math.abs(a) > Math.abs(h)) favorite="away";
+        else if(Math.abs(h) > Math.abs(a)) favorite="home";
+      }
+    }
     const statusName=(ev.status?.type?.name||comp.status?.type?.name||"").toUpperCase();
     const scorePair=`${away?.score??""}-${home?.score??""}`;
+    const isFinalGame = statusName.includes("FINAL");
+
+    // queue rich text formatting for Matchup (column E index 4)
+    if(sheetId!=null){
+      const { fullText, runs } = buildMatchupRichText({
+        awayName, homeName, favorite,
+        isFinal: isFinalGame,
+        awayFinal: Number(away?.score ?? NaN),
+        homeFinal: Number(home?.score ?? NaN)
+      });
+      formatRequests.push({
+        updateCells: {
+          range: { sheetId, startRowIndex: rowNum-1, endRowIndex: rowNum, startColumnIndex: 4, endColumnIndex: 5 },
+          rows: [{ values: [{ userEnteredValue: { stringValue: fullText }, textFormatRuns: runs }] }],
+          fields: "userEnteredValue,textFormatRuns"
+        }
+      });
+    }
 
     if(statusName.includes("FINAL")){
       if(hmap["final score"]!==undefined) batch.add(rowNum, hmap["final score"], scorePair);
@@ -385,17 +533,17 @@ async function applyCenterFormatting(sheets){
     }
 
     const currentRow=(values[rowNum-1]||[]);
-    const halfAlready=(currentRow[hmap["half score"]]||"").toString().trim();
-    const liveTotalVal=(currentRow[hmap["live total"]]||"").toString().trim();
+    const halfAlready=(currentRow[hmap["score"]]||"").toString().trim();
+    const liveTotalVal=(currentRow[hmap["half total"]]||"").toString().trim();
 
     if(isHalftimeLike(ev)&&!liveTotalVal&&!halfAlready){
       const live=await scrapeLiveOddsOnce(LEAGUE, ev.id);
       if(live){
         const {liveAwaySpread, liveHomeSpread, liveTotal, liveAwayML, liveHomeML, halfScore}=live;
         const payload=[]; const add=(name,val)=>{const idx=hmap[name]; if(idx===undefined||!val) return; const range=`${TAB_NAME}!${colLetter(idx)}${rowNum}:${colLetter(idx)}${rowNum}`; payload.push({range, values:[[val]]});};
-        add("status","Half"); if(halfScore) add("half score", halfScore);
-        add("live away spread", liveAwaySpread); add("live home spread", liveHomeSpread);
-        add("live away ml", liveAwayML); add("live home ml", liveHomeML); add("live total", liveTotal);
+        add("status","Half"); if(halfScore) add("score", halfScore);
+        add("half a spread", liveAwaySpread); add("half h spread", liveHomeSpread);
+        add("half a ml", liveAwayML); add("half h ml", liveHomeML); add("half total", liveTotal);
         if(payload.length){ await sheets.spreadsheets.values.batchUpdate({spreadsheetId:SHEET_ID, requestBody:{valueInputOption:"RAW", data:payload}}); }
         log(`Halftime LIVE written for ${matchup}`);
         continue;
@@ -416,6 +564,14 @@ async function applyCenterFormatting(sheets){
     }
   }
   await batch.flush(sheets);
+
+  // Apply rich text formatting in one go
+  if(formatRequests.length){
+    await sheets.spreadsheets.batchUpdate({
+      spreadsheetId: SHEET_ID,
+      requestBody: { requests: formatRequests }
+    });
+  }
 
   // Single master wait & one more halftime pass
   if(ADAPTIVE_HALFTIME && masterDelayMin!=null){
@@ -447,17 +603,17 @@ async function applyCenterFormatting(sheets){
       const headerNow=(snap.data.values||[])[0]||header;
       const hmapNow=mapHeadersToIndex(headerNow);
       const cur=rowsNow[rowNum-2]||[];
-      const halfAlready=(cur[hmapNow["half score"]]||"").toString().trim();
-      const liveTotalVal=(cur[hmapNow["live total"]]||"").toString().trim();
+      const halfAlready=(cur[hmapNow["score"]]||"").toString().trim();
+      const liveTotalVal=(cur[hmapNow["half total"]]||"").toString().trim();
       if(halfAlready||liveTotalVal) continue;
 
       const live=await scrapeLiveOddsOnce(LEAGUE, ev.id);
       if(live){
         const {liveAwaySpread, liveHomeSpread, liveTotal, liveAwayML, liveHomeML, halfScore}=live;
         const payload=[]; const add=(name,val)=>{const idx=hmapNow[name]; if(idx===undefined||!val) return; const range=`${TAB_NAME}!${colLetter(idx)}${rowNum}:${colLetter(idx)}${rowNum}`; payload.push({range, values:[[val]]});};
-        add("status","Half"); if(halfScore) add("half score", halfScore);
-        add("live away spread", liveAwaySpread); add("live home spread", liveHomeSpread);
-        add("live away ml", liveAwayML); add("live home ml", liveHomeML); add("live total", liveTotal);
+        add("status","Half"); if(halfScore) add("score", halfScore);
+        add("half a spread", liveAwaySpread); add("half h spread", liveHomeSpread);
+        add("half a ml", liveAwayML); add("half h ml", liveHomeML); add("half total", liveTotal);
         if(payload.length){ await sheets.spreadsheets.values.batchUpdate({spreadsheetId:SHEET_ID, requestBody:{valueInputOption:"RAW", data:payload}}); }
         log(`(Adaptive) Halftime LIVE written for ${matchup}`);
       }
@@ -468,7 +624,7 @@ async function applyCenterFormatting(sheets){
 
   if(GHA_JSON_MODE){
     const payload={ ok:true, league:normLeague(LEAGUE), scope:RUN_SCOPE, tab:TAB_NAME };
-    process.stdout.write(JSON.stringify(payload)+"\n");
+    process.stdout.write(JSON.stringify(payload)+"n");
   }
 })().catch(err=>{
   if(GHA_JSON_MODE){ process.stdout.write(JSON.stringify({ok:false,error:String(err?.message||err)})+"\n"); }
