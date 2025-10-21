@@ -331,15 +331,13 @@ function reconcileHeaderRow(header){
   rename("Live Home ML","Half H ML");
   rename("Live Total","Half Total");
 
-  // If header is empty, seed with COLS
   if(renamed.length===0) return COLS.slice();
 
-  // Ensure we have the exact final set/ordering
+  // Normalize ordering to COLS
   const out = COLS.slice();
-  const hmap = mapHeadersToIndex(renamed);
+  const lower = renamed.map(x=>x.toLowerCase());
   COLS.forEach((label, idx)=>{
-    // if target label exists somewhere in current, use it, else keep target label
-    const j = renamed.findIndex(h=>map(h)===label.toLowerCase());
+    const j = lower.indexOf(label.toLowerCase());
     out[idx] = j>=0 ? renamed[j] : label;
   });
   return out;
@@ -363,9 +361,9 @@ async function applyCenterAndCF(sheets){
     }
   });
 
-  // Conditional formatting for I (H Spread): >0 red shade; <0 green shade, but only if Final Score (F) not blank
-  const firstDataRow = 2; // row 2 (index 1)
-  const addCF = (type, color, cmpExpr) => reqs.push({
+  // Conditional formatting for I (H Spread): only when Final Score (F) present
+  const firstDataRow = 2;
+  const addCF = (expr, color) => reqs.push({
     addConditionalFormatRule:{
       index:0,
       rule:{
@@ -373,16 +371,15 @@ async function applyCenterAndCF(sheets){
         booleanRule:{
           condition:{
             type:"CUSTOM_FORMULA",
-            values:[{userEnteredValue: `=AND($F${firstDataRow}<>\"\", ${cmpExpr})`}]
+            values:[{userEnteredValue: `=AND($F2<>"", ${expr})`}]
           },
           format:{ backgroundColor: color }
         }
       }
     }
   });
-  // I row-relative in custom formula: use INDIRECT to keep row-relative: IROW()
-  addCF("gt",{red:1,green:0.85,blue:0.85}, "INDIRECT(\"I\"&ROW())>0");
-  addCF("lt",{red:0.85,green:1,blue:0.85},   "INDIRECT(\"I\"&ROW())<0");
+  addCF("I2>0", {red:1,green:0.85,blue:0.85});
+  addCF("I2<0", {red:0.85,green:1,blue:0.85});
 
   await sheets.spreadsheets.batchUpdate({
     spreadsheetId:SHEET_ID,
@@ -392,20 +389,23 @@ async function applyCenterAndCF(sheets){
   return sheetId;
 }
 
-/** Rich text for Matchup with explicit reset runs */
+/** Rich text for Matchup — exactly two runs, indices strictly increasing */
 function matchupRuns(fullText, awayName, homeName, favorite, winner){
-  const awayStart=0;
-  const awayEnd  =awayName.length;
-  const homeStart=awayEnd+3; // " @ "
-  const homeEnd  =homeStart+homeName.length;
-  const endIndex =fullText.length;
+  const awayFmt = { underline: favorite==='away'||false, bold: winner==='away'||false };
+  const homeFmt = { underline: favorite==='home'||false, bold: winner==='home'||false };
 
-  return [
-    { startIndex: 0,         format: { underline:false, bold:false } },                    // reset
-    { startIndex: awayStart, format: { underline: favorite==='away'||false, bold: winner==='away'||false } },
-    { startIndex: homeStart, format: { underline: favorite==='home'||false, bold: winner==='home'||false } },
-    { startIndex: endIndex,  format: { underline:false, bold:false } }                    // reset after
-  ];
+  const awayStart = 0;
+  const homeStart = awayName.length + 3; // " @ "
+  const len = fullText.length;
+
+  const runs = [];
+  // away segment (always at 0)
+  runs.push({ startIndex: awayStart, format: awayFmt });
+  // home segment (must be < len and > 0)
+  if (homeStart > 0 && homeStart < len) {
+    runs.push({ startIndex: homeStart, format: homeFmt });
+  }
+  return runs;
 }
 
 /** ===== MAIN ===== */
@@ -431,7 +431,6 @@ function matchupRuns(fullText, awayName, homeName, favorite, winner){
   let header=reconcileHeaderRow(headerOrig);
 
   if(headerOrig.join("|||") !== header.join("|||")){
-    // write reconciled header
     await sheets.spreadsheets.values.update({
       spreadsheetId:SHEET_ID,
       range:`${TAB_NAME}!A1`,
@@ -463,7 +462,7 @@ function matchupRuns(fullText, awayName, homeName, favorite, winner){
 
   const buildPregame=pregameRowFactory(firstDaySB);
   let appendBatch=[];
-  const formatRequests = []; // rich text changes for Matchup
+  const formatRequests = [];
 
   // Append pregame rows for new events
   for(const ev of events){
@@ -483,7 +482,7 @@ function matchupRuns(fullText, awayName, homeName, favorite, winner){
     log(`Appended ${appendBatch.length} pregame row(s).`);
   }
 
-  // Pass 1: finals/halftime + collect adaptive delay + queue matchup formatting
+  // Finals/format pass
   const batch=new BatchWriter(TAB_NAME);
   let masterDelayMin=null;
 
@@ -500,16 +499,16 @@ function matchupRuns(fullText, awayName, homeName, favorite, winner){
     const rowNum=keyToRowNum.get(key);
     if(!rowNum) continue;
 
-    // compute favorite (pregame) for underline
-    let favorite = null;
-    const o0 = pickOdds(comp.odds||ev.odds||[]);
-    const favId = String(o0?.favorite||o0?.favoriteTeamId||"");
+    // who’s favorite (for underline)
+    let favorite=null;
+    const o0=pickOdds(comp.odds||ev.odds||[]);
+    const favId=String(o0?.favorite||o0?.favoriteTeamId||"");
     if(favId){
       if(String(away?.team?.id||"")===favId) favorite="away";
       else if(String(home?.team?.id||"")===favId) favorite="home";
     } else {
-      const ml = await extractMLWithFallback(ev, o0, away, home);
-      const a = parseInt(String(ml.awayML||""),10), h = parseInt(String(ml.homeML||""),10);
+      const ml=await extractMLWithFallback(ev, o0, away, home);
+      const a=parseInt(String(ml.awayML||""),10), h=parseInt(String(ml.homeML||""),10);
       if(Number.isFinite(a)&&Number.isFinite(h)){
         if(a<0 && h>=0) favorite="away";
         else if(h<0 && a>=0) favorite="home";
@@ -522,7 +521,7 @@ function matchupRuns(fullText, awayName, homeName, favorite, winner){
     const isFinalGame = statusName.includes("FINAL");
     const scorePair=`${away?.score??""}-${home?.score??""}`;
 
-    // queue rich text formatting (underline favorite; bold winner if final)
+    // rich text: underline favorite, bold winner if final
     if(sheetId!=null){
       const winner = isFinalGame
         ? (Number(away?.score)>Number(home?.score) ? "away"
@@ -545,7 +544,7 @@ function matchupRuns(fullText, awayName, homeName, favorite, winner){
       continue;
     }
 
-    // halftime write handled by live script (not changing here)
+    // (Adaptive halftime scheduling left as-is; not shown)
     if(ADAPTIVE_HALFTIME){
       const short=(ev.status?.type?.shortDetail||"").trim();
       const parsed=parseShortDetailClock(short);
@@ -562,15 +561,12 @@ function matchupRuns(fullText, awayName, homeName, favorite, winner){
   }
   await batch.flush(sheets);
 
-  // Apply all matchup formatting
   if(formatRequests.length){
     await sheets.spreadsheets.batchUpdate({
       spreadsheetId: SHEET_ID,
       requestBody: { requests: formatRequests }
     });
   }
-
-  // Optional adaptive halftime pass unchanged (omitted for brevity)
 
   log("Run complete.");
 
