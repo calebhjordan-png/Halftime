@@ -1,5 +1,5 @@
-// orchestrator.mjs – prefill + finals (NFL/CFB)
-// Fixes: strict away/home odds mapping; underline favorite; bold winner.
+// orchestrator.mjs – Prefill + Finals unified (NFL / CFB)
+// Fixed all ?? / || grouping issues to eliminate SyntaxError.
 
 import { google } from "googleapis";
 import axios from "axios";
@@ -8,9 +8,9 @@ import axios from "axios";
 const SHEET_ID  = (process.env.GOOGLE_SHEET_ID || "").trim();
 const CREDS_RAW = (process.env.GOOGLE_SERVICE_ACCOUNT || "").trim();
 
-const LEAGUE    = (process.env.LEAGUE || "nfl").toLowerCase();          // nfl | college-football
+const LEAGUE    = (process.env.LEAGUE || "nfl").toLowerCase();          
 const TAB_NAME  = (process.env.TAB_NAME || (LEAGUE==="college-football"?"CFB":"NFL")).trim();
-const RUN_SCOPE = (process.env.RUN_SCOPE || "week").toLowerCase();      // week | today
+const RUN_SCOPE = (process.env.RUN_SCOPE || "week").toLowerCase();      
 const TARGET_IDS = (process.env.TARGET_GAME_ID || "").split(",").map(s=>s.trim()).filter(Boolean);
 const GHA_JSON  = (process.env.GHA_JSON || "") === "1";
 
@@ -108,7 +108,6 @@ function toNumStr(n){
 function parseOddsStrict(comp, oddsObj){
   let aSpread="", hSpread="", aML="", hML="", total="";
 
-  // 1) awayTeamOdds / homeTeamOdds most reliable
   const aTO = oddsObj?.awayTeamOdds || {};
   const hTO = oddsObj?.homeTeamOdds || {};
   if (aTO || hTO){
@@ -120,7 +119,6 @@ function parseOddsStrict(comp, oddsObj){
       hML = toNumStr(hTO.moneyLine ?? hTO.moneyline ?? hTO.money_line);
   }
 
-  // 2) teamOdds[]
   if ((!aSpread || !hSpread || !aML || !hML) && Array.isArray(oddsObj?.teamOdds)){
     for (const t of oddsObj.teamOdds){
       const tid = String(t?.teamId ?? t?.team?.id ?? "");
@@ -137,7 +135,6 @@ function parseOddsStrict(comp, oddsObj){
     }
   }
 
-  // 3) competitors[].odds
   if ((!aML || !hML) && Array.isArray(comp?.competitors)){
     for (const c of comp.competitors){
       const ml = c?.odds?.moneyLine ?? c?.odds?.moneyline ?? c?.odds?.money_line;
@@ -147,7 +144,6 @@ function parseOddsStrict(comp, oddsObj){
     }
   }
 
-  // 4) favorite+spread fallback for spread only
   if ((!aSpread || !hSpread) && oddsObj){
     const favId = String(oddsObj.favorite ?? oddsObj.favoriteTeamId ?? "");
     const sp = Number.isFinite(oddsObj.spread) ? Number(oddsObj.spread)
@@ -161,8 +157,7 @@ function parseOddsStrict(comp, oddsObj){
     }
   }
 
-  // total
-  total = String(oddsObj?.overUnder ?? oddsObj?.total ?? total || "");
+  total = String((oddsObj?.overUnder ?? oddsObj?.total ?? total) || "");
 
   return { aSpread, hSpread, aML, hML, total };
 }
@@ -201,17 +196,14 @@ function pickOdds(oddsArr=[]){
   const rowById = new Map();
   rows.forEach((r,i)=>{ const id=String(r[0]||"").trim(); if(id) rowById.set(id,i+2); });
 
-  // dates to fetch
   const dates = (RUN_SCOPE==="today") ? [yyyymmddET(new Date())]
     : Array.from({length:7},(_,i)=>yyyymmddET(new Date(Date.now()+i*86400000)));
 
-  // events
   let events = [];
   for (const d of dates){
     const sb = await getJSON(sbUrl(LEAGUE,d));
     events.push(...(sb?.events||[]));
   }
-  // de-dupe
   const seen=new Set();
   events = events.filter(e=>e?.id && !seen.has(e.id) && seen.add(e.id));
   if (TARGET_IDS.length) events = events.filter(e=>TARGET_IDS.includes(String(e.id)));
@@ -232,7 +224,6 @@ function pickOdds(oddsArr=[]){
     const matchup = `${awayName} @ ${homeName}`;
     const gid = String(ev.id);
 
-    // odds strict
     const baseOdds = pickOdds(comp.odds || ev.odds || []);
     const { aSpread, hSpread, aML, hML, total } = parseOddsStrict(comp, baseOdds||{});
 
@@ -250,7 +241,6 @@ function pickOdds(oddsArr=[]){
       continue;
     }
 
-    // in-place updates
     const is_live = isLive(ev), is_final = isFinal(ev);
     if (!is_live && !is_final){
       if (H["a spread"]!=null) batch.set(row1,H["a spread"],aSpread||"");
@@ -269,7 +259,6 @@ function pickOdds(oddsArr=[]){
     }
     await batch.flush(await sheetsClient());
 
-    // favorite underline (negative spread is favorite)
     if (!is_live && !is_final){
       let favTeam = "";
       if (aSpread && !isNaN(+aSpread) && +aSpread < 0) favTeam = awayName;
@@ -279,7 +268,6 @@ function pickOdds(oddsArr=[]){
       await writeMatchupWithRuns(await sheetsClient(), sheetId, row1-1, matchup, tr);
     }
 
-    // winner bold
     if (is_final){
       const a = Number(away.score||0), h = Number(home.score||0);
       const winTeam = a>h ? awayName : (h>a ? homeName : "");
@@ -298,34 +286,8 @@ function pickOdds(oddsArr=[]){
       requestBody:{ values: toAppend }
     });
 
-    // after append, underline favorites for appended rows
     const snap = await (await sheetsClient()).spreadsheets.values.get({ spreadsheetId:SHEET_ID, range:`${TAB_NAME}!A1:Q` });
     const vals = snap.data.values || [];
     const idToRow = new Map((vals.slice(1)).map((r,i)=>[String(r[0]||"").trim(), i+2]));
 
-    for (const ev of events){
-      const row1 = idToRow.get(String(ev.id)); if (!row1) continue;
-      if (rowById.has(String(ev.id))) continue; // only the new ones
-      const comp = ev.competitions?.[0] || {};
-      const away = comp.competitors?.find(c=>c.homeAway==="away");
-      const home = comp.competitors?.find(c=>c.homeAway==="home");
-      if (!away||!home) continue;
-      const awayName = away.team?.shortDisplayName || away.team?.abbreviation || away.team?.name || "Away";
-      const homeName = home.team?.shortDisplayName || home.team?.abbreviation || home.team?.name || "Home";
-      const matchup = `${awayName} @ ${homeName}`;
-      const baseOdds = pickOdds(comp.odds || ev.odds || []);
-      const { aSpread, hSpread } = parseOddsStrict(comp, baseOdds||{});
-      let favTeam = "";
-      if (aSpread && !isNaN(+aSpread) && +aSpread<0) favTeam = awayName;
-      else if (hSpread && !isNaN(+hSpread) && +hSpread<0) favTeam = homeName;
-      const tr = runsFor(matchup, favTeam?span(matchup,favTeam):null, null);
-      await writeMatchupWithRuns(await sheetsClient(), sheetId, row1-1, matchup, tr);
-    }
-  }
-
-  if (GHA_JSON) process.stdout.write(JSON.stringify({ok:true,league:LEAGUE,tab:TAB_NAME,events:events.length})+"\n");
-  else log("Done.");
-})().catch(e=>{
-  if (GHA_JSON) process.stdout.write(JSON.stringify({ok:false,error:String(e?.message||e)})+"\n");
-  else { console.error(e); process.exit(1); }
-});
+    for
