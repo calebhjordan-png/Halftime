@@ -1,0 +1,50 @@
+name: Orchestrator (Prefill + Finals)
+
+on:
+  workflow_dispatch:
+    inputs:
+      league:
+        description: "League"
+        type: choice
+        options: [nfl, college-football]
+        default: nfl
+      scope:
+        description: "Range to fetch"
+        type: choice
+        options: [today, week]
+        default: week
+      target_game_ids:
+        description: "Comma-separated ESPN Game IDs (optional)"
+        required: false
+        default: ""
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install deps
+        run: |
+          if [ -f package.json ]; then
+            npm i --no-audit --no-fund
+          else
+            npm i googleapis playwright axios --no-audit --no-fund
+          fi
+
+      - name: Orchestrate
+        env:
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+          GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
+          LEAGUE: ${{ inputs.league }}
+          TAB_NAME: ${{ inputs.league == 'nfl' && 'NFL' || 'CFB' }}
+          RUN_SCOPE: ${{ inputs.scope }}
+          TARGET_GAME_ID: ${{ inputs.target_game_ids }}
+          GHA_JSON: "1"
+        run: node orchestrator.mjs --gha
