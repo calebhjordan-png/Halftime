@@ -1,91 +1,82 @@
 name: Orchestrator
 
 on:
-  # Manual runs with knobs
   workflow_dispatch:
     inputs:
       league:
-        description: "League to run (nfl | college-football)"
+        description: "League to run"
         type: choice
         required: true
-        default: nfl
-        options: [nfl, college-football]
-      tab_name:
-        description: "Sheet tab (NFL or CFB; leave blank to let script pick)"
+        default: both
+        options: [both, nfl, college-football]
+      game_ids:
+        description: "Optional: one or more ESPN game IDs (comma or space separated)"
         required: false
         default: ""
-      run_scope:
-        description: "Time window (today | week)"
-        type: choice
-        required: true
-        default: today
-        options: [today, week]
-      adaptive_halftime:
-        description: "Enable adaptive halftime (1=yes, 0=no)"
-        required: true
-        default: "1"
 
-  # (Optional) Uncomment to auto-prefill each morning ET and do game-day passes
-  # schedule:
-  #   # Daily prefill at 10:30 ET
-  #   - cron: "30 14 * * *"
-  #   # Game windows: every 15 minutes Fri/Sat/Sun ET
-  #   - cron: "*/15 16-06 * * 5-7"
-
-# Avoid overlapping runs per league
 concurrency:
-  group: orchestrator-${{ github.workflow }}-${{ inputs.league || 'nfl' }}
+  group: orchestrator-${{ github.run_id }} # allow both jobs to run together per dispatch
   cancel-in-progress: false
 
+env:
+  GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+  GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
+  TZ: America/New_York
+  ADAPTIVE_HALFTIME: "1"   # always on
+  GAME_IDS: ${{ inputs.game_ids }}
+
 jobs:
-  run:
+  run-nfl:
+    if: ${{ inputs.league == 'both' || inputs.league == 'nfl' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    env:
-      # Required secrets (add in repo settings → Secrets and variables → Actions)
-      GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
-      GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
-
-      # Optional knobs (script has sane defaults if blank)
-      LEAGUE: ${{ inputs.league }}
-      TAB_NAME: ${{ inputs.tab_name }}
-      RUN_SCOPE: ${{ inputs.run_scope }}
-      ADAPTIVE_HALFTIME: ${{ inputs.adaptive_halftime }}
-
-      # Keep everything consistently in ET (script already formats in ET, this just helps logs)
-      TZ: America/New_York
-
     steps:
-      - name: 🧰 Checkout
-        uses: actions/checkout@v4
-
-      - name: ⚙️ Setup Node
-        uses: actions/setup-node@v4
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
         with:
           node-version: "20"
           cache: "npm"
 
-      - name: 📦 Install dependencies
+      - name: Install dependencies
         run: |
-          npm ci
-          # Install Playwright Chromium and its OS deps for the halftime scrape
+          npm install --no-audit --no-fund
           npx playwright install --with-deps chromium
 
-      - name: 🔎 Show config
+      - name: Decide RUN_SCOPE (ET)
         run: |
-          echo "LEAGUE=${LEAGUE:-nfl}"
-          echo "TAB_NAME=${TAB_NAME:-'(script default)'}"
-          echo "RUN_SCOPE=${RUN_SCOPE:-today}"
-          echo "ADAPTIVE_HALFTIME=${ADAPTIVE_HALFTIME:-1}"
+          # 1=Mon .. 5=Fri 6=Sat 7=Sun
+          dow=$(date +%u)
+          if [ "$dow" -ge 5 ]; then scope=today; else scope=week; fi
+          echo "RUN_SCOPE=$scope" >> "$GITHUB_ENV"
 
-      - name: 🏈 Run orchestrator
+      - name: Run orchestrator (NFL)
+        env:
+          LEAGUE: nfl
         run: node orchestrator.mjs
 
-      # Optional: surface logs/artifacts if you want to debug runs
-      # - name: Upload logs
-      #   if: always()
-      #   uses: actions/upload-artifact@v4
-      #   with:
-      #     name: orchestrator-logs
-      #     path: |
-      #       playwright/. # if you keep traces
+  run-cfb:
+    if: ${{ inputs.league == 'both' || inputs.league == 'college-football' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: |
+          npm install --no-audit --no-fund
+          npx playwright install --with-deps chromium
+
+      - name: Decide RUN_SCOPE (ET)
+        run: |
+          dow=$(date +%u)
+          if [ "$dow" -ge 5 ]; then scope=today; else scope=week; fi
+          echo "RUN_SCOPE=$scope" >> "$GITHUB_ENV"
+
+      - name: Run orchestrator (CFB)
+        env:
+          LEAGUE: college-football
+        run: node orchestrator.mjs
