@@ -7,7 +7,9 @@ const CREDS_RAW = (process.env.GOOGLE_SERVICE_ACCOUNT || "").trim();
 const LEAGUE    = (process.env.LEAGUE || "nfl").toLowerCase();           // nfl | college-football
 const TAB_NAME  = (process.env.TAB_NAME || (LEAGUE === "college-football" ? "CFB" : "NFL")).trim();
 const RUN_SCOPE = (process.env.RUN_SCOPE || "today").toLowerCase();      // today | week
-const ADAPTIVE_HALFTIME = "1"; // always on
+const ADAPTIVE_HALFTIME = "1";                                           // always on
+
+// Optional: limit to specific games (comma/space separated IDs)
 const GAME_IDS = (() => {
   const raw = (process.env.GAME_IDS || "").trim();
   return raw ? raw.split(/[,\s]+/).map(s=>s.trim()).filter(Boolean) : null;
@@ -156,6 +158,23 @@ function normalizeSpread(sp) {
   if (!Number.isFinite(n)) return "";
   return n > 0 ? `+${Math.abs(n)}` : `${n}`;
 }
+function readAnySpread(obj) {
+  // Look through many shapes ESPN uses
+  const cands = [
+    obj?.spread, obj?.pointSpread, obj?.handicap, obj?.line,
+    obj?.current?.spread, obj?.current?.spread?.point, obj?.current?.handicap, obj?.current?.line,
+    obj?.displayOdds?.spread,
+    obj?.open?.spread, obj?.close?.spread,
+    obj?.odds?.spread, obj?.odds?.pointSpread, obj?.odds?.handicap
+  ];
+  for (const v of cands) {
+    if (v == null) continue;
+    const s = String(v).trim();
+    if (s === "" || /^N\/A$/i.test(s)) continue;
+    return s;
+  }
+  return "";
+}
 function extractMoneylines(o, awayId, homeId, competitors = []) {
   let awayML = "", homeML = "";
   if (o && (o.awayTeamOdds || o.homeTeamOdds)) {
@@ -222,35 +241,61 @@ async function extractMLWithFallback(event, baseOdds, away, home) {
   } catch (e) { warn("Summary fallback failed:", e?.message || e); }
   return base;
 }
+
+/** ==== Spread extractor (robust + signs by favorite) ==== */
 function extractSpreads(o, awayId, homeId) {
   let away = "", home = "";
+  const favId = o?.favorite ?? o?.favoriteTeamId ?? o?.favoriteId;
+
+  const applySignIfMissing = (raw, teamId) => {
+    const s = String(raw).trim();
+    const normalized = normalizeSpread(s);
+    if (!normalized) return "";
+    // If the original value had no explicit sign, normalizeSpread adds '+'.
+    // Correct it using favorite when known.
+    const hadSign = /^[+-]/.test(s);
+    if (hadSign) return normalized;
+    const abs = Math.abs(parseFloat(normalized));
+    if (!Number.isFinite(abs)) return normalized;
+    if (favId != null && String(teamId) === String(favId)) return `-${abs}`;
+    return `+${abs}`;
+  };
+
+  // 1) Explicit team odds with teamId mapping
   if (Array.isArray(o?.teamOdds)) {
     for (const t of o.teamOdds) {
       const tid = String(t?.teamId ?? t?.team?.id ?? "");
-      const sp  = normalizeSpread(t?.spread ?? t?.pointSpread ?? t?.handicap ?? t?.line);
-      if (!sp) continue;
+      const raw = readAnySpread(t);
+      if (!raw) continue;
+      const sp = applySignIfMissing(raw, tid);
       if (tid === String(awayId)) away = sp;
       if (tid === String(homeId)) home = sp;
     }
   }
+
+  // 2) Competitors array on the odds object
   if (!(away && home) && Array.isArray(o?.competitors)) {
     for (const c of o.competitors) {
       const tid = String(c?.id ?? c?.teamId ?? c?.team?.id ?? "");
-      const sp  = normalizeSpread(c?.odds?.spread ?? c?.odds?.handicap ?? c?.odds?.pointSpread);
-      if (!sp) continue;
+      const raw = readAnySpread(c);
+      if (!raw) continue;
+      const sp = applySignIfMissing(raw, tid);
       if (c.homeAway === "away" || tid === String(awayId)) away = sp;
       if (c.homeAway === "home" || tid === String(homeId)) home = sp;
     }
   }
+
+  // 3) Single favorite + line → derive both sides
   if (!(away && home)) {
-    const favId = o?.favorite ?? o?.favoriteTeamId ?? o?.favoriteId;
-    const line  = normalizeSpread(o?.spread ?? o?.pointSpread ?? o?.handicap);
-    if (favId != null && line) {
-      const s = Math.abs(Number.parseFloat(line));
+    const raw = readAnySpread(o);
+    const base = normalizeSpread(raw);
+    if (favId != null && base) {
+      const s = Math.abs(Number.parseFloat(base));
       if (String(favId) === String(awayId)) { away = `-${s}`; home = `+${s}`; }
       else if (String(favId) === String(homeId)) { home = `-${s}`; away = `+${s}`; }
     }
   }
+
   return { awaySpread: away || "", homeSpread: home || "" };
 }
 
@@ -274,6 +319,7 @@ function pregameRowFactory(sbForDay) {
       total = (o0.overUnder ?? o0.total) ?? "";
       const sp = extractSpreads(o0, away?.team?.id, home?.team?.id);
       awaySpread = sp.awaySpread; homeSpread = sp.homeSpread;
+
       if (awaySpread && awaySpread.startsWith("-")) favSide = "away";
       else if (homeSpread && homeSpread.startsWith("-")) favSide = "home";
 
@@ -352,10 +398,25 @@ async function scrapeLiveOddsOnce(league, gameId) {
         let liveAwaySpread="", liveHomeSpread="", liveTotal="", liveAwayML="", liveHomeML="";
         liveTotal = String(best.overUnder ?? best.total ?? "") || "";
 
+        const favId = best?.favorite ?? best?.favoriteTeamId ?? best?.favoriteId;
+
+        const applySignIfMissing = (raw, teamId) => {
+          const s = String(raw).trim();
+          const normalized = normalizeSpread(s);
+          if (!normalized) return "";
+          const hadSign = /^[+-]/.test(s);
+          if (hadSign) return normalized;
+          const abs = Math.abs(parseFloat(normalized));
+          if (!Number.isFinite(abs)) return normalized;
+          if (favId != null && String(teamId) === String(favId)) return `-${abs}`;
+          return `+${abs}`;
+        };
+
         if (Array.isArray(best.teamOdds)) {
           for (const t of best.teamOdds) {
             const tid = String(t?.teamId ?? t?.team?.id ?? "");
-            const sp  = normalizeSpread(t?.spread ?? t?.pointSpread ?? t?.handicap ?? t?.line);
+            const rawSp = readAnySpread(t);
+            const sp = applySignIfMissing(rawSp, tid);
             if (!sp) continue;
             if (tid === String(awayId)) liveAwaySpread = sp;
             if (tid === String(homeId)) liveHomeSpread = sp;
@@ -368,10 +429,10 @@ async function scrapeLiveOddsOnce(league, gameId) {
             if (tid === String(homeId) && val) liveHomeML = val;
           }
         } else {
-          const favId = best?.favorite ?? best?.favoriteTeamId ?? best?.favoriteId;
-          const line  = normalizeSpread(best?.spread ?? best?.pointSpread ?? best?.handicap);
-          if (favId != null && line) {
-            const s = Math.abs(Number.parseFloat(line));
+          const raw = readAnySpread(best);
+          const base = normalizeSpread(raw);
+          if (favId != null && base) {
+            const s = Math.abs(Number.parseFloat(base));
             if (String(favId) === String(awayId)) { liveAwaySpread = `-${s}`; liveHomeSpread = `+${s}`; }
             else if (String(favId) === String(homeId)) { liveHomeSpread = `-${s}`; liveAwaySpread = `+${s}`; }
           }
