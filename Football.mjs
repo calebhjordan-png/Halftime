@@ -1,33 +1,21 @@
 // Football.mjs
 // One script: Prefill + Finals (+ optional halftime snapshot)
-//
-// Env:
-//   GOOGLE_SHEET_ID, GOOGLE_SERVICE_ACCOUNT (json string or base64)
-//   LEAGUE = nfl | college-football
-//   TAB_NAME = NFL | CFB
-//   GAME_IDS = optional comma list (force-only these)
-//   MODE = prefill_and_finals [default] | prefill_only | finals_only | live_only
-//   RUN_SCOPE = auto [default] | today | week
-//   REWRITE = "1" | "0"   (finals pass can rewrite spreads/ML/total for past games; default "1")
-//   RESET_CF = "1"        (delete existing conditional format rules before re-adding ours)
-//
-// Columns:
-//   A: Game ID | B: Date | C: Week | D: Status | E: Matchup | F: Final Score
-//   G: A Spread | H: A ML | I: H Spread | J: H ML | K: Total
-//   L: H Score | M: Half A Spread | N: Half A ML | O: Half H Spread | P: Half H ML | Q: Half Total
 
 import { google } from "googleapis";
 
-// ---------- Config ----------
+/* ========== ENV / CONFIG ========== */
 const SHEET_ID = (process.env.GOOGLE_SHEET_ID || "").trim();
 const CREDS_RAW = (process.env.GOOGLE_SERVICE_ACCOUNT || "").trim();
 const LEAGUE = normLeague(process.env.LEAGUE || "nfl");
 const TAB_NAME = (process.env.TAB_NAME || (LEAGUE==="nfl"?"NFL":"CFB")).trim();
 const GAME_IDS = (process.env.GAME_IDS || "").trim();
-const MODE = (process.env.MODE || "prefill_and_finals").toLowerCase();
-const RUN_SCOPE = (process.env.RUN_SCOPE || "auto").toLowerCase();
-const REWRITE = String(process.env.REWRITE ?? "1") !== "0";
-const RESET_CF = String(process.env.RESET_CF ?? "0") === "1";
+const MODE = (process.env.MODE || "prefill_and_finals").toLowerCase(); // prefill_and_finals | prefill_only | finals_only | live_only
+const RUN_SCOPE = (process.env.RUN_SCOPE || "auto").toLowerCase();     // auto|today|week
+const REWRITE = String(process.env.REWRITE ?? "1") !== "0";            // finals pass may rewrite odds
+const RESET_CF = String(process.env.RESET_CF ?? "0") === "1";          // delete all CF and re-add column-scoped rules
+
+// Clear backgrounds for non-graded columns A..F every run to keep sheet clean.
+const CLEAR_AF_ALWAYS = true;
 
 const ET_TZ = "America/New_York";
 const HEADERS = [
@@ -36,55 +24,38 @@ const HEADERS = [
   "H Score","Half A Spread","Half A ML","Half H Spread","Half H ML","Half Total"
 ];
 
-// ---------- Small utils ----------
+/* ========== UTILS ========== */
 const log=(...a)=>console.log(...a);
 const warn=(...a)=>console.warn(...a);
 
-function normLeague(x){
-  return /college-football|ncaaf/i.test(x) ? "college-football" : "nfl";
-}
+function normLeague(x){ return /college-football|ncaaf/i.test(x) ? "college-football" : "nfl"; }
 function fmtET(d, opts){ return new Intl.DateTimeFormat("en-US",{timeZone:ET_TZ, ...opts}).format(new Date(d)); }
 function statusPregame(d){ return `${fmtET(d,{month:"2-digit",day:"2-digit"})} - ${fmtET(d,{hour:"numeric",minute:"2-digit",hour12:true})}`; }
 function yyyymmddInET(d=new Date()){ const p=fmtET(d,{year:"numeric",month:"2-digit",day:"2-digit"}).split("/"); return p[2]+p[0]+p[1]; }
 async function fetchJson(u){ const r=await fetch(u,{headers:{'User-Agent':'halftime-bot'}}); if(!r.ok) throw new Error(r.status+" "+u); return r.json(); }
 async function fetchText(u){ const r=await fetch(u,{headers:{'User-Agent':'halftime-bot'}}); if(!r.ok) throw new Error(r.status+" "+u); return r.text(); }
 
-function scoreboardUrl(lg,dates){
-  const extra = lg==="college-football" ? "&groups=80&limit=300" : "";
-  return `https://site.api.espn.com/apis/site/v2/sports/football/${lg}/scoreboard?dates=${dates}${extra}`;
-}
+function scoreboardUrl(lg,dates){ const extra = lg==="college-football" ? "&groups=80&limit=300" : ""; return `https://site.api.espn.com/apis/site/v2/sports/football/${lg}/scoreboard?dates=${dates}${extra}`; }
 function summaryUrl(lg,id){ return `https://site.api.espn.com/apis/site/v2/sports/football/${lg}/summary?event=${id}`; }
 function gameUrl(lg,id){ return `https://www.espn.com/${lg}/game/_/gameId/${id}`; }
 
-function isFinalEvent(evt){
-  return /(FINAL)/i.test(evt?.status?.type?.name || evt?.competitions?.[0]?.status?.type?.name || "");
-}
-function isHalf(evt){
-  const s=(evt?.status?.type?.shortDetail||"").toUpperCase();
-  return /HALF/.test(s) || /(Q2).*(0:0?0)/.test(s);
-}
+function isFinalEvent(evt){ return /(FINAL)/i.test(evt?.status?.type?.name || evt?.competitions?.[0]?.status?.type?.name || ""); }
+function isHalf(evt){ const s=(evt?.status?.type?.shortDetail||"").toUpperCase(); return /HALF/.test(s) || /(Q2).*(0:0?0)/.test(s); }
 
 function mapHeadersToIndex(h){ const m={}; h.forEach((v,i)=>m[(v||"").trim().toLowerCase()]=i); return m; }
 function colLetter(i){ return String.fromCharCode(65+i); }
 
-function pickOdds(arr=[]){
-  if(!arr?.length) return null;
-  return arr.find(o=>/espn\s*bet/i.test(o.provider?.name||o.provider?.displayName||"")) || arr[0];
-}
+function pickOdds(arr=[]){ if(!arr?.length) return null; return arr.find(o=>/espn\s*bet/i.test(o.provider?.name||o.provider?.displayName||"")) || arr[0]; }
 function resolveFavAndLine(o, awayId, homeId){
   let aSpread="", hSpread="", total = o?.overUnder ?? o?.total ?? "";
   const favId = String(o?.favoriteTeamId ?? o?.favorite ?? "");
-
   const raw = typeof o?.spread==="string" ? parseFloat(o.spread) : (Number.isFinite(o?.spread)?o.spread:NaN);
   if(!Number.isNaN(raw) && favId){
     if(String(awayId)===favId){ aSpread = -Math.abs(raw); hSpread = +Math.abs(raw); }
     else if(String(homeId)===favId){ hSpread = -Math.abs(raw); aSpread = +Math.abs(raw); }
   }else if(o?.details){
-    const m=o.details.match(/([+-]?\d+(\.\d+)?)/); if(m){
-      const n=parseFloat(m[1]);
-      if(n<0){ hSpread=n; aSpread=Math.abs(n); }
-      else { aSpread=n; hSpread=-Math.abs(n); }
-    }
+    const m=o.details.match(/([+-]?\d+(\.\d+)?)/);
+    if(m){ const n=parseFloat(m[1]); if(n<0){ hSpread=n; aSpread=Math.abs(n); } else { aSpread=n; hSpread=-Math.abs(n); } }
   }
   return {aSpread:String(aSpread||""), hSpread:String(hSpread||""), total:String(total||""), favId};
 }
@@ -129,9 +100,8 @@ function buildRuns(matchup, underlineAway, boldAway, boldHome){
     {startIndex:A0, format:{bold:!!boldAway, underline:!!underlineAway}},
     {startIndex:H0, format:{bold:!!boldHome, underline:!underlineAway}},
   ];
-  return runs
-    .map(r=>({...r, startIndex: Math.min(Math.max(r.startIndex,0), Math.max(L-1,0))}))
-    .sort((x,y)=>x.startIndex-y.startIndex);
+  return runs.map(r=>({...r, startIndex: Math.min(Math.max(r.startIndex,0), Math.max(L-1,0))}))
+             .sort((x,y)=>x.startIndex-y.startIndex);
 }
 
 async function halftimeSnapshot(gameId){
@@ -139,27 +109,22 @@ async function halftimeSnapshot(gameId){
     const t=(await fetchText(gameUrl(LEAGUE, gameId))).replace(/\u00a0/g," ").replace(/\s+/g," ");
     const i=t.toUpperCase().indexOf("LIVE ODDS"); if(i<0) return null;
     const sec=t.slice(i, i+2000);
-
     const spreads=[...sec.matchAll(/([+-]\d+(\.\d+)?)/g)].map(m=>m[1]);
     const liveAwaySpread = spreads?.[2] ?? spreads?.[0] ?? "";
     const liveHomeSpread = spreads?.[3] ?? spreads?.[1] ?? "";
-
     const o = sec.match(/o\s?(\d+(\.\d+)?)/i)?.[1] || "";
     const u = sec.match(/u\s?(\d+(\.\d+)?)/i)?.[1] || "";
     const liveTotal = o || u || "";
-
     const mls=[...sec.matchAll(/\s[+-]\d{2,4}\b/g)].map(m=>m[0].trim());
     const liveAwayML = mls?.[0] || "";
     const liveHomeML = mls?.[1] || "";
-
     const score = t.match(/\b(\d{1,2})\s*-\s*(\d{1,2})\b/);
     const hScore = score ? `${score[1]}-${score[2]}` : "";
-
     return {liveAwaySpread, liveHomeSpread, liveTotal, liveAwayML, liveHomeML, hScore};
   }catch(e){ warn("halftimeSnapshot:", e.message); return null; }
 }
 
-// Sheets helper
+/* ========== SHEETS HELPER ========== */
 class Sheets {
   constructor(auth, spreadsheetId, tab){ this.api=google.sheets({version:"v4",auth}); this.sid=spreadsheetId; this.tab=tab; }
   async ensureHeader(){
@@ -185,75 +150,65 @@ class Sheets {
   async resetConditionalFormattingIfRequested(){
     if(!RESET_CF) return;
     const sid = await this.sheetId();
-    // Best-effort: delete first 50 rules at index 0 repeatedly.
     const reqs=[];
     for(let i=0;i<50;i++){ reqs.push({deleteConditionalFormatRule:{index:0, sheetId:sid}}); }
-    try { await this.api.spreadsheets.batchUpdate({spreadsheetId:this.sid, requestBody:{requests:reqs}}); }
-    catch(e){ /* ignore if fewer rules exist */ }
+    try { await this.api.spreadsheets.batchUpdate({spreadsheetId:this.sid, requestBody:{requests:reqs}}); } catch(_) {}
   }
   async ensureGradingCF(){
     await this.resetConditionalFormattingIfRequested();
-
     const sid = await this.sheetId();
     const green={red:0.85,green:0.95,blue:0.85}, red={red:0.98,green:0.85,blue:0.85};
-
     const mk = (colIdx, passFormula, failFormula) => ([
-      {
-        addConditionalFormatRule:{
-          index:0,
-          rule:{
-            ranges:[{sheetId:sid,startRowIndex:1,startColumnIndex:colIdx,endColumnIndex:colIdx+1}],
-            booleanRule:{condition:{type:"CUSTOM_FORMULA", values:[{userEnteredValue:passFormula}]}, format:{backgroundColor:green}}
-          }
-        }
-      },
-      {
-        addConditionalFormatRule:{
-          index:0,
-          rule:{
-            ranges:[{sheetId:sid,startRowIndex:1,startColumnIndex:colIdx,endColumnIndex:colIdx+1}],
-            booleanRule:{condition:{type:"CUSTOM_FORMULA", values:[{userEnteredValue:failFormula}]}, format:{backgroundColor:red}}
-          }
-        }
-      }
+      { addConditionalFormatRule:{ index:0, rule:{ ranges:[{sheetId:sid,startRowIndex:1,startColumnIndex:colIdx,endColumnIndex:colIdx+1}], booleanRule:{condition:{type:"CUSTOM_FORMULA", values:[{userEnteredValue:passFormula}]}, format:{backgroundColor:green}}}}},
+      { addConditionalFormatRule:{ index:0, rule:{ ranges:[{sheetId:sid,startRowIndex:1,startColumnIndex:colIdx,endColumnIndex:colIdx+1}], booleanRule:{condition:{type:"CUSTOM_FORMULA", values:[{userEnteredValue:failFormula}]}, format:{backgroundColor:red}}}}}
     ]);
 
-    // Helpers referencing row 2 as anchor; Sheets will shift relatively down the column.
     const HAS_FINAL = '$F2<>""';
     const AWAY = 'VALUE(LEFT($F2,FIND("-",$F2)-1))';
     const HOME = 'VALUE(MID($F2,FIND("-",$F2)+1,99))';
     const SUMPTS = `${AWAY}+${HOME}`;
 
-    // Spreads
     const gPass = `=AND(${HAS_FINAL}, ${AWAY} - ${HOME} + G2 >= 0)`;
     const gFail = `=AND(${HAS_FINAL}, ${AWAY} - ${HOME} + G2 < 0)`;
     const iPass = `=AND(${HAS_FINAL}, ${HOME} - ${AWAY} + I2 >= 0)`;
     const iFail = `=AND(${HAS_FINAL}, ${HOME} - ${AWAY} + I2 < 0)`;
 
-    // Moneylines
     const hPass = `=AND(${HAS_FINAL}, ${AWAY} > ${HOME}, H2<>"")`;
     const hFail = `=AND(${HAS_FINAL}, ${AWAY} <= ${HOME}, H2<>"")`;
     const jPass = `=AND(${HAS_FINAL}, ${HOME} > ${AWAY}, J2<>"")`;
     const jFail = `=AND(${HAS_FINAL}, ${HOME} <= ${AWAY}, J2<>"")`;
 
-    // Total (Over = green; Under/Push = red)
     const kPass = `=AND(${HAS_FINAL}, ${SUMPTS} > K2)`;
     const kFail = `=AND(${HAS_FINAL}, ${SUMPTS} <= K2)`;
 
     const reqs=[
-      ...mk(6, gPass, gFail),   // G: A Spread
-      ...mk(7, hPass, hFail),   // H: A ML
-      ...mk(8, iPass, iFail),   // I: H Spread
-      ...mk(9, jPass, jFail),   // J: H ML
-      ...mk(10, kPass, kFail)   // K: Total
+      ...mk(6, gPass, gFail),   // G
+      ...mk(7, hPass, hFail),   // H
+      ...mk(8, iPass, iFail),   // I
+      ...mk(9, jPass, jFail),   // J
+      ...mk(10, kPass, kFail)   // K
     ];
-
-    try { await this.api.spreadsheets.batchUpdate({spreadsheetId:this.sid, requestBody:{requests:reqs}}); }
-    catch(e){ /* ignore if rules already present */ }
+    try { await this.api.spreadsheets.batchUpdate({spreadsheetId:this.sid, requestBody:{requests:reqs}}); } catch(_) {}
+  }
+  async clearAFBackgrounds(rowCount){
+    if(!CLEAR_AF_ALWAYS) return;
+    const sid = await this.sheetId();
+    await this.api.spreadsheets.batchUpdate({
+      spreadsheetId:this.sid,
+      requestBody:{
+        requests:[{
+          repeatCell:{
+            range:{sheetId:sid,startRowIndex:1,endRowIndex:rowCount,startColumnIndex:0,endColumnIndex:6},
+            cell:{userEnteredFormat:{backgroundColor:null, backgroundColorStyle:null}},
+            fields:"userEnteredFormat.backgroundColor,userEnteredFormat.backgroundColorStyle"
+          }
+        }]
+      }
+    });
   }
 }
 
-// ---------- Main ----------
+/* ========== MAIN ========== */
 (async () => {
   if(!SHEET_ID||!CREDS_RAW){ console.error("Missing GOOGLE_SHEET_ID or GOOGLE_SERVICE_ACCOUNT"); process.exit(1); }
   const creds = CREDS_RAW.trim().startsWith("{") ? JSON.parse(CREDS_RAW) : JSON.parse(Buffer.from(CREDS_RAW,"base64").toString("utf8"));
@@ -264,28 +219,25 @@ class Sheets {
   const hmap = mapHeadersToIndex(header);
   const all = await sh.readAll();
   const rows = all.slice(1);
+  const lastRowIndex = Math.max(2, rows.length+1);
   const rowById = new Map();
   rows.forEach((r,i)=>{ const id=(r[hmap["game id"]]||"").toString().trim(); if(id) rowById.set(id, i+2); });
 
-  // dates list
+  // dates
   const today = yyyymmddInET();
   const dates = RUN_SCOPE==="today" ? [today]
               : RUN_SCOPE==="week"  ? Array.from({length:7},(_,i)=>yyyymmddInET(new Date(Date.now()+i*86400000)))
                                     : Array.from({length:7},(_,i)=>yyyymmddInET(new Date(Date.now()+i*86400000)));
 
-  // fetch scoreboard
+  // fetch events
   let events=[]; for(const d of dates){ const sb=await fetchJson(scoreboardUrl(LEAGUE,d)); events.push(...(sb?.events||[])); }
-
-  // filter optional GAME_IDS
   const onlyIds = GAME_IDS ? GAME_IDS.split(",").map(s=>s.trim()) : null;
   if(onlyIds?.length) events = events.filter(e=>onlyIds.includes(String(e.id)));
-
   log("Events found:", events.length);
 
-  // ---------- PREGAME ----------
+  /* ---------- PREFILL ---------- */
   if(MODE==="prefill_only" || MODE==="prefill_and_finals"){
-    const toAppend=[];
-    const toUpdate=[];
+    const toAppend=[], toUpdate=[];
     for(const ev of events){
       const comp=ev.competitions?.[0]||{};
       const away=comp.competitors?.find(c=>c.homeAway==="away");
@@ -294,13 +246,12 @@ class Sheets {
       const homeName=home?.team?.shortDisplayName || home?.team?.abbreviation || "Home";
       const matchup = `${awayName} @ ${homeName}`;
       const preStatus = statusPregame(ev.date);
-
       const rowNum = rowById.get(String(ev.id));
+
       const odds = pickOdds(comp.odds || ev.odds || []);
       let aSpread="",hSpread="",total="",aML="",hML="", favAway=false;
-
       if(odds){
-        const {aSpread:as, hSpread:hs, total:t, favId} = resolveFavAndLine(odds, away?.team?.id, home?.team?.id);
+        const {aSpread:as,hSpread:hs,total:t,favId} = resolveFavAndLine(odds, away?.team?.id, home?.team?.id);
         const mls = resolveMLs(odds, away?.team?.id, home?.team?.id);
         aSpread=as; hSpread=hs; total=t; aML=mls.aML; hML=mls.hML;
         favAway = favId && String(favId)===String(away?.team?.id);
@@ -312,37 +263,26 @@ class Sheets {
           matchup, "", aSpread, aML, hSpread, hML, total, "", "", "", "", "", ""
         ]);
       }else{
-        // refresh pregame only if not live/final yet
         const existing = all[rowNum-1]||[];
         const curStatus=(existing[hmap["status"]]||"").toString();
         if(curStatus && (/(Final|Q\d|Half|End of)/i.test(curStatus))) continue;
 
-        const payload=[];
-        const set=(name,val)=>{ const idx=hmap[name.toLowerCase()]; if(idx==null) return; payload.push({range:`${TAB_NAME}!${colLetter(idx)}${rowNum}:${colLetter(idx)}${rowNum}`, values:[[val??""]]}); };
-
+        const set=(name,val)=>{ const idx=hmap[name.toLowerCase()]; if(idx==null) return; toUpdate.push({range:`${TAB_NAME}!${colLetter(idx)}${rowNum}:${colLetter(idx)}${rowNum}`, values:[[val??""]]}); };
         set("status", preStatus);
         set("matchup", matchup);
         set("a spread", aSpread); set("h spread", hSpread);
         set("a ml", aML); set("h ml", hML); set("total", total);
 
-        if(payload.length) toUpdate.push(...payload);
-
-        // underline favorite now
-        try {
-          const runs = buildRuns(matchup, favAway, false, false);
-          await sh.updateTextRuns(rowNum, hmap["matchup"], matchup, runs);
-        } catch(e){ /* ignore formatting fail */ }
+        try { const runs = buildRuns(matchup, favAway, false, false); await sh.updateTextRuns(rowNum, hmap["matchup"], matchup, runs); } catch(_) {}
       }
     }
     if(toAppend.length) await sh.append(toAppend);
     if(toUpdate.length) await sh.batchWrite(toUpdate);
   }
 
-  // ---------- FINALS (robust + rewrite control) ----------
+  /* ---------- FINALS ---------- */
   if(MODE==="finals_only" || MODE==="prefill_and_finals"){
-    const batch=[];
-    const formatQueue=[];
-
+    const batch=[], formatQueue=[];
     for(const ev of events){
       const comp=ev.competitions?.[0]||{};
       const away=comp.competitors?.find(c=>c.homeAway==="away");
@@ -356,12 +296,11 @@ class Sheets {
       let aPts = Number(away?.score||0), hPts = Number(home?.score||0);
       let finalScore = (aPts||hPts) ? `${aPts}-${hPts}` : "";
 
-      // If sheet already has Final Score but Status not Final -> force Final
+      // Fail-safe: if sheet already has Final Score, treat as final
       const sheetRow = all[rowNum-1] || [];
       const sheetFinalScore = (sheetRow[hmap["final score"]]||"").toString().trim();
       if(sheetFinalScore && !finalNow){
-        finalNow = true;
-        finalScore = sheetFinalScore;
+        finalNow = true; finalScore = sheetFinalScore;
         const m = sheetFinalScore.match(/(\d+)\s*-\s*(\d+)/);
         if(m){ aPts=Number(m[1]||0); hPts=Number(m[2]||0); }
       }
@@ -370,20 +309,16 @@ class Sheets {
         if(finalScore) set("final score", finalScore);
         set("status","Final");
 
-        // (Optional) rewrite pregame numbers when final (repair past rows)
         if(REWRITE){
           const odds=pickOdds(comp.odds||ev.odds||[]);
           if(odds){
             const lines = resolveFavAndLine(odds, away?.team?.id, home?.team?.id);
             const mls   = resolveMLs(odds, away?.team?.id, home?.team?.id);
-            // write if empty OR always (simple + reliable)
             set("a spread", lines.aSpread);
             set("h spread", lines.hSpread);
             set("total",   lines.total);
             set("a ml",    mls.aML);
             set("h ml",    mls.hML);
-
-            // favorite underline
             const favAway = lines.favId && String(lines.favId)===String(away?.team?.id);
             const boldAway = aPts>hPts, boldHome = hPts>aPts;
             formatQueue.push({rowNum, text:matchup, favAway, boldAway, boldHome});
@@ -399,25 +334,30 @@ class Sheets {
     }
 
     if(batch.length) await sh.batchWrite(batch);
-    // apply bold/underline runs
     for(const f of formatQueue){
-      try{
-        const runs=buildRuns(f.text, f.favAway, f.boldAway, f.boldHome);
-        await sh.updateTextRuns(f.rowNum, hmap["matchup"], f.text, runs);
-      }catch(e){}
+      try{ const runs=buildRuns(f.text, f.favAway, f.boldAway, f.boldHome); await sh.updateTextRuns(f.rowNum, hmap["matchup"], f.text, runs); }catch(_){}
     }
-
-    // add column-scoped grading for spreads, MLs, and totals
     await sh.ensureGradingCF();
+
+    // **Finals safety sweep**: if a row has Final Score but Status != Final, fix it.
+    const fixPayload=[];
+    rows.forEach((r,i)=>{
+      const rowNum=i+2;
+      const fs=(r[hmap["final score"]]||"").toString().trim();
+      const st=(r[hmap["status"]]||"").toString().trim();
+      if(fs && st.toLowerCase()!=="final"){
+        fixPayload.push({range:`${TAB_NAME}!${colLetter(hmap["status"])}${rowNum}:${colLetter(hmap["status"])}${rowNum}`, values:[["Final"]]});
+      }
+    });
+    if(fixPayload.length) await sh.batchWrite(fixPayload);
   }
 
-  // ---------- LIVE (halftime snapshot) ----------
+  /* ---------- LIVE (halftime snapshot) ---------- */
   if(MODE==="live_only"){
     const batch=[];
     for(const ev of events){
       if(!isHalf(ev)) continue;
       const rowNum=rowById.get(String(ev.id)); if(!rowNum) continue;
-
       const snap=await halftimeSnapshot(String(ev.id)); if(!snap) continue;
       const put=(name,val)=>{ const idx=hmap[name.toLowerCase()]; if(idx==null || !val) return; batch.push({range:`${TAB_NAME}!${colLetter(idx)}${rowNum}:${colLetter(idx)}${rowNum}`, values:[[val]]}); };
       put("h score", snap.hScore);
@@ -429,6 +369,9 @@ class Sheets {
     }
     if(batch.length) await sh.batchWrite(batch);
   }
+
+  // Always ensure non-graded columns A..F have no background color
+  await sh.clearAFBackgrounds(lastRowIndex);
 
   log("Done.");
 })().catch(e=>{ console.error("Fatal:", e); process.exit(1); });
