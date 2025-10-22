@@ -46,6 +46,13 @@ function fmtETDate(dateLike) {
     timeZone: ET_TZ, year: "numeric", month: "2-digit", day: "2-digit"
   }).format(new Date(dateLike)); // mm/dd/yyyy
 }
+function fmtStatusScheduled(dateLike) {
+  const d = new Intl.DateTimeFormat("en-US", {
+    timeZone: ET_TZ, month: "2-digit", day: "2-digit"
+  }).format(new Date(dateLike));
+  const t = fmtETTime(dateLike);
+  return `${d} - ${t}`;
+}
 function yyyymmddInET(d=new Date()) {
   const parts = new Intl.DateTimeFormat("en-US", {
     timeZone: ET_TZ, year: "numeric", month: "2-digit", day: "2-digit"
@@ -87,7 +94,7 @@ function mapHeadersToIndex(headerRow) {
   headerRow.forEach((h,i)=> map[(h||"").trim().toLowerCase()] = i);
   return map;
 }
-/** Header alias resolution (handles your short headers) */
+/** Header alias resolution (handles short headers) */
 function resolveHeaderIndex(hmap, name) {
   const key = name.toLowerCase();
   if (hmap[key] != null) return hmap[key];
@@ -118,7 +125,7 @@ function numOrBlank(v) {
   return s.startsWith("+") ? `+${n}` : `${n}`;
 }
 
-/** Status text: live shortDetail or kickoff time only (no date/year) */
+/** Status text policy */
 function tidyStatus(evt) {
   const comp = evt.competitions?.[0] || {};
   const typeObj = evt.status?.type || comp.status?.type || {};
@@ -127,7 +134,7 @@ function tidyStatus(evt) {
   if (name.includes("FINAL")) return "Final";
   if (name.includes("HALFTIME")) return "Half";
   if (name.includes("IN_PROGRESS") || name.includes("LIVE")) return short || "In Progress";
-  return fmtETTime(evt.date); // scheduled: time only
+  return fmtStatusScheduled(evt.date); // scheduled: MM/DD - Start Time
 }
 
 /** ===== Week label resolvers (per-date) ===== */
@@ -322,7 +329,7 @@ function pregameRowFactory(sbForDay) {
         dateET,                 // Date
         weekText || "",         // Week
         statusClean,            // Status
-        matchupPlain,           // Matchup (we'll apply underline formatting after write)
+        matchupPlain,           // Matchup (plain; we underline via formatting)
         finalScore,             // Final Score
         awaySpread || "",       // Away Spread
         String(awayML || ""),   // Away ML
@@ -366,7 +373,10 @@ function q2AdaptiveCandidateMinutes(evt) {
   return clampRecheck(2 * minutesLeft);
 }
 
-/** LIVE odds scrape (best effort) */
+/** LIVE odds scrape:
+ *  1) read embedded JSON (window.__espnfitt__.page.content.gamepackage.pickcenter/odds)
+ *  2) fallback to LIVE ODDS DOM text
+ */
 async function scrapeLiveOddsOnce(league, gameId) {
   const url = gameUrl(league, gameId);
   const browser = await playwright.chromium.launch({ headless: true });
@@ -374,10 +384,93 @@ async function scrapeLiveOddsOnce(league, gameId) {
   try {
     await page.goto(url, { timeout: 60000, waitUntil: "domcontentloaded" });
     await page.waitForLoadState("networkidle", { timeout: 6000 }).catch(()=>{});
-    await page.waitForTimeout(500);
+    await page.waitForTimeout(400);
 
+    // Try embedded JSON first
+    const raw = await page.evaluate(() => {
+      try {
+        const gp = (window).__espnfitt__?.page?.content?.gamepackage;
+        return gp ? JSON.stringify(gp) : null;
+      } catch { return null; }
+    });
+    if (raw) {
+      const gp = JSON.parse(raw);
+      const candidates = []
+        .concat(gp?.odds || [])
+        .concat(gp?.pickcenter || [])
+        .filter(Boolean);
+
+      // choose the most recent/live candidate
+      let best = null;
+      for (const c of candidates) {
+        if (!best) best = c;
+        // prefer items that look live / have inGame flags
+        if ((c.isLive || c.inGame || /live/i.test(c?.details || ""))) best = c;
+      }
+
+      if (best) {
+        // spreads: always map to team
+        const awayId = gp?.boxscore?.teams?.find?.(t=>t.homeAway==="away")?.team?.id ?? gp?.competitions?.[0]?.competitors?.find?.(x=>x.homeAway==="away")?.team?.id;
+        const homeId = gp?.boxscore?.teams?.find?.(t=>t.homeAway==="home")?.team?.id ?? gp?.competitions?.[0]?.competitors?.find?.(x=>x.homeAway==="home")?.team?.id;
+
+        let liveAwaySpread = "", liveHomeSpread = "", liveTotal = "", liveAwayML = "", liveHomeML = "";
+
+        // total
+        liveTotal = String(best.overUnder ?? best.total ?? "") || "";
+
+        // spreads
+        if (Array.isArray(best.teamOdds)) {
+          for (const t of best.teamOdds) {
+            const tid = String(t?.teamId ?? t?.team?.id ?? "");
+            const sp  = t?.spread ?? t?.pointSpread ?? t?.handicap ?? t?.line;
+            const n   = Number.parseFloat(sp);
+            if (!Number.isFinite(n)) continue;
+            const val = n > 0 ? `+${Math.abs(n)}` : `${n}`;
+            if (tid === String(awayId)) liveAwaySpread = val;
+            if (tid === String(homeId)) liveHomeSpread = val;
+          }
+        } else {
+          // favorite + line
+          const favId = best?.favorite ?? best?.favoriteTeamId ?? best?.favoriteId;
+          const line  = best?.spread ?? best?.pointSpread ?? best?.handicap;
+          if (favId != null && line != null) {
+            const s = Math.abs(Number.parseFloat(line));
+            if (String(favId) === String(awayId)) { liveAwaySpread = `-${s}`; liveHomeSpread = `+${s}`; }
+            else if (String(favId) === String(homeId)) { liveHomeSpread = `-${s}`; liveAwaySpread = `+${s}`; }
+          }
+        }
+
+        // moneylines
+        if (Array.isArray(best.teamOdds)) {
+          for (const t of best.teamOdds) {
+            const tid = String(t?.teamId ?? t?.team?.id ?? "");
+            const ml  = t?.moneyLine ?? t?.moneyline ?? t?.money_line;
+            const val = numOrBlank(ml);
+            if (tid === String(awayId) && val) liveAwayML = val;
+            if (tid === String(homeId) && val) liveHomeML = val;
+          }
+        } else {
+          const a = best?.awayTeamOdds || {};
+          const h = best?.homeTeamOdds || {};
+          liveAwayML = numOrBlank(a.moneyLine ?? a.moneyline ?? a.money_line) || liveAwayML;
+          liveHomeML = numOrBlank(h.moneyLine ?? h.moneyline ?? h.money_line) || liveHomeML;
+        }
+
+        // half score (from gp boxscore)
+        let halfScore = "";
+        try {
+          const aPts = Number(gp?.boxscore?.teams?.find(t=>t.homeAway==="away")?.score ?? 0);
+          const hPts = Number(gp?.boxscore?.teams?.find(t=>t.homeAway==="home")?.score ?? 0);
+          if (Number.isFinite(aPts) && Number.isFinite(hPts)) halfScore = `${aPts}-${hPts}`;
+        } catch {}
+
+        return { liveAwaySpread, liveHomeSpread, liveTotal, liveAwayML, liveHomeML, halfScore };
+      }
+    }
+
+    // Fallback to the LIVE ODDS section text
     const section = page.locator("section:has-text('LIVE ODDS'), div:has(h2:has-text('LIVE ODDS'))").first();
-    await section.waitFor({ timeout: 8000 });
+    await section.waitFor({ timeout: 6000 });
     const txt = (await section.innerText()).replace(/\u00a0/g," ").replace(/\s+/g," ").trim();
 
     const spreadMatches = txt.match(/([+-]\d+(\.\d+)?)/g) || [];
@@ -400,7 +493,7 @@ async function scrapeLiveOddsOnce(league, gameId) {
 
     return { liveAwaySpread, liveHomeSpread, liveTotal, liveAwayML, liveHomeML, halfScore };
   } catch (err) {
-    warn("Live DOM scrape failed:", err.message, url);
+    warn("Live scrape failed:", err.message, url);
     return null;
   } finally { await browser.close(); }
 }
@@ -462,13 +555,12 @@ async function underlineFavoriteInMatchup(sheets, sheetId, rowNum, colIdx, awayN
   if (favSide === "away") {
     runs = [
       { startIndex: awayStart, format: { underline: true } },
-      { startIndex: awayEnd + 1 }, // space before "@"
-      { startIndex: atPos, format: { underline: false } }
+      { startIndex: awayEnd }, // stop underline at end of away
     ];
   } else if (favSide === "home") {
     runs = [
       { startIndex: homeStart, format: { underline: true } },
-      { startIndex: homeEnd, format: { underline: false } }
+      { startIndex: homeEnd }, // stop underline at end of home
     ];
   } else return;
 
@@ -544,7 +636,7 @@ async function underlineFavoriteInMatchup(sheets, sheetId, rowNum, colIdx, awayN
     else keyToRow.set(keyOf(r[idxDate]||"", r[idxMatch]||""), rowNum);
   });
 
-  // Centering + get sheetId (for underline formatting)
+  // Centering + sheetId (for underline)
   const sheetId = await getSheetIdAndCenter(sheets);
 
   // Pull events
@@ -568,9 +660,7 @@ async function underlineFavoriteInMatchup(sheets, sheetId, rowNum, colIdx, awayN
 
   // Pregame append aligned to existing header (with aliases)
   let appendBatch = [];
-  const hmap = new Proxy(hmapRaw, {
-    get: (t,p)=> resolveHeaderIndex(hmapRaw, p) // alias-aware lookups
-  });
+  const hmap = new Proxy(hmapRaw, { get: (t,p)=> resolveHeaderIndex(hmapRaw, p) });
 
   for (const ev of events) {
     const eventDayKey = yyyymmddInET(new Date(ev.date));
@@ -664,7 +754,7 @@ async function underlineFavoriteInMatchup(sheets, sheetId, rowNum, colIdx, awayN
 
   await batch.flush(sheets);
 
-  // Adaptive master wait = the single sleep the job takes to revisit games right around halftime.
+  // Adaptive master wait = the single sleep to revisit games near halftime
   if (ADAPTIVE_HALFTIME === "1" && masterDelayMin != null) {
     log(`⏳ Adaptive master wait: ${masterDelayMin} minute(s).`);
     await new Promise(r => setTimeout(r, Math.ceil(masterDelayMin*60*1000)));
@@ -697,7 +787,7 @@ async function underlineFavoriteInMatchup(sheets, sheetId, rowNum, colIdx, awayN
       const statusName = (ev.status?.type?.name || comp.status?.type?.name || "").toUpperCase();
       if (!statusName.includes("HALFTIME")) continue;
 
-      // best-effort live odds; but we *always* write Half + half score from summary
+      // prefer embedded JSON live odds; fallback to DOM; fallback to summary for score
       let live = await scrapeLiveOddsOnce(LEAGUE, ev.id);
       if (!live) {
         try {
@@ -730,7 +820,7 @@ async function underlineFavoriteInMatchup(sheets, sheetId, rowNum, colIdx, awayN
           requestBody: { valueInputOption: "RAW", data: payload }
         });
       }
-      log(`🕐 Halftime written for ${matchup} (with fallback)`);
+      log(`🕐 Halftime written for ${matchup}`);
     }
   }
 
