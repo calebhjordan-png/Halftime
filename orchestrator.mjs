@@ -1,61 +1,51 @@
-// orchestrator.mjs — with GAME_IDS filter, Game ID–first row targeting, team-correct spreads, live status, week per-day
-
 import { google } from "googleapis";
 import * as playwright from "playwright";
 
-/** ====== CONFIG via GitHub Action env ====== */
-const SHEET_ID      = (process.env.GOOGLE_SHEET_ID || "").trim();
-const CREDS_RAW     = (process.env.GOOGLE_SERVICE_ACCOUNT || "").trim();
-const LEAGUE        = (process.env.LEAGUE || "nfl").toLowerCase();          // "nfl" | "college-football"
-const TAB_NAME      = (process.env.TAB_NAME || (LEAGUE === "college-football" ? "CFB" : "NFL")).trim();
-const RUN_SCOPE     = (process.env.RUN_SCOPE || "today").toLowerCase();     // "today" | "week"
-const ADAPTIVE_HALFTIME = "1"; // always on as requested
+/** ====== CONFIG ====== */
+const SHEET_ID  = (process.env.GOOGLE_SHEET_ID || "").trim();
+const CREDS_RAW = (process.env.GOOGLE_SERVICE_ACCOUNT || "").trim();
+const LEAGUE    = (process.env.LEAGUE || "nfl").toLowerCase();           // nfl | college-football
+const TAB_NAME  = (process.env.TAB_NAME || (LEAGUE === "college-football" ? "CFB" : "NFL")).trim();
+const RUN_SCOPE = (process.env.RUN_SCOPE || "today").toLowerCase();      // today | week
+const ADAPTIVE_HALFTIME = "1"; // always on
 
-// NEW: optional filter list of game IDs (comma/space separated)
 const GAME_IDS = (() => {
   const raw = (process.env.GAME_IDS || "").trim();
   if (!raw) return null;
   return raw.split(/[,\s]+/).map(s => s.trim()).filter(Boolean);
 })();
 
-/** Kickoff window and adaptive bounds */
+/** ====== Constants ====== */
+const ET_TZ = "America/New_York";
 const MIN_RECHECK_MIN = 2;
 const MAX_RECHECK_MIN = 20;
 
-/** Column names */
-const COLS = [
+const DEFAULT_COLS = [
   "Date","Week","Status","Matchup","Final Score",
   "Away Spread","Away ML","Home Spread","Home ML","Total",
   "Half Score","Live Away Spread","Live Away ML","Live Home Spread","Live Home ML","Live Total"
 ];
 
-/** ====== Helpers ====== */
+/** ===== Helpers ===== */
 const log = (...a)=>console.log(...a);
 const warn = (...a)=>console.warn(...a);
 
-/* parse service account (raw JSON or base64) */
 function parseServiceAccount(raw) {
   if (!raw) throw new Error("GOOGLE_SERVICE_ACCOUNT is empty");
-  if (raw.trim().startsWith("{")) return JSON.parse(raw); // raw JSON
-  const json = Buffer.from(raw, "base64").toString("utf8"); // Base64
-  return JSON.parse(json);
+  if (raw.trim().startsWith("{")) return JSON.parse(raw);
+  return JSON.parse(Buffer.from(raw, "base64").toString("utf8"));
 }
-
-/* --- ET formatters --- */
-const ET_TZ = "America/New_York";
 
 function fmtETTime(dateLike) {
   return new Intl.DateTimeFormat("en-US", {
     timeZone: ET_TZ, hour: "numeric", minute: "2-digit", hour12: true
   }).format(new Date(dateLike));
 }
-
 function fmtETDate(dateLike) {
   return new Intl.DateTimeFormat("en-US", {
     timeZone: ET_TZ, year: "numeric", month: "2-digit", day: "2-digit"
   }).format(new Date(dateLike)); // mm/dd/yyyy
 }
-
 function yyyymmddInET(d=new Date()) {
   const parts = new Intl.DateTimeFormat("en-US", {
     timeZone: ET_TZ, year: "numeric", month: "2-digit", day: "2-digit"
@@ -63,7 +53,6 @@ function yyyymmddInET(d=new Date()) {
   const get = k => parts.find(p=>p.type===k)?.value || "";
   return `${get("year")}${get("month")}${get("day")}`;
 }
-
 async function fetchJson(url) {
   log("GET", url);
   const res = await fetch(url, { headers: { "User-Agent": "halftime-bot", "Referer":"https://www.espn.com/" } });
@@ -98,9 +87,28 @@ function mapHeadersToIndex(headerRow) {
   headerRow.forEach((h,i)=> map[(h||"").trim().toLowerCase()] = i);
   return map;
 }
+/** Header alias resolution (handles your short headers) */
+function resolveHeaderIndex(hmap, name) {
+  const key = name.toLowerCase();
+  if (hmap[key] != null) return hmap[key];
+  const aliases = {
+    "away spread": ["a spread","awayspread"],
+    "home spread": ["h spread","homespread"],
+    "away ml": ["a ml","awayml"],
+    "home ml": ["h ml","homeml"],
+    "half score": ["h score","halfscore"],
+    "live away spread": ["live a spread","liveawayspread"],
+    "live home spread": ["live h spread","livehomespread"],
+    "live away ml": ["live a ml","liveawayml"],
+    "live home ml": ["live h ml","livehomeml"],
+    "live total": ["live o/u","live ou","livetotal"],
+  };
+  for (const alt of (aliases[key]||[])) {
+    if (hmap[alt] != null) return hmap[alt];
+  }
+  return undefined;
+}
 function keyOf(dateStr, matchup) { return `${(dateStr||"").trim()}__${(matchup||"").trim()}`; }
-
-/** Normalize numeric-ish value (preserve +) */
 function numOrBlank(v) {
   if (v === 0) return "0";
   if (v == null) return "";
@@ -110,7 +118,7 @@ function numOrBlank(v) {
   return s.startsWith("+") ? `+${n}` : `${n}`;
 }
 
-/** ===== Status formatting (fixed to ET) ===== */
+/** Status text: live shortDetail or kickoff time only (no date/year) */
 function tidyStatus(evt) {
   const comp = evt.competitions?.[0] || {};
   const typeObj = evt.status?.type || comp.status?.type || {};
@@ -118,14 +126,11 @@ function tidyStatus(evt) {
   const short = (typeObj.shortDetail || "").trim();
   if (name.includes("FINAL")) return "Final";
   if (name.includes("HALFTIME")) return "Half";
-  if (name.includes("IN_PROGRESS") || name.includes("LIVE")) {
-    return short || "In Progress";
-  }
-  // scheduled → format in ET
-  return fmtETTime(evt.date);
+  if (name.includes("IN_PROGRESS") || name.includes("LIVE")) return short || "In Progress";
+  return fmtETTime(evt.date); // scheduled: time only
 }
 
-/** ===== Week label resolvers ===== */
+/** ===== Week label resolvers (per-date) ===== */
 function resolveWeekLabelFromCalendar(sb, eventDateISO) {
   const cal = sb?.leagues?.[0]?.calendar || sb?.calendar || [];
   const t = new Date(eventDateISO).getTime();
@@ -138,10 +143,9 @@ function resolveWeekLabelFromCalendar(sb, eventDateISO) {
       if (!start || !end) continue;
       const s = new Date(start).getTime();
       const ed = new Date(end).getTime();
-      if (!Number.isFinite(s) || !Number.isFinite(ed)) continue;
-      if (t >= s && t <= ed) {
+      if (Number.isFinite(s) && Number.isFinite(ed) && t >= s && t <= ed) {
         if (/Week\s*\d+/i.test(label)) return label;
-        if (label) return label; // Bowls/CFP too
+        if (label) return label;
       }
     }
   }
@@ -158,10 +162,9 @@ function resolveWeekLabelCFB(sb, eventDateISO) {
   return resolveWeekLabelFromCalendar(sb, eventDateISO) || "Regular Season";
 }
 
-/** ===== ML extractor (includes PickCenter shapes) ===== */
+/** Moneylines (many ESPN shapes) */
 function extractMoneylines(o, awayId, homeId, competitors = []) {
   let awayML = "", homeML = "";
-
   if (o && (o.awayTeamOdds || o.homeTeamOdds)) {
     const aObj = o.awayTeamOdds || {};
     const hObj = o.homeTeamOdds || {};
@@ -176,7 +179,6 @@ function extractMoneylines(o, awayId, homeId, competitors = []) {
     homeML = homeML || homeClose;
     if (awayML || homeML) return { awayML, homeML };
   }
-
   if (Array.isArray(o?.teamOdds)) {
     for (const t of o.teamOdds) {
       const tid = String(t?.teamId ?? t?.team?.id ?? "");
@@ -187,7 +189,6 @@ function extractMoneylines(o, awayId, homeId, competitors = []) {
     }
     if (awayML || homeML) return { awayML, homeML };
   }
-
   if (Array.isArray(o?.competitors)) {
     const findML = c => numOrBlank(c?.moneyLine ?? c?.moneyline ?? c?.odds?.moneyLine ?? c?.odds?.moneyline);
     const aML = findML(o.competitors.find(c => String(c?.id ?? c?.teamId) === String(awayId)));
@@ -195,11 +196,9 @@ function extractMoneylines(o, awayId, homeId, competitors = []) {
     awayML = awayML || aML; homeML = homeML || hML;
     if (awayML || homeML) return { awayML, homeML };
   }
-
   awayML = awayML || numOrBlank(o?.moneyLineAway ?? o?.awayTeamMoneyLine ?? o?.awayMoneyLine ?? o?.awayMl);
   homeML = homeML || numOrBlank(o?.moneyLineHome ?? o?.homeTeamMoneyLine ?? o?.homeMoneyLine ?? o?.homeMl);
   if (awayML || homeML) return { awayML, homeML };
-
   const favId = String(o?.favorite ?? o?.favoriteId ?? o?.favoriteTeamId ?? "");
   const favML = numOrBlank(o?.favoriteMoneyLine);
   const dogML = numOrBlank(o?.underdogMoneyLine);
@@ -207,7 +206,6 @@ function extractMoneylines(o, awayId, homeId, competitors = []) {
     if (String(awayId) === favId) { awayML = awayML || favML; homeML = homeML || dogML; return { awayML, homeML }; }
     if (String(homeId) === favId) { homeML = homeML || favML; awayML = awayML || dogML; return { awayML, homeML }; }
   }
-
   if (Array.isArray(competitors)) {
     for (const c of competitors) {
       const ml = numOrBlank(c?.odds?.moneyLine ?? c?.odds?.moneyline ?? c?.odds?.money_line);
@@ -216,37 +214,28 @@ function extractMoneylines(o, awayId, homeId, competitors = []) {
       if (c.homeAway === "home") homeML = homeML || ml;
     }
   }
-
   return { awayML, homeML };
 }
-
-/** ML fallback: /summary */
 async function extractMLWithFallback(event, baseOdds, away, home) {
   const base = extractMoneylines(baseOdds || {}, away?.team?.id, home?.team?.id, (event.competitions?.[0]?.competitors)||[]);
   if (base.awayML && base.homeML) return base;
-
   try {
     const sum = await fetchJson(summaryUrl(LEAGUE, event.id));
     const candidates = [];
     if (Array.isArray(sum?.header?.competitions?.[0]?.odds)) candidates.push(...sum.header.competitions[0].odds);
     if (Array.isArray(sum?.odds)) candidates.push(...sum.odds);
     if (Array.isArray(sum?.pickcenter)) candidates.push(...sum.pickcenter);
-
     for (const cand of candidates) {
       const ml = extractMoneylines(cand, away?.team?.id, home?.team?.id, (event.competitions?.[0]?.competitors)||[]);
       if (ml.awayML || ml.homeML) return ml;
     }
-  } catch (e) {
-    warn("Summary fallback failed:", e?.message || e);
-  }
-
+  } catch (e) { warn("Summary fallback failed:", e?.message || e); }
   return base;
 }
 
-/** ===== robust spread extractor (team-specific lines) ===== */
+/** ==== Spread extractor (team-specific lines) ==== */
 function extractSpreads(o, awayId, homeId) {
   let away = "", home = "";
-
   const setFromFav = (favId, raw) => {
     const n = Number.parseFloat(raw);
     if (!Number.isFinite(n)) return;
@@ -254,7 +243,6 @@ function extractSpreads(o, awayId, homeId) {
     if (String(favId) === String(awayId)) { away = `-${s}`; home = `+${s}`; }
     else if (String(favId) === String(homeId)) { home = `-${s}`; away = `+${s}`; }
   };
-
   const favId = o?.favorite ?? o?.favoriteTeamId ?? o?.favoriteId;
   const line  = o?.spread ?? o?.pointSpread ?? o?.handicap;
   if (favId != null && line != null) setFromFav(favId, line);
@@ -269,7 +257,6 @@ function extractSpreads(o, awayId, homeId) {
       if (tid === String(homeId)) home = n > 0 ? `+${Math.abs(n)}` : `${n}`;
     }
   }
-
   if (!(away && home) && Array.isArray(o?.competitors)) {
     for (const c of o.competitors) {
       const n = Number.parseFloat(c?.odds?.spread ?? c?.odds?.handicap ?? c?.odds?.pointSpread);
@@ -278,7 +265,6 @@ function extractSpreads(o, awayId, homeId) {
       if (c.homeAway === "home") home = n > 0 ? `+${Math.abs(n)}` : `${n}`;
     }
   }
-
   if (!(away && home) && o?.details) {
     const m = String(o.details).match(/([+-]?\d+(\.\d+)?)/);
     if (m) {
@@ -287,7 +273,6 @@ function extractSpreads(o, awayId, homeId) {
       else { away = n > 0 ? `+${Math.abs(n)}` : `${n}`; home = n > 0 ? `-${Math.abs(n)}` : `+${Math.abs(n)}`; }
     }
   }
-
   return { awaySpread: away || "", homeSpread: home || "" };
 }
 
@@ -300,19 +285,20 @@ function pregameRowFactory(sbForDay) {
 
     const awayName = away?.team?.shortDisplayName || away?.team?.abbreviation || away?.team?.name || "Away";
     const homeName = home?.team?.shortDisplayName || home?.team?.abbreviation || home?.team?.name || "Home";
-    const matchup = `${awayName} @ ${homeName}`;
 
     const isFinal = /final/i.test(event.status?.type?.name || comp.status?.type?.name || "");
     const finalScore = isFinal ? `${away?.score ?? ""}-${home?.score ?? ""}` : "";
 
     const o0 = pickOdds(comp.odds || event.odds || []);
-    let awaySpread = "", homeSpread = "", total = "", awayML = "", homeML = "";
+    let awaySpread = "", homeSpread = "", total = "", awayML = "", homeML = "", favSide = null;
 
     if (o0) {
       total = (o0.overUnder ?? o0.total) ?? "";
       const sp = extractSpreads(o0, away?.team?.id, home?.team?.id);
       awaySpread = sp.awaySpread;
       homeSpread = sp.homeSpread;
+      if (awaySpread && awaySpread.startsWith("-")) favSide = "away";
+      else if (homeSpread && homeSpread.startsWith("-")) favSide = "home";
 
       const ml = await extractMLWithFallback(event, o0, away, home);
       awayML = ml.awayML || "";
@@ -330,12 +316,13 @@ function pregameRowFactory(sbForDay) {
     const statusClean = tidyStatus(event);
     const dateET = fmtETDate(event.date);
 
+    const matchupPlain = `${awayName} @ ${homeName}`;
     return {
       values: [
         dateET,                 // Date
         weekText || "",         // Week
         statusClean,            // Status
-        matchup,                // Matchup
+        matchupPlain,           // Matchup (we'll apply underline formatting after write)
         finalScore,             // Final Score
         awaySpread || "",       // Away Spread
         String(awayML || ""),   // Away ML
@@ -345,12 +332,14 @@ function pregameRowFactory(sbForDay) {
         "", "", "", "", "", ""  // live cols
       ],
       dateET,
-      matchup
+      matchupPlain,
+      favSide,
+      names: { awayName, homeName }
     };
   };
 }
 
-/** ===== Halftime-ish? and delays ===== */
+/** Halftime detection & adaptive wait */
 function isHalftimeLike(evt) {
   const t = (evt.status?.type?.name || evt.competitions?.[0]?.status?.type?.name || "").toUpperCase();
   const short = (evt.status?.type?.shortDetail || "").toUpperCase();
@@ -377,7 +366,7 @@ function q2AdaptiveCandidateMinutes(evt) {
   return clampRecheck(2 * minutesLeft);
 }
 
-/** ===== Playwright DOM scrape for LIVE odds at halftime (one-time) ===== */
+/** LIVE odds scrape (best effort) */
 async function scrapeLiveOddsOnce(league, gameId) {
   const url = gameUrl(league, gameId);
   const browser = await playwright.chromium.launch({ headless: true });
@@ -413,12 +402,10 @@ async function scrapeLiveOddsOnce(league, gameId) {
   } catch (err) {
     warn("Live DOM scrape failed:", err.message, url);
     return null;
-  } finally {
-    await browser.close();
-  }
+  } finally { await browser.close(); }
 }
 
-/** Batch writer */
+/** Sheets helpers */
 function colLetter(i){ return String.fromCharCode("A".charCodeAt(0) + i); }
 class BatchWriter {
   constructor(tab){ this.tab = tab; this.acc = []; }
@@ -438,33 +425,81 @@ class BatchWriter {
   }
 }
 
-/** Center-align all columns A–P (idempotent) */
-async function applyCenterFormatting(sheets) {
+/** Center cols + capture sheetId for rich text formatting */
+async function getSheetIdAndCenter(sheets) {
   const meta = await sheets.spreadsheets.get({ spreadsheetId: SHEET_ID });
-  const sheetId = (meta.data.sheets || []).find(s => s.properties?.title === TAB_NAME)?.properties?.sheetId;
-  if (sheetId == null) return;
+  const sheet = (meta.data.sheets || []).find(s => s.properties?.title === TAB_NAME);
+  const sheetId = sheet?.properties?.sheetId;
+  if (sheetId == null) return null;
   await sheets.spreadsheets.batchUpdate({
     spreadsheetId: SHEET_ID,
     requestBody: {
-      requests: [
-        {
-          repeatCell: {
-            range: { sheetId, startRowIndex: 0, startColumnIndex: 0, endColumnIndex: 16 },
-            cell: { userEnteredFormat: { horizontalAlignment: "CENTER" } },
-            fields: "userEnteredFormat.horizontalAlignment"
-          }
+      requests: [{
+        repeatCell: {
+          range: { sheetId, startRowIndex: 0, startColumnIndex: 0, endColumnIndex: 16 },
+          cell: { userEnteredFormat: { horizontalAlignment: "CENTER" } },
+          fields: "userEnteredFormat.horizontalAlignment"
         }
-      ]
+      }]
+    }
+  });
+  return sheetId;
+}
+
+/** Underline favorite in Matchup cell using rich text runs */
+async function underlineFavoriteInMatchup(sheets, sheetId, rowNum, colIdx, awayName, homeName, favSide) {
+  if (!sheetId || favSide == null || colIdx == null) return;
+  const plain = `${awayName} @ ${homeName}`;
+  const atPos = plain.indexOf("@");
+  if (atPos < 0) return;
+
+  const awayStart = 0;
+  const awayEnd = awayName.length;
+  const homeStart = atPos + 1 + 1; // skip "@ "
+  const homeEnd = plain.length;
+
+  let runs = [];
+  if (favSide === "away") {
+    runs = [
+      { startIndex: awayStart, format: { underline: true } },
+      { startIndex: awayEnd + 1 }, // space before "@"
+      { startIndex: atPos, format: { underline: false } }
+    ];
+  } else if (favSide === "home") {
+    runs = [
+      { startIndex: homeStart, format: { underline: true } },
+      { startIndex: homeEnd, format: { underline: false } }
+    ];
+  } else return;
+
+  await sheets.spreadsheets.batchUpdate({
+    spreadsheetId: SHEET_ID,
+    requestBody: {
+      requests: [{
+        updateCells: {
+          range: {
+            sheetId,
+            startRowIndex: rowNum-1,
+            endRowIndex: rowNum,
+            startColumnIndex: colIdx,
+            endColumnIndex: colIdx+1
+          },
+          rows: [{
+            values: [{
+              userEnteredValue: { stringValue: plain },
+              textFormatRuns: runs
+            }]
+          }],
+          fields: "userEnteredValue,textFormatRuns"
+        }
+      }]
     }
   });
 }
 
-/** ====== MAIN ====== */
+/** ===== MAIN ===== */
 (async function main() {
-  if (!SHEET_ID || !CREDS_RAW) {
-    console.error("Missing secrets.");
-    process.exit(1);
-  }
+  if (!SHEET_ID || !CREDS_RAW) { console.error("Missing secrets."); process.exit(1); }
   const CREDS = parseServiceAccount(CREDS_RAW);
   const auth = new google.auth.GoogleAuth({
     credentials: { client_email: CREDS.client_email, private_key: CREDS.private_key },
@@ -482,41 +517,42 @@ async function applyCenterFormatting(sheets) {
     });
   }
   const read = await sheets.spreadsheets.values.get({
-    spreadsheetId: SHEET_ID,
-    range: `${TAB_NAME}!A1:Z`,
+    spreadsheetId: SHEET_ID, range: `${TAB_NAME}!A1:Z`,
   });
   const values = read.data.values || [];
   let header = values[0] || [];
   if (header.length === 0) {
     await sheets.spreadsheets.values.update({
-      spreadsheetId: SHEET_ID,
-      range: `${TAB_NAME}!A1`,
-      valueInputOption: "RAW",
-      requestBody: { values: [COLS] }
+      spreadsheetId: SHEET_ID, range: `${TAB_NAME}!A1`,
+      valueInputOption: "RAW", requestBody: { values: [DEFAULT_COLS] }
     });
-    header = COLS.slice();
+    header = DEFAULT_COLS.slice();
   }
-  const hmap = mapHeadersToIndex(header);
+  const hmapRaw = mapHeadersToIndex(header);
   const rows = values.slice(1);
 
-  // Build index preferring Game ID if present
-  const hGameId = hmap["game id"];
-  const keyToRowNum = new Map();
-  rows.forEach((r, i) => {
-    const rowNum = i + 2;
-    const gid = hGameId != null ? (r[hGameId] || "").toString().trim() : "";
-    if (gid) keyToRowNum.set(`id:${gid}`, rowNum);
-    else keyToRowNum.set(keyOf(r[hmap["date"]], r[hmap["matchup"]]), rowNum);
+  // Build index preferring Game ID
+  const idxGameId = resolveHeaderIndex(hmapRaw, "game id");
+  const idxDate   = resolveHeaderIndex(hmapRaw, "date");
+  const idxMatch  = resolveHeaderIndex(hmapRaw, "matchup");
+
+  const keyToRow = new Map();
+  rows.forEach((r,i)=>{
+    const rowNum = i+2;
+    const gid = idxGameId!=null ? (r[idxGameId]||"").toString().trim() : "";
+    if (gid) keyToRow.set(`id:${gid}`, rowNum);
+    else keyToRow.set(keyOf(r[idxDate]||"", r[idxMatch]||""), rowNum);
   });
 
-  // Apply centering (A..P)
-  await applyCenterFormatting(sheets);
+  // Centering + get sheetId (for underline formatting)
+  const sheetId = await getSheetIdAndCenter(sheets);
 
-  // Pull events (today or week) and keep a per-date scoreboard map
+  // Pull events
   const datesList = RUN_SCOPE === "week"
     ? (()=>{ const start = new Date(); return Array.from({length:7}, (_,i)=> yyyymmddInET(new Date(start.getTime()+i*86400000))); })()
     : [ yyyymmddInET(new Date()) ];
 
+  // map date → scoreboard
   const sbByDate = new Map();
   let events = [];
   for (const d of datesList) {
@@ -524,61 +560,69 @@ async function applyCenterFormatting(sheets) {
     sbByDate.set(d, sb);
     events = events.concat(sb?.events || []);
   }
-  // Optional: only selected games
   if (Array.isArray(GAME_IDS) && GAME_IDS.length) {
     events = events.filter(e => GAME_IDS.includes(String(e.id)));
   }
-
   const seen = new Set(); events = events.filter(e => !seen.has(e.id) && seen.add(e.id));
   log(`Events found: ${events.length}`);
 
-  // Pregame append (aligned to EXISTING header; includes Game ID if present)
+  // Pregame append aligned to existing header (with aliases)
   let appendBatch = [];
+  const hmap = new Proxy(hmapRaw, {
+    get: (t,p)=> resolveHeaderIndex(hmapRaw, p) // alias-aware lookups
+  });
+
   for (const ev of events) {
     const eventDayKey = yyyymmddInET(new Date(ev.date));
-    const sbForThisEvent = sbByDate.get(eventDayKey) || sbByDate.values().next().value || null;
-    const buildPregame = pregameRowFactory(sbForThisEvent);
-    const { values: rowVals, dateET, matchup } = await buildPregame(ev);
+    const sbForDay = sbByDate.get(eventDayKey) || [...sbByDate.values()][0] || null;
+    const buildPregame = pregameRowFactory(sbForDay);
+    const { values: rowVals, dateET, matchupPlain, favSide, names } = await buildPregame(ev);
 
-    if (keyToRowNum.has(`id:${ev.id}`) || keyToRowNum.has(keyOf(dateET, matchup))) continue;
+    if (keyToRow.has(`id:${ev.id}`) || keyToRow.has(keyOf(dateET, matchupPlain))) continue;
 
     const aligned = new Array(header.length).fill("");
-    const lowerH = Object.fromEntries(Object.entries(hmap).map(([k,v])=>[k.toLowerCase(),v]));
-    const put = (name, val) => {
-      const j = lowerH[name.toLowerCase()];
-      if (j != null) aligned[j] = val;
-    };
-
-    const names = ["Date","Week","Status","Matchup","Final Score","Away Spread","Away ML","Home Spread","Home ML","Total","Half Score","Live Away Spread","Live Away ML","Live Home Spread","Live Home ML","Live Total"];
-    names.forEach((n, idx) => put(n, rowVals[idx]));
-
-    if (hGameId != null) aligned[hGameId] = String(ev.id);
-
-    appendBatch.push(aligned);
+    const nameList = ["Date","Week","Status","Matchup","Final Score","Away Spread","Away ML","Home Spread","Home ML","Total","Half Score","Live Away Spread","Live Away ML","Live Home Spread","Live Home ML","Live Total"];
+    for (let i=0;i<nameList.length;i++){
+      const idx = resolveHeaderIndex(hmapRaw, nameList[i]);
+      if (idx != null) aligned[idx] = rowVals[i];
+    }
+    if (idxGameId != null) aligned[idxGameId] = String(ev.id);
+    appendBatch.push({ aligned, ev, matchupPlain, favSide, names });
   }
+
   if (appendBatch.length) {
     await sheets.spreadsheets.values.append({
-      spreadsheetId: SHEET_ID,
-      range: `${TAB_NAME}!A1`,
+      spreadsheetId: SHEET_ID, range: `${TAB_NAME}!A1`,
       valueInputOption: "RAW",
-      requestBody: { values: appendBatch },
+      requestBody: { values: appendBatch.map(x=>x.aligned) },
     });
-    // Refresh index after append
+    // rebuild index
     const re = await sheets.spreadsheets.values.get({ spreadsheetId: SHEET_ID, range: `${TAB_NAME}!A1:Z` });
     const v2 = re.data.values || [];
     const hdr2 = v2[0] || header;
     const h2 = mapHeadersToIndex(hdr2);
-    const gidIdx = h2["game id"];
+    const id2 = resolveHeaderIndex(h2, "game id");
+    const date2 = resolveHeaderIndex(h2, "date");
+    const match2 = resolveHeaderIndex(h2, "matchup");
+
     (v2.slice(1)).forEach((r, i) => {
       const rowNum = i + 2;
-      const gid = gidIdx != null ? (r[gidIdx] || "").toString().trim() : "";
-      if (gid) keyToRowNum.set(`id:${gid}`, rowNum);
-      else keyToRowNum.set(keyOf(r[h2["date"]], r[h2["matchup"]]), rowNum);
+      const gid = id2 != null ? (r[id2] || "").toString().trim() : "";
+      if (gid) keyToRow.set(`id:${gid}`, rowNum);
+      else keyToRow.set(keyOf(r[date2]||"", r[match2]||""), rowNum);
     });
+
+    // apply underline for favorites in the rows we just wrote
+    for (const item of appendBatch) {
+      const rowNum = keyToRow.get(`id:${item.ev.id}`) || keyToRow.get(keyOf(fmtETDate(item.ev.date), item.matchupPlain));
+      if (!rowNum) continue;
+      const idxMatchCol = resolveHeaderIndex(hmapRaw, "matchup");
+      await underlineFavoriteInMatchup(sheets, sheetId, rowNum, idxMatchCol, item.names.awayName, item.names.homeName, item.favSide);
+    }
     log(`✅ Appended ${appendBatch.length} pregame row(s).`);
   }
 
-  // ===== Pass 1: finals/halftime writes + live status + collect candidate delays
+  // Pass 1: finals / live status / halftime candidates
   const batch = new BatchWriter(TAB_NAME);
   let masterDelayMin = null;
 
@@ -591,8 +635,8 @@ async function applyCenterFormatting(sheets) {
     const matchup = `${awayName} @ ${homeName}`;
     const dateET = fmtETDate(ev.date);
 
-    const rowKey = (hGameId != null) ? `id:${ev.id}` : keyOf(dateET, matchup);
-    const rowNum = keyToRowNum.get(rowKey);
+    const rowKey = (idxGameId != null) ? `id:${ev.id}` : keyOf(dateET, matchup);
+    const rowNum = keyToRow.get(rowKey);
     if (!rowNum) continue;
 
     const statusType = (ev.status?.type || comp.status?.type || {});
@@ -600,66 +644,32 @@ async function applyCenterFormatting(sheets) {
     const statusShort = (statusType.shortDetail || "").trim();
     const scorePair = `${away?.score ?? ""}-${home?.score ?? ""}`;
 
-    // Final score
     if (statusName.includes("FINAL")) {
-      if (hmap["final score"] !== undefined) batch.add(rowNum, hmap["final score"], scorePair);
-      if (hmap["status"] !== undefined)      batch.add(rowNum, hmap["status"], "Final");
+      const iFS = resolveHeaderIndex(hmapRaw, "final score");
+      const iST = resolveHeaderIndex(hmapRaw, "status");
+      if (iFS!=null) batch.add(rowNum, iFS, scorePair);
+      if (iST!=null) batch.add(rowNum, iST, "Final");
       continue;
     }
 
-    // Live status clock
-    if ((/IN_PROGRESS|LIVE/i).test(statusName) && hmap["status"] !== undefined) {
-      batch.add(rowNum, hmap["status"], statusShort || "In Progress");
+    if ((/IN_PROGRESS|LIVE/i).test(statusName)) {
+      const iST = resolveHeaderIndex(hmapRaw, "status");
+      if (iST!=null) batch.add(rowNum, iST, statusShort || "In Progress");
     }
 
-    // Halftime write (one-time)
-    const currentRow = (values[rowNum-1] || []);
-    const halfAlready = (currentRow[hmap["half score"]] || "").toString().trim();
-    const liveTotalVal = (currentRow[hmap["live total"]] || "").toString().trim();
-
-    if (isHalftimeLike(ev) && !liveTotalVal && !halfAlready) {
-      const live = await scrapeLiveOddsOnce(LEAGUE, ev.id);
-      if (live) {
-        const { liveAwaySpread, liveHomeSpread, liveTotal, liveAwayML, liveHomeML, halfScore } = live;
-        const payload = [];
-        const add = (name,val) => {
-          const idx = hmap[name]; if (idx===undefined || !val) return;
-          const range = `${TAB_NAME}!${colLetter(idx)}${rowNum}:${colLetter(idx)}${rowNum}`;
-          payload.push({ range, values: [[val]] });
-        };
-        add("status", "Half");
-        if (halfScore) add("half score", halfScore);
-        add("live away spread", liveAwaySpread);
-        add("live home spread", liveHomeSpread);
-        add("live away ml", liveAwayML);
-        add("live home ml", liveHomeML);
-        add("live total", liveTotal);
-
-        if (payload.length) {
-          await sheets.spreadsheets.values.batchUpdate({
-            spreadsheetId: SHEET_ID,
-            requestBody: { valueInputOption: "RAW", data: payload }
-          });
-        }
-        log(`🕐 Halftime LIVE written for ${matchup}`);
-        continue;
-      }
-    }
-
-    // Adaptive recheck candidate (Q2 under 10:00 → 2x minutes remaining)
-    const q2Cand = q2AdaptiveCandidateMinutes(ev);
-    if (q2Cand != null) masterDelayMin = masterDelayMin == null ? q2Cand : Math.min(masterDelayMin, q2Cand);
+    // halftime candidates (adaptive wait)
+    const cand = q2AdaptiveCandidateMinutes(ev);
+    if (cand != null) masterDelayMin = masterDelayMin==null ? cand : Math.min(masterDelayMin, cand);
   }
 
   await batch.flush(sheets);
 
-  // ===== Single master sleep (if any) and one more halftime pass
+  // Adaptive master wait = the single sleep the job takes to revisit games right around halftime.
   if (ADAPTIVE_HALFTIME === "1" && masterDelayMin != null) {
-    const ms = Math.ceil(masterDelayMin * 60 * 1000);
     log(`⏳ Adaptive master wait: ${masterDelayMin} minute(s).`);
-    await new Promise(r => setTimeout(r, ms));
+    await new Promise(r => setTimeout(r, Math.ceil(masterDelayMin*60*1000)));
 
-    // Re-fetch events quickly and do one halftime pass
+    // Refetch & halftime pass
     let events2 = [];
     for (const d of datesList) {
       const sb2 = await fetchJson(scoreboardUrl(LEAGUE, d));
@@ -680,53 +690,49 @@ async function applyCenterFormatting(sheets) {
       const matchup = `${awayName} @ ${homeName}`;
       const dateET = fmtETDate(ev.date);
 
-      const rowKey = (hGameId != null) ? `id:${ev.id}` : keyOf(dateET, matchup);
-      const rowNum = keyToRowNum.get(rowKey);
+      const rowKey = (idxGameId != null) ? `id:${ev.id}` : keyOf(dateET, matchup);
+      const rowNum = keyToRow.get(rowKey);
       if (!rowNum) continue;
 
       const statusName = (ev.status?.type?.name || comp.status?.type?.name || "").toUpperCase();
       if (!statusName.includes("HALFTIME")) continue;
 
-      // read current row snapshot again to avoid double write
-      const snap = await sheets.spreadsheets.values.get({ spreadsheetId: SHEET_ID, range: `${TAB_NAME}!A1:Z` });
-      const rowsNow = (snap.data.values || []).slice(1);
-      const headerNow = (snap.data.values || [])[0] || header;
-      const hmapNow = mapHeadersToIndex(headerNow);
-      const currentRow = rowsNow[rowNum - 2] || [];
-      const halfAlready = (currentRow[hmapNow["half score"]] || "").toString().trim();
-      const liveTotalVal = (currentRow[hmapNow["live total"]] || "").toString().trim();
-      if (halfAlready || liveTotalVal) continue;
-
-      const live = await scrapeLiveOddsOnce(LEAGUE, ev.id);
-      if (live) {
-        const { liveAwaySpread, liveHomeSpread, liveTotal, liveAwayML, liveHomeML, halfScore } = live;
-        const payload = [];
-        const add = (name,val) => {
-          const idx = hmapNow[name]; if (idx===undefined || !val) return;
-          const range = `${TAB_NAME}!${colLetter(idx)}${rowNum}:${colLetter(idx)}${rowNum}`;
-          payload.push({ range, values: [[val]] });
-        };
-        add("status", "Half");
-        if (halfScore) add("half score", halfScore);
-        add("live away spread", liveAwaySpread);
-        add("live home spread", liveHomeSpread);
-        add("live away ml", liveAwayML);
-        add("live home ml", liveHomeML);
-        add("live total", liveTotal);
-
-        if (payload.length) {
-          await sheets.spreadsheets.values.batchUpdate({
-            spreadsheetId: SHEET_ID,
-            requestBody: { valueInputOption: "RAW", data: payload }
-          });
-        }
-        log(`🕐 (Adaptive) Halftime LIVE written for ${matchup}`);
+      // best-effort live odds; but we *always* write Half + half score from summary
+      let live = await scrapeLiveOddsOnce(LEAGUE, ev.id);
+      if (!live) {
+        try {
+          const sum = await fetchJson(summaryUrl(LEAGUE, ev.id));
+          const teams = (sum?.header?.competitions?.[0]?.competitors) || (sum?.competitions?.[0]?.competitors) || [];
+          const a = teams.find(t=>t.homeAway==="away"), h = teams.find(t=>t.homeAway==="home");
+          live = { halfScore: `${a?.score ?? ""}-${h?.score ?? ""}` };
+        } catch {}
       }
+
+      const payload = [];
+      const add = (name,val) => {
+        if (!val) return;
+        const idx = resolveHeaderIndex(hmapRaw, name);
+        if (idx==null) return;
+        const range = `${TAB_NAME}!${colLetter(idx)}${rowNum}:${colLetter(idx)}${rowNum}`;
+        payload.push({ range, values: [[val]] });
+      };
+      add("status", "Half");
+      if (live?.halfScore) add("half score", live.halfScore);
+      if (live?.liveAwaySpread) add("live away spread", live.liveAwaySpread);
+      if (live?.liveHomeSpread) add("live home spread", live.liveHomeSpread);
+      if (live?.liveAwayML) add("live away ml", live.liveAwayML);
+      if (live?.liveHomeML) add("live home ml", live.liveHomeML);
+      if (live?.liveTotal) add("live total", live.liveTotal);
+
+      if (payload.length) {
+        await sheets.spreadsheets.values.batchUpdate({
+          spreadsheetId: SHEET_ID,
+          requestBody: { valueInputOption: "RAW", data: payload }
+        });
+      }
+      log(`🕐 Halftime written for ${matchup} (with fallback)`);
     }
   }
 
   log("✅ Run complete.");
-})().catch(err => {
-  console.error("❌ Error:", err);
-  process.exit(1);
-});
+})().catch(err => { console.error("❌ Error:", err); process.exit(1); });
