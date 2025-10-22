@@ -1,9 +1,9 @@
 // Football.mjs
-// One script: Prefill + Finals (+ optional halftime live snapshot)
+// One script: Prefill + Finals (+ optional halftime "live" snapshot)
 //
-// Env (from Football.yml):
+// Env:
 //   GOOGLE_SHEET_ID, GOOGLE_SERVICE_ACCOUNT (json string or base64)
-//   LEAGUE  = nfl | college-football
+//   LEAGUE = nfl | college-football
 //   TAB_NAME = NFL | CFB
 //   GAME_IDS = optional comma list
 //   MODE = prefill_and_finals [default] | prefill_only | finals_only | live_only
@@ -52,9 +52,16 @@ function scoreboardUrl(lg,dates){
 function summaryUrl(lg,id){ return `https://site.api.espn.com/apis/site/v2/sports/football/${lg}/summary?event=${id}`; }
 function gameUrl(lg,id){ return `https://www.espn.com/${lg}/game/_/gameId/${id}`; }
 
-function isFinal(evt){ return /(FINAL)/i.test(evt?.status?.type?.name || evt?.competitions?.[0]?.status?.type?.name || ""); }
-function isLive(evt){ return /(IN_PROGRESS|LIVE)/i.test(evt?.status?.type?.name || evt?.competitions?.[0]?.status?.type?.name || ""); }
-function isHalf(evt){ const s=(evt?.status?.type?.shortDetail||"").toUpperCase(); return /HALF/.test(s) || /(Q2).*(0:0?0)/.test(s); }
+function isFinalEvent(evt){
+  return /(FINAL)/i.test(evt?.status?.type?.name || evt?.competitions?.[0]?.status?.type?.name || "");
+}
+function isLive(evt){
+  return /(IN_PROGRESS|LIVE)/i.test(evt?.status?.type?.name || evt?.competitions?.[0]?.status?.type?.name || "");
+}
+function isHalf(evt){
+  const s=(evt?.status?.type?.shortDetail||"").toUpperCase();
+  return /HALF/.test(s) || /(Q2).*(0:0?0)/.test(s);
+}
 
 function mapHeadersToIndex(h){ const m={}; h.forEach((v,i)=>m[(v||"").trim().toLowerCase()]=i); return m; }
 function colLetter(i){ return String.fromCharCode(65+i); }
@@ -66,9 +73,8 @@ function pickOdds(arr=[]){
 }
 function resolveFavAndLine(o, awayId, homeId){
   let aSpread="", hSpread="", total = o?.overUnder ?? o?.total ?? "";
-  let favId = String(o?.favoriteTeamId ?? o?.favorite ?? "");
+  const favId = String(o?.favoriteTeamId ?? o?.favorite ?? "");
 
-  // numeric spread
   const raw = typeof o?.spread==="string" ? parseFloat(o.spread) : (Number.isFinite(o?.spread)?o.spread:NaN);
   if(!Number.isNaN(raw) && favId){
     if(String(awayId)===favId){ aSpread = -Math.abs(raw); hSpread = +Math.abs(raw); }
@@ -85,7 +91,8 @@ function resolveFavAndLine(o, awayId, homeId){
 function resolveMLs(o, awayId, homeId){
   const s=v=>v==null? "": String(v);
   if(o?.awayTeamOdds||o?.homeTeamOdds){
-    return {aML:s(o.awayTeamOdds?.moneyLine ?? o.awayTeamOdds?.moneyline), hML:s(o.homeTeamOdds?.moneyLine ?? o.homeTeamOdds?.moneyline)};
+    return {aML:s(o.awayTeamOdds?.moneyLine ?? o.awayTeamOdds?.moneyline),
+            hML:s(o.homeTeamOdds?.moneyLine ?? o.homeTeamOdds?.moneyline)};
   }
   if(o?.moneyline){
     return {aML:s(o.moneyline?.away?.close?.odds ?? o.moneyline?.away?.open?.odds),
@@ -123,7 +130,6 @@ function buildRuns(matchup, underlineAway, boldAway, boldHome){
     {startIndex:A0, format:{bold:!!boldAway, underline:!!underlineAway}},
     {startIndex:H0, format:{bold:!!boldHome, underline:!underlineAway}},
   ];
-  // clamp to valid ascending indices
   return runs
     .map(r=>({...r, startIndex: Math.min(Math.max(r.startIndex,0), Math.max(L-1,0))}))
     .sort((x,y)=>x.startIndex-y.startIndex);
@@ -178,33 +184,62 @@ class Sheets {
       requestBody:{requests:[{updateCells:{range:{sheetId, startRowIndex:row-1,endRowIndex:row,startColumnIndex:colIdx,endColumnIndex:colIdx+1}, rows:[{values:[{userEnteredValue:{stringValue:text}, textFormatRuns:runs}]}], fields:"userEnteredValue,textFormatRuns"}}]}
     });
   }
-  async addGradingCFIfMissing(){
+  async ensureGradingCF(){
+    // Apply CF only to columns G, I, K (spreads & total).
+    // We add two rules per column (pass/fail). Formulas are relative to the top-left of the range.
     const sid = await this.sheetId();
-    const reqs=[];
-    const F=colLetter(5), G=colLetter(6), I=colLetter(8), K=colLetter(10);
-    const row=2;
     const green={red:0.85,green:0.95,blue:0.85}, red={red:0.98,green:0.85,blue:0.85};
 
-    const add=(range,formula,bg)=>reqs.push({
-      addConditionalFormatRule:{
-        rule:{ranges:[{sheetId:sid, startRowIndex:row-1}], booleanRule:{condition:{type:"CUSTOM_FORMULA", values:[{userEnteredValue:formula}]}, format:{backgroundColor:bg}}},
-        index:0
+    const mk = (colIdx, passFormula, failFormula) => ([
+      {
+        addConditionalFormatRule:{
+          index:0,
+          rule:{
+            ranges:[{sheetId:sid,startRowIndex:1,startColumnIndex:colIdx,endColumnIndex:colIdx+1}],
+            booleanRule:{condition:{type:"CUSTOM_FORMULA", values:[{userEnteredValue:passFormula}]}, format:{backgroundColor:green}}
+          }
+        }
+      },
+      {
+        addConditionalFormatRule:{
+          index:0,
+          rule:{
+            ranges:[{sheetId:sid,startRowIndex:1,startColumnIndex:colIdx,endColumnIndex:colIdx+1}],
+            booleanRule:{condition:{type:"CUSTOM_FORMULA", values:[{userEnteredValue:failFormula}]}, format:{backgroundColor:red}}
+          }
+        }
       }
-    });
+    ]);
 
-    // Away spread hit: away - home + A_spread >= 0
-    add(`${this.tab}!${G}${row}:${G}`, `=AND($${F}${row}<>"", VALUE(LEFT($${F}${row},FIND("-",$${F}${row})-1)) - VALUE(MID($${F}${row},FIND("-",$${F}${row})+1,99)) + VALUE($${G}${row}) >= 0)`, green);
-    add(`${this.tab}!${G}${row}:${G}`, `=AND($${F}${row}<>"", VALUE(LEFT($${F}${row},FIND("-",$${F}${row})-1)) - VALUE(MID($${F}${row},FIND("-",$${F}${row})+1,99)) + VALUE($${G}${row}) < 0)`, red);
-    // Home spread hit: home - away + H_spread >= 0
-    add(`${this.tab}!${I}${row}:${I}`, `=AND($${F}${row}<>"", VALUE(MID($${F}${row},FIND("-",$${F}${row})+1,99)) - VALUE(LEFT($${F}${row},FIND("-",$${F}${row})-1)) + VALUE($${I}${row}) >= 0)`, green);
-    add(`${this.tab}!${I}${row}:${I}`, `=AND($${F}${row}<>"", VALUE(MID($${F}${row},FIND("-",$${F}${row})+1,99)) - VALUE(LEFT($${F}${row},FIND("-",$${F}${row})-1)) + VALUE($${I}${row}) < 0)`, red);
-    // Total: green if points > total (Over). You may invert if you prefer to grade by “posted total” vs result.
-    add(`${this.tab}!${K}${row}:${K}`, `=AND($${F}${row}<>"", VALUE(LEFT($${F}${row},FIND("-",$${F}${row})-1)) + VALUE(MID($${F}${row},FIND("-",$${F}${row})+1,99)) > VALUE($${K}${row}))`, green);
-    add(`${this.tab}!${K}${row}:${K}`, `=AND($${F}${row}<>"", VALUE(LEFT($${F}${row},FIND("-",$${F}${row})-1)) + VALUE(MID($${F}${row},FIND("-",$${F}${row})+1,99)) <= VALUE($${K}${row}))`, red);
+    // Relative references: F is Final Score, G is this cell if range starts in G2, etc.
+    // Helpers: AWAY = VALUE(LEFT($F2, FIND("-", $F2)-1)), HOME = VALUE(MID($F2, FIND("-", $F2)+1, 99))
+    const AWAY = 'VALUE(LEFT($F2,FIND("-",$F2)-1))';
+    const HOME = 'VALUE(MID($F2,FIND("-",$F2)+1,99))';
 
-    if(reqs.length){
-      try{ await this.api.spreadsheets.batchUpdate({spreadsheetId:this.sid, requestBody:{requests:reqs}}); }catch(_){}
-    }
+    // Only grade when F (Final Score) exists.
+    const hasFinal = '$F2<>""';
+
+    // G (A Spread): away - home + G2 >= 0  → pass
+    const gPass = `=AND(${hasFinal}, ${AWAY} - ${HOME} + G2 >= 0)`;
+    const gFail = `=AND(${hasFinal}, ${AWAY} - ${HOME} + G2 < 0)`;
+
+    // I (H Spread): home - away + I2 >= 0  → pass
+    const iPass = `=AND(${hasFinal}, ${HOME} - ${AWAY} + I2 >= 0)`;
+    const iFail = `=AND(${hasFinal}, ${HOME} - ${AWAY} + I2 < 0)`;
+
+    // K (Total): (away+home) > K2  → Over hits (you can invert if you prefer)
+    const sumPts = `${AWAY}+${HOME}`;
+    const kPass = `=AND(${hasFinal}, ${sumPts} > K2)`;
+    const kFail = `=AND(${hasFinal}, ${sumPts} <= K2)`;
+
+    const reqs=[
+      ...mk(6, gPass, gFail),  // G
+      ...mk(8, iPass, iFail),  // I
+      ...mk(10, kPass, kFail)  // K
+    ];
+
+    try { await this.api.spreadsheets.batchUpdate({spreadsheetId:this.sid, requestBody:{requests:reqs}}); }
+    catch(e){ /* If rules already exist or quota, silently ignore */ }
   }
 }
 
@@ -262,7 +297,6 @@ class Sheets {
       }
 
       if(!rowNum){
-        // add new row
         toAppend.push([
           String(ev.id), fmtET(ev.date,{year:"numeric",month:"2-digit",day:"2-digit"}), comp.week?.text || ("Week "+(comp.week?.number??"")), preStatus,
           matchup, "", aSpread, aML, hSpread, hML, total, "", "", "", "", "", ""
@@ -294,39 +328,62 @@ class Sheets {
     if(toUpdate.length) await sh.batchWrite(toUpdate);
   }
 
-  // ---------- FINALS ----------
+  // ---------- FINALS (robust) ----------
   if(MODE==="finals_only" || MODE==="prefill_and_finals"){
     const batch=[];
+    const boldApplyQueue=[];
+
     for(const ev of events){
-      if(!isFinal(ev)) continue;
       const comp=ev.competitions?.[0]||{};
       const away=comp.competitors?.find(c=>c.homeAway==="away");
       const home=comp.competitors?.find(c=>c.homeAway==="home");
       const matchup = `${away?.team?.shortDisplayName||"Away"} @ ${home?.team?.shortDisplayName||"Home"}`;
-      const finalScore = `${away?.score??""}-${home?.score??""}`;
       const rowNum=rowById.get(String(ev.id)); if(!rowNum) continue;
 
       const set=(name,val)=>{ const idx=hmap[name.toLowerCase()]; if(idx==null) return; batch.push({range:`${TAB_NAME}!${colLetter(idx)}${rowNum}:${colLetter(idx)}${rowNum}`, values:[[val??""]]}); };
-      set("final score", finalScore);
-      set("status","Final");
 
-      // bold winner + keep underline fav based on original odds (best-effort, pick current pickcenter)
-      let favAway=false;
-      const odds=pickOdds(comp.odds||ev.odds||[]);
-      if(odds){
-        const {favId}=resolveFavAndLine(odds, away?.team?.id, home?.team?.id);
-        favAway = favId && String(favId)===String(away?.team?.id);
+      // Determine finality and final score from ESPN OR fall back to existing sheet score
+      let finalNow = isFinalEvent(ev);
+      let aPts = Number(away?.score||0), hPts = Number(home?.score||0);
+      let finalScore = (aPts||hPts) ? `${aPts}-${hPts}` : "";
+
+      // If sheet already has Final Score but Status not Final -> force Final
+      const row = all[rowNum-1] || [];
+      const sheetFinalScore = (row[hmap["final score"]]||"").toString().trim();
+      if(sheetFinalScore && !finalNow){
+        finalNow = true;
+        finalScore = sheetFinalScore;
+        const m = sheetFinalScore.match(/(\d+)\s*-\s*(\d+)/);
+        if(m){ aPts=Number(m[1]||0); hPts=Number(m[2]||0); }
       }
-      const aPts=Number(away?.score||0), hPts=Number(home?.score||0);
-      const boldAway = aPts>hPts, boldHome = hPts>aPts;
-      try {
-        const runs=buildRuns(matchup, favAway, boldAway, boldHome);
-        await sh.updateTextRuns(rowNum, hmap["matchup"], matchup, runs);
-      }catch(e){}
 
+      if(finalNow){
+        if(finalScore) set("final score", finalScore);
+        set("status","Final");
+
+        // favorite underline (best-effort)
+        let favAway=false;
+        const odds=pickOdds(comp.odds||ev.odds||[]);
+        if(odds){
+          const {favId}=resolveFavAndLine(odds, away?.team?.id, home?.team?.id);
+          favAway = favId && String(favId)===String(away?.team?.id);
+        }
+        const boldAway = aPts>hPts, boldHome = hPts>aPts;
+        boldApplyQueue.push({rowNum, text:matchup, favAway, boldAway, boldHome});
+      }
     }
+
     if(batch.length) await sh.batchWrite(batch);
-    await sh.addGradingCFIfMissing();
+    // apply bold/underline runs
+    for(const b of boldApplyQueue){
+      try{
+        const runs=buildRuns(b.text, b.favAway, b.boldAway, b.boldHome);
+        await sh.updateTextRuns(b.rowNum, hmap["matchup"], b.text, runs);
+      }catch(e){}
+    }
+
+    // only color G/I/K; do not paint entire rows
+    await sh.ensureGradingCF();
   }
 
   // ---------- LIVE (halftime snapshot) ----------
