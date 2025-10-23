@@ -1,33 +1,34 @@
-// Football.mjs
-// One script for Prefill + Finals (+ optional Half snapshot)
+// Football.mjs — Prefill + Finals (+ optional halftime) in one file
 
 import { google } from "googleapis";
 
-/* ====== ENV / CONFIG ====== */
+/* ====== ENV ====== */
 const SHEET_ID = (process.env.GOOGLE_SHEET_ID || "").trim();
 const CREDS_RAW = (process.env.GOOGLE_SERVICE_ACCOUNT || "").trim();
 
-const LEAGUE = normLeague(process.env.LEAGUE || "nfl");                 // nfl | college-football
+const LEAGUE = normLeague(process.env.LEAGUE || "nfl");                // nfl | college-football
 const TAB_NAME = (process.env.TAB_NAME || (LEAGUE==="nfl"?"NFL":"CFB")).trim();
 const GAME_IDS = (process.env.GAME_IDS || "").trim();                   // "4017...,4017..."
 const MODE = (process.env.MODE || "prefill_and_finals").toLowerCase();  // prefill_and_finals | prefill_only | finals_only | live_only
 const RUN_SCOPE = (process.env.RUN_SCOPE || "auto").toLowerCase();      // auto|today|week
-const REWRITE = String(process.env.REWRITE ?? "1") !== "0";             // allow finals pass to rewrite odds if needed
+const REWRITE = String(process.env.REWRITE ?? "1") !== "0";             // allow rewrite at finals
 
-// Clear backgrounds in all NON-GRADED columns every run.
-// Graded columns are ONLY G..J (A/H Spread + A/H ML). Total (K) is NOT graded per request.
+/* Grading scope:
+   - Color only G..K (A/H Spread, A/H ML, Total)
+   - Clear backgrounds in all other columns each run
+*/
 const CLEAR_NON_GRADED_ALWAYS = true;
 
 const ET_TZ = "America/New_York";
 
-/* Column headers (A..Q) */
+/* Headers (A..Q) */
 const HEADERS = [
   "Game ID","Date","Week","Status","Matchup","Final Score",     // A..F
-  "A Spread","A ML","H Spread","H ML","Total",                   // G..K   (Grade only G..J)
+  "A Spread","A ML","H Spread","H ML","Total",                   // G..K (grade G..K)
   "H Score","Half A Spread","Half A ML","Half H Spread","Half H ML","Half Total" // L..Q
 ];
 
-/* ====== Small utils ====== */
+/* ====== utils ====== */
 const log=(...a)=>console.log(...a);
 const warn=(...a)=>console.warn(...a);
 function normLeague(x){ return /college-football|ncaaf/i.test(x) ? "college-football" : "nfl"; }
@@ -98,9 +99,9 @@ function resolveMLs(o, awayId, homeId){
   return {aML:"",hML:""};
 }
 
-/* Fallback to summary endpoint for MLs / lines (prefers ESPN BET) */
+/* Fallback (summary) to fill missing ML/lines; prefers ESPN BET */
 async function fillOddsFromSummaryIfMissing(ev, aSpread, hSpread, total, aML, hML){
-  if(aML && hML && (aSpread || hSpread) && total) return {aSpread,hSpread,total,aML,hML,favAway:null};
+  if(aML && hML && (aSpread || hSpread) && total) return {aSpread,hSpread,total,aML,hML,favAway:null,favHome:null};
   try{
     const sum = await fetchJson(summaryUrl(LEAGUE, ev.id));
     const pools=[];
@@ -115,33 +116,41 @@ async function fillOddsFromSummaryIfMissing(ev, aSpread, hSpread, total, aML, hM
       };
       const lines = resolveFavAndLine(chosen, ids.away, ids.home);
       const mls   = resolveMLs(chosen, ids.away, ids.home);
+      const favAway = lines.favId && String(lines.favId)===String(ids.away);
+      const favHome = lines.favId && String(lines.favId)===String(ids.home);
       return {
         aSpread: aSpread || lines.aSpread,
         hSpread: hSpread || lines.hSpread,
         total:   total   || lines.total,
         aML:     aML     || mls.aML,
         hML:     hML     || mls.hML,
-        favAway: lines.favId && String(lines.favId)===String(ids.away)
+        favAway, favHome
       };
     }
   }catch(e){ /* ignore */ }
-  return {aSpread,hSpread,total,aML,hML,favAway:null};
+  return {aSpread,hSpread,total,aML,hML,favAway:null,favHome:null};
 }
 
+/* Build textFormatRuns safely (no duplicate 0) */
 function buildRuns(matchup, underlineAway, boldAway, boldHome){
   const at = matchup.indexOf(" @ ");
   const L = matchup.length;
-  if(at<0) return [{startIndex:0,format:{bold:false,underline:false}}];
+  if(at<0){
+    // single run
+    return [{startIndex:0, format:{bold:false, underline:false}}];
+  }
   const A0=0, H0=at+3;
-  const runs=[
-    {startIndex:0, format:{bold:false, underline:false}},
-    {startIndex:A0, format:{bold:!!boldAway, underline:!!underlineAway}},
-    {startIndex:H0, format:{bold:!!boldHome, underline:!underlineAway}},
-  ];
-  return runs.map(r=>({...r, startIndex: Math.min(Math.max(r.startIndex,0), Math.max(L-1,0))}))
-             .sort((x,y)=>x.startIndex-y.startIndex);
+  const runs=[];
+  // Away segment first (starts at 0)
+  runs.push({startIndex:0, format:{bold:!!boldAway, underline:!!underlineAway}});
+  // Home segment
+  runs.push({startIndex:H0, format:{bold:!!boldHome, underline:!underlineAway}});
+  // Ensure indices are within range
+  return runs.map(r=>({...r,startIndex: Math.min(Math.max(r.startIndex,0), Math.max(L-1,0))}))
+             .sort((a,b)=>a.startIndex-b.startIndex);
 }
 
+/* Halftime scrape (kept as-is) */
 async function halftimeSnapshot(gameId){
   try{
     const t=(await fetchText(gameUrl(LEAGUE, gameId))).replace(/\u00a0/g," ").replace(/\s+/g," ");
@@ -185,18 +194,13 @@ class Sheets {
       requestBody:{requests:[{updateCells:{range:{sheetId,startRowIndex:row-1,endRowIndex:row,startColumnIndex:colIdx,endColumnIndex:colIdx+1}, rows:[{values:[{userEnteredValue:{stringValue:text}, textFormatRuns:runs}]}], fields:"userEnteredValue,textFormatRuns"}}]}
     });
   }
-
-  // Reset all conditional rules (optional)
   async resetConditionalFormatting(){
     const sid = await this.sheetId();
     const reqs=[];
     for(let i=0;i<60;i++){ reqs.push({deleteConditionalFormatRule:{index:0, sheetId:sid}}); }
     try { await this.api.spreadsheets.batchUpdate({spreadsheetId:this.sid, requestBody:{requests:reqs}}); } catch(_) {}
   }
-
-  // Grade ONLY G..J
   async ensureGradingCF(){
-    // remove and recreate only our scoped rules
     await this.resetConditionalFormatting();
 
     const sid = await this.sheetId();
@@ -210,11 +214,11 @@ class Sheets {
     const AWAY = 'VALUE(LEFT($F2,FIND("-",$F2)-1))';
     const HOME = 'VALUE(MID($F2,FIND("-",$F2)+1,99))';
 
-    // G (A Spread): (Away pts - Home pts + spread) >= 0
+    // G (A Spread): Away + spread >= Home
     const gPass = `=AND(${HAS_FINAL}, ${AWAY} - ${HOME} + G2 >= 0)`;
     const gFail = `=AND(${HAS_FINAL}, ${AWAY} - ${HOME} + G2 < 0)`;
 
-    // I (H Spread): (Home pts - Away pts + spread) >= 0
+    // I (H Spread): Home + spread >= Away
     const iPass = `=AND(${HAS_FINAL}, ${HOME} - ${AWAY} + I2 >= 0)`;
     const iFail = `=AND(${HAS_FINAL}, ${HOME} - ${AWAY} + I2 < 0)`;
 
@@ -226,24 +230,29 @@ class Sheets {
     const jPass = `=AND(${HAS_FINAL}, ${HOME} > ${AWAY}, J2<>"")`;
     const jFail = `=AND(${HAS_FINAL}, ${HOME} <= ${AWAY}, J2<>"")`;
 
+    // K (Total): Over is green, Under is red (push = no color)
+    const kPass = `=AND(${HAS_FINAL}, ${AWAY}+${HOME} > K2)`;
+    const kFail = `=AND(${HAS_FINAL}, ${AWAY}+${HOME} < K2)`;
+
     const reqs=[
-      ...mk(6, gPass, gFail),   // G
-      ...mk(7, hPass, hFail),   // H
-      ...mk(8, iPass, iFail),   // I
-      ...mk(9, jPass, jFail)    // J
+      ...mk(6, gPass, gFail),  // G
+      ...mk(7, hPass, hFail),  // H
+      ...mk(8, iPass, iFail),  // I
+      ...mk(9, jPass, jFail),  // J
+      ...mk(10,kPass,kFail)    // K (Total)
     ];
     try { await this.api.spreadsheets.batchUpdate({spreadsheetId:this.sid, requestBody:{requests:reqs}}); } catch(e){ warn("ensureGradingCF:", e.message); }
   }
 
-  // Clear backgrounds on all NON-GRADED columns (A..F and K..Q)
+  // Clear backgrounds on non-graded columns (A..F and L..Q) — keep G..K colored
   async clearNonGradedBackgrounds(rowCount){
     if(!CLEAR_NON_GRADED_ALWAYS) return;
     const sid = await this.sheetId();
-    const requests = [
-      { repeatCell:{ range:{sheetId:sid,startRowIndex:1,endRowIndex:rowCount,startColumnIndex:0,endColumnIndex:6}, cell:{userEnteredFormat:{backgroundColor:null, backgroundColorStyle:null}}, fields:"userEnteredFormat.backgroundColor,userEnteredFormat.backgroundColorStyle" }}, // A..F
-      { repeatCell:{ range:{sheetId:sid,startRowIndex:1,endRowIndex:rowCount,startColumnIndex:10,endColumnIndex:17}, cell:{userEnteredFormat:{backgroundColor:null, backgroundColorStyle:null}}, fields:"userEnteredFormat.backgroundColor,userEnteredFormat.backgroundColorStyle" }}, // K..Q
+    const reqs = [
+      { repeatCell:{ range:{sheetId:sid,startRowIndex:1,endRowIndex:rowCount,startColumnIndex:0,endColumnIndex:6},  cell:{userEnteredFormat:{backgroundColor:null, backgroundColorStyle:null}}, fields:"userEnteredFormat.backgroundColor,userEnteredFormat.backgroundColorStyle" }}, // A..F
+      { repeatCell:{ range:{sheetId:sid,startRowIndex:1,endRowIndex:rowCount,startColumnIndex:11,endColumnIndex:17}, cell:{userEnteredFormat:{backgroundColor:null, backgroundColorStyle:null}}, fields:"userEnteredFormat.backgroundColor,userEnteredFormat.backgroundColorStyle" }}, // L..Q
     ];
-    await this.api.spreadsheets.batchUpdate({spreadsheetId:this.sid, requestBody:{requests}});
+    await this.api.spreadsheets.batchUpdate({spreadsheetId:this.sid, requestBody:{requests:reqs}});
   }
 }
 
@@ -263,18 +272,16 @@ class Sheets {
   const rowById = new Map();
   rows.forEach((r,i)=>{ const id=(r[hmap["game id"]]||"").toString().trim(); if(id) rowById.set(id, i+2); });
 
-  // dates to fetch
   const dates = RUN_SCOPE==="today" ? [yyyymmddInET()]
               : RUN_SCOPE==="week"  ? Array.from({length:7},(_,i)=>yyyymmddInET(new Date(Date.now()+i*86400000)))
                                     : Array.from({length:7},(_,i)=>yyyymmddInET(new Date(Date.now()+i*86400000)));
 
-  // pull events
   let events=[]; for(const d of dates){ const sb=await fetchJson(scoreboardUrl(LEAGUE,d)); events.push(...(sb?.events||[])); }
   const onlyIds = GAME_IDS ? GAME_IDS.split(",").map(s=>s.trim()) : null;
   if(onlyIds?.length) events = events.filter(e=>onlyIds.includes(String(e.id)));
   log("Events found:", events.length);
 
-  /* ---------- PREFILL ---------- */
+  /* -------- PREFILL -------- */
   if(MODE==="prefill_only" || MODE==="prefill_and_finals"){
     const toAppend=[], toUpdate=[];
     for(const ev of events){
@@ -288,17 +295,17 @@ class Sheets {
       const rowNum = rowById.get(String(ev.id));
 
       let odds = pickOdds(comp.odds || ev.odds || []);
-      let aSpread="",hSpread="",total="",aML="",hML="", favAway=false;
+      let aSpread="",hSpread="",total="",aML="",hML="", favAway=null, favHome=null;
 
       if(odds){
         const lines = resolveFavAndLine(odds, away?.team?.id, home?.team?.id);
         const mls   = resolveMLs(odds, away?.team?.id, home?.team?.id);
         aSpread=lines.aSpread; hSpread=lines.hSpread; total=lines.total; aML=mls.aML; hML=mls.hML;
         favAway = lines.favId && String(lines.favId)===String(away?.team?.id);
+        favHome = lines.favId && String(lines.favId)===String(home?.team?.id);
       }
 
-      // Fallback to summary if MLs/lines are missing
-      ({aSpread,hSpread,total,aML,hML,favAway} = await fillOddsFromSummaryIfMissing(ev, aSpread,hSpread,total,aML,hML));
+      ({aSpread,hSpread,total,aML,hML,favAway,favHome} = await fillOddsFromSummaryIfMissing(ev, aSpread,hSpread,total,aML,hML));
 
       if(!rowNum){
         toAppend.push([
@@ -308,7 +315,6 @@ class Sheets {
       }else{
         const existing = all[rowNum-1]||[];
         const curStatus=(existing[hmap["status"]]||"").toString();
-        // don't overwrite once live/finished
         if(curStatus && (/(Final|Q\d|Half|End of)/i.test(curStatus))) continue;
 
         const set=(name,val)=>{ const idx=hmap[name.toLowerCase()]; if(idx==null) return; toUpdate.push({range:`${TAB_NAME}!${colLetter(idx)}${rowNum}:${colLetter(idx)}${rowNum}`, values:[[val??""]]}); };
@@ -317,14 +323,18 @@ class Sheets {
         set("a spread", aSpread); set("h spread", hSpread);
         set("a ml", aML); set("h ml", hML); set("total", total);
 
-        try { const runs = buildRuns(matchup, !!favAway, false, false); await sh.updateTextRuns(rowNum, hmap["matchup"], matchup, runs); } catch(_) {}
+        try {
+          const underlineAway = favAway ? true : (favHome ? false : false); // if unknown -> underline home? No; default no underline is impossible; we underline away if favAway true else home.
+          const runs = buildRuns(matchup, underlineAway, false, false);
+          await sh.updateTextRuns(rowNum, hmap["matchup"], matchup, runs);
+        } catch(_) {}
       }
     }
     if(toAppend.length) await sh.append(toAppend);
     if(toUpdate.length) await sh.batchWrite(toUpdate);
   }
 
-  /* ---------- FINALS ---------- */
+  /* -------- FINALS -------- */
   if(MODE==="finals_only" || MODE==="prefill_and_finals"){
     const batch=[], formatQueue=[];
     for(const ev of events){
@@ -372,25 +382,25 @@ class Sheets {
             set("h ml",    mls.hML);
             const favAway = lines.favId && String(lines.favId)===String(away?.team?.id);
             const boldAway = aPts>hPts, boldHome = hPts>aPts;
-            formatQueue.push({rowNum, text:matchup, favAway, boldAway, boldHome});
+            formatQueue.push({rowNum, text:matchup, underlineAway:!!favAway, boldAway, boldHome});
           }else{
             const boldAway = aPts>hPts, boldHome = hPts>aPts;
-            formatQueue.push({rowNum, text:matchup, favAway:false, boldAway, boldHome});
+            formatQueue.push({rowNum, text:matchup, underlineAway:false, boldAway, boldHome});
           }
         }else{
           const boldAway = aPts>hPts, boldHome = hPts>aPts;
-          formatQueue.push({rowNum, text:matchup, favAway:false, boldAway, boldHome});
+          formatQueue.push({rowNum, text:matchup, underlineAway:false, boldAway, boldHome});
         }
       }
     }
 
     if(batch.length) await sh.batchWrite(batch);
     for(const f of formatQueue){
-      try{ const runs=buildRuns(f.text, f.favAway, f.boldAway, f.boldHome); await sh.updateTextRuns(f.rowNum, hmap["matchup"], f.text, runs); }catch(_){}
+      try{ const runs=buildRuns(f.text, f.underlineAway, f.boldAway, f.boldHome); await sh.updateTextRuns(f.rowNum, hmap["matchup"], f.text, runs); }catch(_){}
     }
     await sh.ensureGradingCF();
 
-    // Safety sweep: if Final Score exists but Status != Final, fix it.
+    // Safety sweep: Final Score present => Status "Final"
     const fixPayload=[];
     rows.forEach((r,i)=>{
       const rowNum=i+2;
@@ -403,7 +413,7 @@ class Sheets {
     if(fixPayload.length) await sh.batchWrite(fixPayload);
   }
 
-  /* ---------- LIVE halftime snapshot (optional) ---------- */
+  /* -------- LIVE (half only, optional) -------- */
   if(MODE==="live_only"){
     const batch=[];
     for(const ev of events){
@@ -421,7 +431,7 @@ class Sheets {
     if(batch.length) await sh.batchWrite(batch);
   }
 
-  // Keep only G..J colored: clear backgrounds on A..F and K..Q
+  // Keep only G..K colored: clear backgrounds elsewhere
   await sh.clearNonGradedBackgrounds(lastRowIndex);
 
   log("Done.");
