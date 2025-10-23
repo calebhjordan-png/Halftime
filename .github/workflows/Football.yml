@@ -36,9 +36,14 @@ jobs:
             tab: NFL
           - league: college-football
             tab: CFB
-    # Use github.event.inputs (not inputs) so the expression resolves correctly
-    if: ${{ github.event.inputs.league == 'both' || matrix.league == github.event.inputs.league }}
+
     steps:
+      - name: Conditional skip (league filter)
+        if: ${{ !(github.event.inputs.league == 'both' || github.event.inputs.league == matrix.league) }}
+        run: |
+          echo "Skipping matrix.league=${{ matrix.league }} because workflow input league=${{ github.event.inputs.league }}"
+          exit 0
+
       - uses: actions/checkout@v4
 
       - uses: actions/setup-node@v4
