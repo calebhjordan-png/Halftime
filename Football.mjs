@@ -26,7 +26,12 @@ const warn=(...a)=>console.warn(...a);
 
 function normLeague(x){ return /college-football|ncaaf/i.test(x) ? "college-football" : "nfl"; }
 function fmtET(d,opts){ return new Intl.DateTimeFormat("en-US",{timeZone:ET_TZ,...opts}).format(new Date(d)); }
-function statusPregame(d){ return `${fmtET(d,{month:"2-digit",day:"2-digit"})} - ${fmtET(d,{hour:"numeric",minute:"2-digit",hour12:true})}`; }
+function statusPregame(d){
+  // no timezone text; include date + time; no year in Status
+  const md = fmtET(d,{month:"2-digit",day:"2-digit"});
+  const hm = fmtET(d,{hour:"numeric",minute:"2-digit",hour12:true});
+  return `${md} - ${hm}`;
+}
 function yyyymmddInET(d=new Date()){ const p=fmtET(d,{year:"numeric",month:"2-digit",day:"2-digit"}).split("/"); return p[2]+p[0]+p[1]; }
 function dateOnlyISO(d){ return fmtET(d,{year:"numeric",month:"2-digit",day:"2-digit"}); }
 
@@ -162,16 +167,17 @@ async function halftimeSnapshot(gameId){
 /* ========= Sheets ========= */
 class Sheets {
   constructor(auth, id, tab){ this.api=google.sheets({version:"v4",auth}); this.sid=id; this.tab=tab; }
-  async ensureHeader(){
-    const r=await this.api.spreadsheets.values.get({spreadsheetId:this.sid, range:`${this.tab}!A1:Z`});
-    const v=r.data.values||[];
+  async ensureHeaderAndAll(){
+    // ONE read: get entire tab; if header empty, write header, then read again (second read, but only on first-time tabs)
+    let r=await this.api.spreadsheets.values.get({spreadsheetId:this.sid, range:`${this.tab}!A1:Z`});
+    let v=r.data.values||[];
     if(!v[0]?.length){
       await this.api.spreadsheets.values.update({spreadsheetId:this.sid, range:`${this.tab}!A1`, valueInputOption:"RAW", requestBody:{values:[HEADERS]}});
-      return HEADERS.slice();
+      r=await this.api.spreadsheets.values.get({spreadsheetId:this.sid, range:`${this.tab}!A1:Z`});
+      v=r.data.values||[];
     }
-    return v[0];
+    return v;
   }
-  async readAll(){ const r=await this.api.spreadsheets.values.get({spreadsheetId:this.sid, range:`${this.tab}!A1:Z`}); return r.data.values||[]; }
   async append(vals){ if(vals.length) await this.api.spreadsheets.values.append({spreadsheetId:this.sid, range:`${this.tab}!A1`, valueInputOption:"RAW", requestBody:{values:vals}}); }
   async batchWrite(data){ if(data.length) await this.api.spreadsheets.values.batchUpdate({spreadsheetId:this.sid, requestBody:{valueInputOption:"RAW", data}}); }
   async sheetId(){ const m=await this.api.spreadsheets.get({spreadsheetId:this.sid}); return (m.data.sheets||[]).find(s=>s.properties?.title===this.tab)?.properties?.sheetId; }
@@ -184,7 +190,8 @@ class Sheets {
   }
   async resetConditionalFormatting(){
     const sid = await this.sheetId();
-    const reqs=[]; for(let i=0;i<80;i++) reqs.push({deleteConditionalFormatRule:{index:0,sheetId:sid}});
+    // delete by sweeping up to 50 rules; this is WRITE only, no reads
+    const reqs=[]; for(let i=0;i<50;i++) reqs.push({deleteConditionalFormatRule:{index:0,sheetId:sid}});
     try { await this.api.spreadsheets.batchUpdate({spreadsheetId:this.sid, requestBody:{requests:reqs}}); } catch(_) {}
   }
   async ensureGradingCF(){
@@ -235,13 +242,15 @@ class Sheets {
   const auth = new google.auth.GoogleAuth({credentials:{client_email:creds.client_email, private_key:creds.private_key}, scopes:["https://www.googleapis.com/auth/spreadsheets"]});
   const sh = new Sheets(auth, SHEET_ID, TAB_NAME);
 
-  const header = await sh.ensureHeader();
+  // SINGLE read (header + all rows)
+  const allValues = await sh.ensureHeaderAndAll();
+  let header = allValues[0] || HEADERS;
   const hmap = mapHeadersToIndex(header);
-  const all0 = await sh.readAll();
-  const rows0 = all0.slice(1);
+  let rows = allValues.slice(1);
 
+  // Build index once
   const rowById = new Map();
-  rows0.forEach((r,i)=>{ const id=(r[hmap["game id"]]||"").toString().trim(); if(id) rowById.set(id, i+2); });
+  rows.forEach((r,i)=>{ const id=(r[hmap["game id"]]||"").toString().trim(); if(id) rowById.set(id, i+2); });
 
   const dates = RUN_SCOPE==="today" ? [yyyymmddInET()]
               : RUN_SCOPE==="week"  ? Array.from({length:7},(_,i)=>yyyymmddInET(new Date(Date.now()+i*86400000)))
@@ -283,37 +292,31 @@ class Sheets {
         toAppend.push([ String(ev.id), dateOnlyISO(ev.date), comp.week?.text || ("Week "+(comp.week?.number??"")), preStatus,
           matchup, "", aSpread, aML, hSpread, hML, total, "", "", "", "", "", "" ]);
       }else{
-        const sheetRow = all0[rowNum-1]||[];
+        const sheetRow = rows[rowNum-2]||[];
         const curStatus=(sheetRow[hmap["status"]]||"").toString();
-        if(curStatus && (/(Final|Q\d|Half|End of)/i.test(curStatus))) {
-          // don't overwrite live/final rows
-        }else{
+        if(!(curStatus && (/(Final|Q\d|Half|End of)/i.test(curStatus)))){
           const set=(name,val)=>{ const idx=hmap[name.toLowerCase()]; if(idx==null) return; toUpdate.push({range:`${TAB_NAME}!${colLetter(idx)}${rowNum}:${colLetter(idx)}${rowNum}`, values:[[val??""]]}); };
           set("status", preStatus);
           set("matchup", matchup);
           set("a spread", aSpread); set("h spread", hSpread);
           set("a ml", aML); set("h ml", hML); set("total", total);
         }
-        // queue underline formatting (favorite only if known)
         if(favAway===true || favHome===true){
           prefillFormatQueue.push({rowNum, text:matchup, underlineAway:!!favAway});
         }
       }
     }
 
-    if(toAppend.length) await sh.append(toAppend);
-
-    // refresh index to capture newly appended rows for text formatting
-    const allAfterAppend = await sh.readAll();
-    const rowsAfterAppend = allAfterAppend.slice(1);
-    const rowById2 = new Map();
-    rowsAfterAppend.forEach((r,i)=>{ const id=(r[hmap["game id"]]||"").toString().trim(); if(id) rowById2.set(id, i+2); });
-
-    // add underline tasks for newly appended rows
     if(toAppend.length){
+      await sh.append(toAppend);
+      // refresh local snapshot & index ONCE to format appended favorites without another read later
+      const v2 = await sh.ensureHeaderAndAll();
+      header = v2[0]; rows = v2.slice(1);
+      rowById.clear(); rows.forEach((r,i)=>{ const id=(r[hmap["game id"]]||"").toString().trim(); if(id) rowById.set(id, i+2); });
+
+      // underline for appended rows
       for(const ev of events){
-        const rn = rowById2.get(String(ev.id));
-        if(!rn) continue;
+        const rn = rowById.get(String(ev.id)); if(!rn) continue;
         const comp=ev.competitions?.[0]||{};
         const away=comp.competitors?.find(c=>c.homeAway==="away");
         const home=comp.competitors?.find(c=>c.homeAway==="home");
@@ -329,7 +332,6 @@ class Sheets {
           favHome = lines.favId && String(lines.favId)===String(home?.team?.id);
         }
         if(favAway===null && favHome===null){
-          // one more try from summary
           const filled = await fillOddsFromSummaryIfMissing(ev,"","","","","");
           favAway = filled.favAway; favHome = filled.favHome;
         }
@@ -348,13 +350,12 @@ class Sheets {
   /* ---------- FINALS ---------- */
   if(MODE==="finals_only" || MODE==="prefill_and_finals"){
     const batch=[], finalsFormatQueue=[];
-
     for(const ev of events){
       const comp=ev.competitions?.[0]||{};
       const away=comp.competitors?.find(c=>c.homeAway==="away");
       const home=comp.competitors?.find(c=>c.homeAway==="home");
       const matchup = `${away?.team?.shortDisplayName||"Away"} @ ${home?.team?.shortDisplayName||"Home"}`;
-      const rowNum=(await locateRow(sh,hmap)).get(String(ev.id)); if(!rowNum) continue;
+      const rowNum = rowById.get(String(ev.id)); if(!rowNum) continue;
 
       const set=(name,val)=>{ const idx=hmap[name.toLowerCase()]; if(idx==null) return; batch.push({range:`${TAB_NAME}!${colLetter(idx)}${rowNum}:${colLetter(idx)}${rowNum}`, values:[[val??""]]}); };
 
@@ -362,8 +363,8 @@ class Sheets {
       let aPts = Number(away?.score||0), hPts = Number(home?.score||0);
       let finalScore = (aPts||hPts) ? `${aPts}-${hPts}` : "";
 
-      const snap = (await sh.readAll())[rowNum-1] || [];
-      const sheetFinal = (snap[hmap["final score"]]||"").toString().trim();
+      const sheetRow = rows[rowNum-2] || [];
+      const sheetFinal = (sheetRow[hmap["final score"]]||"").toString().trim();
       if(sheetFinal && !finalNow){
         finalNow = true; finalScore = sheetFinal;
         const m = sheetFinal.match(/(\d+)\s*-\s*(\d+)/); if(m){ aPts=+m[1]; hPts=+m[2]; }
@@ -405,10 +406,9 @@ class Sheets {
 
     await sh.ensureGradingCF();
 
-    // Safety: if a row has Final Score but Status not Final, flip it
-    const allNow = await sh.readAll();
+    // flip any row that has a Final Score but Status != Final — use our current snapshot rows
     const fixPayload=[];
-    (allNow.slice(1)).forEach((r,i)=>{
+    rows.forEach((r,i)=>{
       const st=(r[hmap["status"]]||"").toString().trim();
       const fs=(r[hmap["final score"]]||"").toString().trim();
       if(fs && st!=="Final"){
@@ -418,10 +418,10 @@ class Sheets {
     });
     if(fixPayload.length) await sh.batchWrite(fixPayload);
 
-    // Extra sweep: rows with old dates but no final — try Summary to force a finish (e.g., 401772826-type)
+    // Force-finish rows with past date but no final
     const today = dateOnlyISO(new Date());
     const needsForce=[];
-    (allNow.slice(1)).forEach((r,i)=>{
+    rows.forEach((r,i)=>{
       const dt=(r[hmap["date"]]||"").toString().trim();
       const fs=(r[hmap["final score"]]||"").toString().trim();
       const st=(r[hmap["status"]]||"").toString().trim();
@@ -448,11 +448,10 @@ class Sheets {
 
   /* ---------- LIVE (optional) ---------- */
   if(MODE==="live_only"){
-    const all = await locateRow(sh,hmap);
     const batch=[];
     for(const ev of events){
       if(!isHalf(ev)) continue;
-      const rowNum=all.get(String(ev.id)); if(!rowNum) continue;
+      const rowNum=rowById.get(String(ev.id)); if(!rowNum) continue;
       const snap=await halftimeSnapshot(String(ev.id)); if(!snap) continue;
       const put=(name,val)=>{ const idx=hmap[name.toLowerCase()]; if(idx==null || !val) return; batch.push({range:`${TAB_NAME}!${colLetter(idx)}${rowNum}:${colLetter(idx)}${rowNum}`, values:[[val]]}); };
       put("h score", snap.hScore);
@@ -465,16 +464,8 @@ class Sheets {
     if(batch.length) await sh.batchWrite(batch);
   }
 
-  // cosmetics: keep color only in G..K
-  const finalAll = await sh.readAll();
-  await sh.clearNonGradedBackgrounds(Math.max(2, finalAll.length));
+  // cosmetics: keep color only in G..K — no read; use current rows length
+  await sh.clearNonGradedBackgrounds(Math.max(2, rows.length+1));
 
   log("Done.");
 })().catch(e=>{ console.error("Fatal:", e); process.exit(1); });
-
-/* locate rows by Game ID fresh */
-async function locateRow(sh,hmap){
-  const v=await sh.readAll(); const rows=v.slice(1);
-  const map=new Map(); rows.forEach((r,i)=>{ const id=(r[hmap["game id"]]||"").toString().trim(); if(id) map.set(id,i+2); });
-  return map;
-}
