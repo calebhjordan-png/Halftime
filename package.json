@@ -1,18 +1,19 @@
+Package.json
 {
   "name": "halftime-bot",
   "version": "1.0.0",
-  "private": true,
   "type": "module",
+  "private": true,
   "scripts": {
-    "start": "node Football.mjs",
-    "run:nfl:today": "LEAGUE=nfl TAB_NAME=NFL RUN_SCOPE=today node Football.mjs",
-    "run:cfb:today": "LEAGUE=college-football TAB_NAME=CFB RUN_SCOPE=today node Football.mjs",
-    "run:nfl:week": "LEAGUE=nfl TAB_NAME=NFL RUN_SCOPE=week node Football.mjs",
-    "run:cfb:week": "LEAGUE=college-football TAB_NAME=CFB RUN_SCOPE=week node Football.mjs"
+    "start": "node orchestrator.mjs",
+    "live:cfb": "LEAGUE=college-football TAB_NAME=CFB node live-game.mjs",
+    "live:nfl": "LEAGUE=nfl TAB_NAME=NFL node live-game.mjs"
   },
   "dependencies": {
-    "axios": "^1.6.0",
-    "dotenv": "^16.0.0",
-    "googleapis": "126.0.1"
+    "axios": "1.12.2",
+    "googleapis": "129.0.0",
+    "luxon": "3.7.2",
+    "dotenv": "17.2.3",
+    "playwright": "1.48.2"
   }
 }
