@@ -1,65 +1,75 @@
-name: Football
+name: Football (Prefill + Finals + Live)
 
 on:
   workflow_dispatch:
     inputs:
-      leagues:
-        description: "Which leagues to run"
+      league:
+        description: "Which league(s) to run"
         type: choice
-        options: [both, nfl, college-football]
+        options:
+          - both
+          - nfl
+          - college-football
         default: both
-      mode:
-        description: "Mode"
+      run_mode:
+        description: "Which phase to run"
         type: choice
-        options: [prefill_and_finals, prefill_only, finals_only, live_only]
-        default: prefill_and_finals
+        options:
+          - all
+          - prefill
+          - finals
+          - live
+        default: all
       game_ids:
-        description: "Optional comma-separated ESPN Game IDs"
+        description: "Comma-separated Game IDs (optional)"
         required: false
         default: ""
-      run_scope:
-        description: "Range (auto=today..+6)"
-        type: choice
-        options: [auto, today, week]
-        default: auto
 
 jobs:
-  run-nfl:
-    if: ${{ inputs.leagues == 'both' || inputs.leagues == 'nfl' }}
+  nfl:
+    if: ${{ inputs.league == 'both' || inputs.league == 'nfl' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-node@v4
-        with: { node-version: '20' }
+        with:
+          node-version: "20"
+
       - name: Install deps
-        run: npm i googleapis
+        run: npm i axios googleapis
+
       - name: Run Football.mjs (NFL)
         env:
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
           GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
           LEAGUE: nfl
           TAB_NAME: NFL
-          MODE: ${{ inputs.mode }}
+          RUN_SCOPE: week
+          RUN_MODE: ${{ inputs.run_mode }}
           GAME_IDS: ${{ inputs.game_ids }}
-          RUN_SCOPE: ${{ inputs.run_scope }}
         run: node Football.mjs
 
-  run-cfb:
-    if: ${{ inputs.leagues == 'both' || inputs.leagues == 'college-football' }}
+  cfb:
+    if: ${{ inputs.league == 'both' || inputs.league == 'college-football' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-node@v4
-        with: { node-version: '20' }
+        with:
+          node-version: "20"
+
       - name: Install deps
-        run: npm i googleapis
+        run: npm i axios googleapis
+
       - name: Run Football.mjs (CFB)
         env:
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
           GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
           LEAGUE: college-football
           TAB_NAME: CFB
-          MODE: ${{ inputs.mode }}
+          RUN_SCOPE: week
+          RUN_MODE: ${{ inputs.run_mode }}
           GAME_IDS: ${{ inputs.game_ids }}
-          RUN_SCOPE: ${{ inputs.run_scope }}
         run: node Football.mjs
