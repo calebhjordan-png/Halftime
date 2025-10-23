@@ -1,4 +1,4 @@
-// Football.mjs — Prefill + Finals + Live + Finals-backfill + Direct grading colors (G..K)
+// Football.mjs — Prefill + Finals + Live + Finals-backfill + Direct grading (G..K only) + CF purge
 
 import { google } from "googleapis";
 import axios from "axios";
@@ -155,6 +155,14 @@ class Sheets{
   async batch(values){ if(values.length) await this.api.spreadsheets.values.batchUpdate({spreadsheetId:this.id,requestBody:{valueInputOption:"RAW",data:values}}); }
   async batchReq(reqs){ if(reqs.length) await this.api.spreadsheets.batchUpdate({spreadsheetId:this.id,requestBody:{requests:reqs}}); }
   async sheetId(){ const meta=await this.api.spreadsheets.get({spreadsheetId:this.id}); const s=meta?.data?.sheets?.find(x=>x.properties?.title===this.tab); return s?.properties?.sheetId; }
+  async getConditionalFormats(){ 
+    const meta=await this.api.spreadsheets.get({
+      spreadsheetId:this.id,
+      fields:"sheets.properties,sheets.conditionalFormats"
+    });
+    const sheet = meta?.data?.sheets?.find(s=>s.properties?.title===this.tab);
+    return { sheetId: sheet?.properties?.sheetId, rules: sheet?.conditionalFormats || [] };
+  }
 }
 
 /* ========= MAIN ========= */
@@ -176,7 +184,7 @@ class Sheets{
   let hmap = mapHeaders(header);
   let rows = grid.slice(1);
 
-  /* --- row index by Game ID --- */
+  /* --- index by Game ID --- */
   const gi = hmap["game id"] ?? 0;
   const rowById = new Map();
   rows.forEach((r,i)=>{ const id=(r[gi]||"").toString().trim(); if(id) rowById.set(id, i+2); });
@@ -287,7 +295,6 @@ class Sheets{
     const status=(r[hmap["status"]]||"").toString().toLowerCase();
     if (id && !/final/.test(status)) needCheck.push({id,row:i+2});
   });
-  // limit to avoid quota storms
   for (const {id,row} of needCheck.slice(0,120)){
     try{
       const s=await fetchJSON(sumUrl(id));
@@ -301,6 +308,9 @@ class Sheets{
           { range:rc(TAB_NAME,hmap["status"],row),      values:[["Final"]] },
           { range:rc(TAB_NAME,hmap["final score"],row), values:[[finalScore]] }
         ]);
+        // update in-memory row for later grading
+        rows[row-2][hmap["status"]]="Final";
+        rows[row-2][hmap["final score"]]=finalScore;
       }
     }catch{ /* ignore */ }
   }
@@ -331,7 +341,19 @@ class Sheets{
   }
   await sh.batch(liveWrites);
 
-  /* --- Direct grading colors for G..K based on Final Score --- */
+  /* --- PURGE ALL CONDITIONAL FORMAT RULES on this tab --- */
+  if (sheetId!=null){
+    const { rules } = await sh.getConditionalFormats();
+    if (rules && rules.length){
+      const dels = [];
+      for (let i=rules.length-1; i>=0; i--){
+        dels.push({ deleteConditionalFormatRule:{ sheetId, index:i }});
+      }
+      await sh.batchReq(dels);
+    }
+  }
+
+  /* --- Direct grading colors for G..K only, based on Final Score --- */
   if (sheetId!=null){
     const GREEN={red:0.85,green:0.95,blue:0.85}, RED={red:0.97,green:0.85,blue:0.85}, CLEAR={red:1,green:1,blue:1};
     const reqs=[];
@@ -343,7 +365,8 @@ class Sheets{
       const I = toNum(rows[r][hmap["h spread"]]);
       const J = toNum(rows[r][hmap["h ml"]]);
       const K = toNum(rows[r][hmap["total"]]);
-      // clear first
+
+      // clear ONLY G..K
       for (const idx of [hmap["a spread"],hmap["a ml"],hmap["h spread"],hmap["h ml"],hmap["total"]]){
         if (idx===undefined) continue;
         reqs.push({ repeatCell:{
@@ -372,7 +395,7 @@ class Sheets{
       if (I!=null) paint(hmap["h spread"], (h + I > a) ? GREEN : RED);
       // H ML: h > a wins
       if (J!=null) paint(hmap["h ml"], (h > a) ? GREEN : RED);
-      // Total: (a+h) > total wins
+      // Total: (a+h) > total wins (Over green)
       if (K!=null) paint(hmap["total"], ((a+h) > K) ? GREEN : RED);
     }
     await sh.batchReq(reqs);
