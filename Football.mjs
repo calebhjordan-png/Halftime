@@ -1,4 +1,3 @@
-Football.yml
 name: Football (Prefill + Finals + Live)
 
 on:
@@ -74,3 +73,4 @@ jobs:
           RUN_MODE: ${{ inputs.run_mode }}
           GAME_IDS: ${{ inputs.game_ids }}
         run: node Football.mjs
+
