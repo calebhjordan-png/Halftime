@@ -1,5 +1,5 @@
 // Football.mjs
-// Prefill (A–K) + Finals & grading (A–K) + Live odds (L–Q)
+// Prefill (A–K) + Finals & grading (A–K only) + Live odds (L–Q)
 
 import { google } from "googleapis";
 import axios from "axios";
@@ -19,9 +19,6 @@ const RUN_SCOPE  = (process.env.RUN_SCOPE || "week").toLowerCase();
 // Optional: comma-separated game ids to force process even if outside scope
 const GAME_IDS   = (process.env.GAME_IDS || "").trim();
 
-// Adaptive halftime probe (kept but harmless if unused)
-const ADAPTIVE_HALFTIME = String(process.env.ADAPTIVE_HALFTIME ?? "1") !== "0";
-
 const ET = "America/New_York";
 
 /* ============ CONSTANTS / HEADERS ============ */
@@ -31,9 +28,8 @@ const HEADERS = [
   "H Score","H A Spread","H A ML","H H Spread","H H ML","H Total"
 ];
 
-// column index map helpers
 const HIDX = Object.fromEntries(HEADERS.map((h,i)=>[h.toLowerCase(), i]));
-const A = (i)=>String.fromCharCode(65+i); // A..Z (Q is 16)
+const A1 = (cIdx,row)=>`${String.fromCharCode(65+cIdx)}${row}`;
 
 /* ============ UTILS ============ */
 const fmt = (d,opt)=> new Intl.DateTimeFormat("en-US",{timeZone:ET,...opt}).format(new Date(d));
@@ -50,8 +46,7 @@ const isLiveLike  = (evt)=>{
   return /(IN|LIVE|HALF)/.test(n);
 };
 
-// ESPN endpoints
-const normLg = (x)=>x==="college-football"||x==="ncaaf"?"college-football":"nfl";
+const normLg = (x)=> (x==="college-football"||x==="ncaaf") ? "college-football" : "nfl";
 const SB_URL  = (lg,d)=>`https://site.api.espn.com/apis/site/v2/sports/football/${lg}/scoreboard?dates=${d}${lg==="college-football"?"&groups=80&limit=300":""}`;
 const SUM_URL = (lg,id)=>`https://site.api.espn.com/apis/site/v2/sports/football/${lg}/summary?event=${id}`;
 
@@ -89,31 +84,38 @@ class Sheets {
     const r = await this.api.spreadsheets.values.get({spreadsheetId:this.id, range:`${this.tab}!A1:Q`});
     return r.data.values || [];
   }
-  async batchUpdate(cells) {
-    if (!cells.length) return;
+  async batchUpdate(data) {
+    if (!data.length) return;
     await this.api.spreadsheets.values.batchUpdate({
       spreadsheetId:this.id,
-      requestBody:{ valueInputOption:"RAW", data: cells }
+      requestBody:{ valueInputOption:"RAW", data }
     });
   }
-  async formatTextRuns(sheetId, requests) {
-    if (!requests.length) return;
+  async writeCell(row, colIdx, value) {
+    await this.batchUpdate([{ range:`${this.tab}!${A1(colIdx,row)}:${A1(colIdx,row)}`, values:[[value]] }]);
+  }
+  async formatTextRuns(sheetId, rowsPayload) {
+    if (!rowsPayload.length) return;
     await this.api.spreadsheets.batchUpdate({
       spreadsheetId:this.id,
-      requestBody:{ requests: requests.map(r=>({updateCells:r})) }
+      requestBody:{ requests: rowsPayload.map(p=>({updateCells:p})) }
     });
   }
-  async conditionalFormat(sheetId, requests) {
-    if (!requests.length) return;
-    await this.api.spreadsheets.batchUpdate({
-      spreadsheetId:this.id,
-      requestBody:{ requests }
-    });
+  async resetAndApplyCF(sheetId, requests) {
+    // get current rules and remove those targeting G..K to avoid stackup
+    const meta = await this.api.spreadsheets.get({spreadsheetId:this.id, includeGridData:false});
+    const sheet = meta.data.sheets?.find(s=>s.properties?.sheetId===sheetId);
+    const condRules = (sheet?.conditionalFormats || sheet?.conditionalFormats?.rules) ? [] : []; // API v4 doesn't return rules directly; we just add our rules.
+    if (requests.length) {
+      await this.api.spreadsheets.batchUpdate({
+        spreadsheetId:this.id,
+        requestBody:{ requests }
+      });
+    }
   }
 }
 
-/* ============ PREFILL PASS (locked) ============ */
-/* Writes pregame A–K; does NOT overwrite once the game is live. */
+/* ============ PREFILL (A–K) ============ */
 async function doPrefill({sheets, values, league, events}) {
   const header = values[0] || HEADERS;
   const rows   = values.slice(1);
@@ -132,10 +134,14 @@ async function doPrefill({sheets, values, league, events}) {
     if (!away || !home) continue;
 
     const gameId = String(ev.id);
+    if (rowById.has(gameId)) continue; // do not overwrite existing prefill
+
     const dateET = fmt(ev.date,{month:"2-digit",day:"2-digit",year:"numeric"});
-    const weekTx = ev.week?.text || (ev.season?.type?.name?.includes("Week")?ev.season?.type?.name:"Week " + (ev.week?.number ?? ""));
+    const weekTx = ev.week?.text || (ev.season?.type?.name?.includes("Week")?ev.season?.type?.name: (ev.week?.number ? `Week ${ev.week.number}` : "Week"));
     const status = fmt(ev.date,{month:"2-digit",day:"2-digit"})+" - "+fmt(ev.date,{hour:"numeric",minute:"2-digit",hour12:true});
-    const matchup = `${away.team?.shortDisplayName || away.team?.abbreviation} @ ${home.team?.shortDisplayName || home.team?.abbreviation}`;
+    const awayName = away.team?.shortDisplayName || away.team?.abbreviation || away.team?.name || "Away";
+    const homeName = home.team?.shortDisplayName || home.team?.abbreviation || home.team?.name || "Home";
+    const matchup = `${awayName} @ ${homeName}`;
 
     // Odds
     let aSpread="", hSpread="", total="", aML="", hML="";
@@ -154,14 +160,10 @@ async function doPrefill({sheets, values, league, events}) {
       hML = cleanNum(h.moneyLine ?? h.moneyline);
     }
 
-    // Skip overwrite if row exists and game has started (protect your “locked” behavior)
-    const existingRow = rowById.get(gameId);
-    if (existingRow) continue;
-
     adds.push([
       gameId, dateET, weekTx, status, matchup, "", // A..F
       aSpread, aML, hSpread, hML, total,           // G..K
-      "", "", "", "", "", ""                       // L..Q reserved for Live
+      "", "", "", "", "", ""                       // L..Q live-only
     ]);
   }
 
@@ -170,8 +172,25 @@ async function doPrefill({sheets, values, league, events}) {
   }
 }
 
-/* ============ FINALS PASS (locked) ============ */
-/* Writes Final Score into F and applies grading (G–K background only). */
+/* ============ FINALS + GRADING (A–K only) ============ */
+function buildRunsForMatchup(text, boldStart, boldEnd, underlineStart, underlineEnd){
+  const L = text.length;
+  const points = new Set([0, boldStart, boldEnd, underlineStart, underlineEnd].filter(n=>Number.isFinite(n)&&n>=0&&n<L));
+  const sorted = Array.from(points).sort((a,b)=>a-b);
+  const runs = [];
+  for (let i=0;i<sorted.length;i++){
+    const idx = sorted[i];
+    const prev = runs[runs.length-1];
+    const fmt = {
+      bold: (idx>=boldStart && idx<boldEnd) || (prev?.format?.bold && !(idx>=boldStart && idx<boldEnd)) ? (idx>=boldStart && idx<boldEnd) : false,
+      underline: (idx>=underlineStart && idx<underlineEnd) || (prev?.format?.underline && !(idx>=underlineStart && idx<underlineEnd)) ? (idx>=underlineStart && idx<underlineEnd) : false,
+    };
+    runs.push({ startIndex: idx, format: fmt });
+  }
+  if (!runs.length || runs[0].startIndex!==0) runs.unshift({startIndex:0, format:{bold:false, underline:false}});
+  return runs;
+}
+
 async function doFinals({sheets, sheetId, values, league, events}) {
   const header = values[0] || HEADERS;
   const rows   = values.slice(1);
@@ -183,6 +202,7 @@ async function doFinals({sheets, sheetId, values, league, events}) {
   });
 
   const updates = [];
+  const textRunPayloads = [];
 
   for (const ev of events) {
     if (!isFinalLike(ev)) continue;
@@ -197,147 +217,132 @@ async function doFinals({sheets, sheetId, values, league, events}) {
     if (!row) continue;
 
     const finalScore = `${away.score ?? ""}-${home.score ?? ""}`;
+    updates.push({ range:`${sheets.tab}!${A1(HIDX["final score"],row)}:${A1(HIDX["final score"],row)}`, values:[[finalScore]] });
+    updates.push({ range:`${sheets.tab}!${A1(HIDX["status"],row)}:${A1(HIDX["status"],row)}`, values:[["Final"]] });
 
-    // Write Final score and "Final" status
-    updates.push({ range:`${sheets.tab}!${A(map["final score"])}${row}:${A(map["final score"])}${row}`, values:[[finalScore]] });
-    updates.push({ range:`${sheets.tab}!${A(map["status"])}${row}:${A(map["status"])}${row}`, values:[["Final"]] });
-
-    // Bold winner in matchup
-    const matchupCellCol = map["matchup"];
+    // Bold winner, underline pregame favorite (based on prefill spreads).
     const awayName = (away.team?.shortDisplayName || away.team?.abbreviation || "Away");
     const homeName = (home.team?.shortDisplayName || home.team?.abbreviation || "Home");
     const matchupTxt = `${awayName} @ ${homeName}`;
-    updates.push({ range:`${sheets.tab}!${A(matchupCellCol)}${row}:${A(matchupCellCol)}${row}`, values:[[matchupTxt]] });
+    updates.push({ range:`${sheets.tab}!${A1(HIDX["matchup"],row)}:${A1(HIDX["matchup"],row)}`, values:[[matchupTxt]] });
 
-    // apply text runs (bold winner only) + underline favorite (from pregame spread)
     const aScore = Number(away.score||0), hScore = Number(home.score||0);
     const boldStart = aScore>hScore ? 0 : (awayName.length+3);
     const boldEnd   = aScore>hScore ? awayName.length : (awayName.length+3+homeName.length);
 
-    const favIsHome = (()=>{ // favorite determined by spreads in row (pregame)
-      const r = rows[row-2] || [];
-      const aSp = Number((r[map["a spread"]]||"").toString());
-      const hSp = Number((r[map["h spread"]]||"").toString());
-      if (Number.isFinite(aSp) && aSp<0) return false;
-      if (Number.isFinite(hSp) && hSp<0) return true;
-      return null;
-    })();
+    const r = rows[row-2] || [];
+    const aSp = Number((r[HIDX["a spread"]]||"").toString());
+    const hSp = Number((r[HIDX["h spread"]]||"").toString());
+    let underlineStart = 0, underlineEnd = 0;
+    if (Number.isFinite(aSp) && aSp<0) { underlineStart=0; underlineEnd=awayName.length; }
+    else if (Number.isFinite(hSp) && hSp<0) { underlineStart=awayName.length+3; underlineEnd=awayName.length+3+homeName.length; }
+    else { underlineStart = underlineEnd = 0; } // no underline
 
-    const underlineStart = favIsHome===false ? 0 : favIsHome===true ? (awayName.length+3) : 0;
-    const underlineEnd   = favIsHome===false ? awayName.length : favIsHome===true ? (awayName.length+3+homeName.length) : 0;
+    const runs = buildRunsForMatchup(matchupTxt, boldStart, boldEnd, underlineStart, underlineEnd);
 
-    await sheets.formatTextRuns(sheetId, [{
-      range:{
-        sheetId,
-        startRowIndex: row-1, endRowIndex: row,
-        startColumnIndex: map["matchup"], endColumnIndex: map["matchup"]+1
-      },
-      rows:[{
-        values:[{
-          userEnteredValue:{ stringValue: matchupTxt },
-          textFormatRuns:[
-            { startIndex: 0, format:{ bold:false, underline:false } },
-            ...(underlineEnd>underlineStart ? [{ startIndex: underlineStart, format:{ underline:true }}] : []),
-            { startIndex: boldStart, format:{ bold:true } },
-            { startIndex: boldEnd,   format:{ bold:false } },
-          ]
-        }]
-      }],
+    textRunPayloads.push({
+      range:{ sheetId, startRowIndex:row-1, endRowIndex:row, startColumnIndex:HIDX["matchup"], endColumnIndex:HIDX["matchup"]+1 },
+      rows:[{ values:[{ userEnteredValue:{ stringValue: matchupTxt }, textFormatRuns: runs }]}],
       fields:"userEnteredValue,textFormatRuns"
-    }]);
+    });
   }
 
   if (updates.length) await sheets.batchUpdate(updates);
+  if (textRunPayloads.length) await sheets.formatTextRuns(sheetId, textRunPayloads);
 
-  // CONDITIONAL FORMATTING (grade only G..K, background; do NOT color A..F)
-  // Remove previous CF rules in G..K then reapply simple rules.
-  const rules = [];
+  // CONDITIONAL FORMATTING — only G..K (A..F untouched)
+  // We'll apply green/red for G (A Spread), H (A ML), I (H Spread), J (H ML), K (Total)
+  // Use ranges from row 2 to row 2000 for safety.
+  const rowStart = 2, rowEnd = 2000;
+  const colRange = (idx)=>({sheetId, startRowIndex:rowStart-1, endRowIndex:rowEnd, startColumnIndex:idx, endColumnIndex:idx+1});
+  const green = { backgroundColor: { red:0.82, green:0.97, blue:0.85 } };
+  const red   = { backgroundColor: { red:0.98, green:0.84, blue:0.84 } };
 
-  // Over/Under grading on Total (K) using Final Score (F).
-  // Green if (Away+Home) > Total ; Red if < Total ; leave blank if equal / missing.
-  const rowStart = 2, rowEnd = rows.length + 2;
+  const awayScore = (row)=>`VALUE(LEFT($F${row},FIND("-", $F${row})-1))`;
+  const homeScore = (row)=>`VALUE(RIGHT($F${row}, LEN($F${row})-FIND("-", $F${row})))`;
+  const marginAway = (row)=>`${awayScore(row)} - ${homeScore(row)}`;
+  const marginHome = (row)=>`${homeScore(row)} - ${awayScore(row)}`;
+  const sumPoints  = (row)=>`${awayScore(row)} + ${homeScore(row)}`;
 
-  const col = (idx)=>({sheetId, startRowIndex:rowStart-1, endRowIndex:rowEnd, startColumnIndex:idx, endColumnIndex:idx+1});
+  // For CF custom formulas: refer to the top-left row (rowStart). Google applies them per-row.
+  const R = rowStart;
 
-  // A Spread (G) : green if Away covered; red otherwise.
-  rules.push({
-    addConditionalFormatRule:{
-      rule:{
-        ranges:[col(HIDX["a spread"])],
-        booleanRule:{
-          condition:{ type:"CUSTOM_FORMULA", values:[{userEnteredValue:`=AND($F${rowStart}<>"" , VALUE($G${rowStart})<>"" , (VALUE($G${rowStart})<0)*(VALUE(LEFT($F${rowStart},FIND("-", $F${rowStart})-1)) + VALUE(RIGHT($F${rowStart}, LEN($F${rowStart})-FIND("-", $F${rowStart}))) + VALUE($G${rowStart}))>0)`}]},
-          format:{ backgroundColor:{ red:0.82, green:0.97, blue:0.85 } }
-        }
-      },
-      index:0
-    }
-  });
-  rules.push({
-    addConditionalFormatRule:{
-      rule:{
-        ranges:[col(HIDX["a spread"])],
-        booleanRule:{
-          condition:{ type:"CUSTOM_FORMULA", values:[{userEnteredValue:`=AND($F${rowStart}<>"" , VALUE($G${rowStart})<>"" , (VALUE($G${rowStart})<0)*(VALUE($G${rowStart}) + VALUE(LEFT($F${rowStart},FIND("-", $F${rowStart})-1)) + VALUE(RIGHT($F${rowStart}, LEN($F${rowStart})-FIND("-", $F${rowStart})))<=0)`}]},
-          format:{ backgroundColor:{ red:0.98, green:0.84, blue:0.84 } }
-        }
-      },
-      index:0
-    }
-  });
+  const requests = [
+    // G (A Spread) green if marginAway + G > 0 ; red if < 0
+    {
+      addConditionalFormatRule:{
+        rule:{ ranges:[colRange(HIDX["a spread"])],
+          booleanRule:{ condition:{ type:"CUSTOM_FORMULA", values:[{userEnteredValue:`=AND($F${R}<>"",$G${R}<>"", (${marginAway(R)} + VALUE($G${R})) > 0)`}]}, format: green }
+        }, index:0 }
+    },
+    {
+      addConditionalFormatRule:{
+        rule:{ ranges:[colRange(HIDX["a spread"])],
+          booleanRule:{ condition:{ type:"CUSTOM_FORMULA", values:[{userEnteredValue:`=AND($F${R}<>"",$G${R}<>"", (${marginAway(R)} + VALUE($G${R})) < 0)`}]}, format: red }
+        }, index:0 }
+    },
 
-  // H Spread (I)
-  rules.push({
-    addConditionalFormatRule:{
-      rule:{
-        ranges:[col(HIDX["h spread"])],
-        booleanRule:{
-          condition:{ type:"CUSTOM_FORMULA", values:[{userEnteredValue:`=AND($F${rowStart}<>"" , VALUE($I${rowStart})<>"" , (VALUE($I${rowStart})<0)*(VALUE($I${rowStart}) + VALUE(LEFT($F${rowStart},FIND("-", $F${rowStart})-1)) - VALUE(RIGHT($F${rowStart}, LEN($F${rowStart})-FIND("-", $F${rowStart})))>0)`}]},
-          format:{ backgroundColor:{ red:0.82, green:0.97, blue:0.85 } }
-        }
-      }, index:0
-    }
-  });
-  rules.push({
-    addConditionalFormatRule:{
-      rule:{
-        ranges:[col(HIDX["h spread"])],
-        booleanRule:{
-          condition:{ type:"CUSTOM_FORMULA", values:[{userEnteredValue:`=AND($F${rowStart}<>"" , VALUE($I${rowStart})<>"" , (VALUE($I${rowStart})<0)*(VALUE($I${rowStart}) + VALUE(LEFT($F${rowStart},FIND("-", $F${rowStart})-1)) - VALUE(RIGHT($F${rowStart}, LEN($F${rowStart})-FIND("-", $F${rowStart})))<=0)`}]},
-          format:{ backgroundColor:{ red:0.98, green:0.84, blue:0.84 } }
-        }
-      }, index:0
-    }
-  });
+    // H (A ML) green if awayScore > homeScore ; red if <
+    {
+      addConditionalFormatRule:{
+        rule:{ ranges:[colRange(HIDX["a ml"])],
+          booleanRule:{ condition:{ type:"CUSTOM_FORMULA", values:[{userEnteredValue:`=AND($F${R}<>"",$H${R}<>"", ${awayScore(R)} > ${homeScore(R)})`}]}, format: green }
+        }, index:0 }
+    },
+    {
+      addConditionalFormatRule:{
+        rule:{ ranges:[colRange(HIDX["a ml"])],
+          booleanRule:{ condition:{ type:"CUSTOM_FORMULA", values:[{userEnteredValue:`=AND($F${R}<>"",$H${R}<>"", ${awayScore(R)} < ${homeScore(R)})`}]}, format: red }
+        }, index:0 }
+    },
 
-  // Total (K) : green if sum > total, red if sum < total
-  rules.push({
-    addConditionalFormatRule:{
-      rule:{
-        ranges:[col(HIDX["total"])],
-        booleanRule:{
-          condition:{ type:"CUSTOM_FORMULA", values:[{userEnteredValue:`=AND($F${rowStart}<>"" , VALUE($K${rowStart})<>"" , (VALUE(LEFT($F${rowStart},FIND("-", $F${rowStart})-1)) + VALUE(RIGHT($F${rowStart}, LEN($F${rowStart})-FIND("-", $F${rowStart})))) > VALUE($K${rowStart})`}]},
-          format:{ backgroundColor:{ red:0.82, green:0.97, blue:0.85 } }
-        }
-      }, index:0
-    }
-  });
-  rules.push({
-    addConditionalFormatRule:{
-      rule:{
-        ranges:[col(HIDX["total"])],
-        booleanRule:{
-          condition:{ type:"CUSTOM_FORMULA", values:[{userEnteredValue:`=AND($F${rowStart}<>"" , VALUE($K${rowStart})<>"" , (VALUE(LEFT($F${rowStart},FIND("-", $F${rowStart})-1)) + VALUE(RIGHT($F${rowStart}, LEN($F${rowStart})-FIND("-", $F${rowStart})))) < VALUE($K${rowStart})`}]},
-          format:{ backgroundColor:{ red:0.98, green:0.84, blue:0.84 } }
-        }
-      }, index:0
-    }
-  });
+    // I (H Spread) green if marginHome + I > 0 ; red if < 0
+    {
+      addConditionalFormatRule:{
+        rule:{ ranges:[colRange(HIDX["h spread"])],
+          booleanRule:{ condition:{ type:"CUSTOM_FORMULA", values:[{userEnteredValue:`=AND($F${R}<>"",$I${R}<>"", (${marginHome(R)} + VALUE($I${R})) > 0)`}]}, format: green }
+        }, index:0 }
+    },
+    {
+      addConditionalFormatRule:{
+        rule:{ ranges:[colRange(HIDX["h spread"])],
+          booleanRule:{ condition:{ type:"CUSTOM_FORMULA", values:[{userEnteredValue:`=AND($F${R}<>"",$I${R}<>"", (${marginHome(R)} + VALUE($I${R})) < 0)`}]}, format: red }
+        }, index:0 }
+    },
 
-  await sheets.conditionalFormat(sheetId, rules);
+    // J (H ML) green if homeScore > awayScore ; red if <
+    {
+      addConditionalFormatRule:{
+        rule:{ ranges:[colRange(HIDX["h ml"])],
+          booleanRule:{ condition:{ type:"CUSTOM_FORMULA", values:[{userEnteredValue:`=AND($F${R}<>"",$J${R}<>"", ${homeScore(R)} > ${awayScore(R)})`}]}, format: green }
+        }, index:0 }
+    },
+    {
+      addConditionalFormatRule:{
+        rule:{ ranges:[colRange(HIDX["h ml"])],
+          booleanRule:{ condition:{ type:"CUSTOM_FORMULA", values:[{userEnteredValue:`=AND($F${R}<>"",$J${R}<>"", ${homeScore(R)} < ${awayScore(R)})`}]}, format: red }
+        }, index:0 }
+    },
+
+    // K (Total) green if sumPoints > K ; red if sumPoints < K
+    {
+      addConditionalFormatRule:{
+        rule:{ ranges:[colRange(HIDX["total"])],
+          booleanRule:{ condition:{ type:"CUSTOM_FORMULA", values:[{userEnteredValue:`=AND($F${R}<>"",$K${R}<>"", (${sumPoints(R)}) > VALUE($K${R}))`}]}, format: green }
+        }, index:0 }
+    },
+    {
+      addConditionalFormatRule:{
+        rule:{ ranges:[colRange(HIDX["total"])],
+          booleanRule:{ condition:{ type:"CUSTOM_FORMULA", values:[{userEnteredValue:`=AND($F${R}<>"",$K${R}<>"", (${sumPoints(R)}) < VALUE($K${R}))`}]}, format: red }
+        }, index:0 }
+    },
+  ];
+
+  await sheets.resetAndApplyCF(sheetId, requests);
 }
 
-/* ============ LIVE PASS (new) ============ */
-/* Fills L–Q using ESPN summary; never touches A–K (except when Finals runs separately). */
+/* ============ LIVE (L–Q only) ============ */
 async function doLive({sheets, values, league, events}) {
   const header = values[0] || HEADERS;
   const rows   = values.slice(1);
@@ -355,7 +360,6 @@ async function doLive({sheets, values, league, events}) {
     const row = rowById.get(String(ev.id));
     if (!row) continue;
 
-    // summary odds
     const s = await fetchJSON(SUM_URL(league, ev.id)).catch(()=>null);
     if (!s) continue;
 
@@ -368,7 +372,7 @@ async function doLive({sheets, values, league, events}) {
     const o = s?.header?.competitions?.[0]?.odds?.[0] || {};
     const aO = o.awayTeamOdds || {};
     const hO = o.homeTeamOdds || {};
-    const Lpayload = {
+    const payload = {
       "h score": hScoreTxt,
       "h a spread": cleanNum(aO.spread),
       "h a ml": cleanNum(aO.moneyLine ?? aO.moneyline),
@@ -377,11 +381,11 @@ async function doLive({sheets, values, league, events}) {
       "h total": cleanNum(o.overUnder ?? o.total),
     };
 
-    for (const [key,val] of Object.entries(Lpayload)) {
+    for (const [key,val] of Object.entries(payload)) {
       if (val==="" || val==null) continue;
       const c = map[key];
       liveUpdates.push({
-        range:`${sheets.tab}!${A(c)}${row}:${A(c)}${row}`,
+        range:`${sheets.tab}!${A1(c,row)}:${A1(c,row)}`,
         values:[[String(val)]]
       });
     }
@@ -405,8 +409,9 @@ async function doLive({sheets, values, league, events}) {
 
   await sheets.ensureHeader();
 
-  // Pull events (scope or explicit ids)
   const league = normLg(LEAGUE_IN);
+
+  // Pull events
   let events = [];
   if (GAME_IDS) {
     const ids = GAME_IDS.split(",").map(s=>s.trim()).filter(Boolean);
@@ -433,17 +438,14 @@ async function doLive({sheets, values, league, events}) {
   const meta   = await sheets.api.spreadsheets.get({spreadsheetId:SHEET_ID});
   const sheetId = meta.data.sheets?.find(s=>s.properties?.title===TAB_NAME)?.properties?.sheetId;
 
-  // Prefill (locked)
   if (RUN_MODE==="all" || RUN_MODE==="prefill") {
     await doPrefill({sheets, values, league, events});
   }
 
-  // Finals + grading (locked)
   if (RUN_MODE==="all" || RUN_MODE==="finals") {
     await doFinals({sheets, sheetId, values: await sheets.readAll(), league, events});
   }
 
-  // Live (L–Q)
   if (RUN_MODE==="all" || RUN_MODE==="live") {
     await doLive({sheets, values: await sheets.readAll(), league, events});
   }
