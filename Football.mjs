@@ -1,4 +1,5 @@
-// Football.mjs — Prefill + Finals + Live + Finals-backfill + Direct grading (G..K) + CF purge
+// Football.mjs — Prefill + Finals + Live + Finals-backfill + Direct grading (G..K only) + CF purge
+
 import { google } from "googleapis";
 import axios from "axios";
 
@@ -38,28 +39,6 @@ const fetchJSON = async u => (await axios.get(u,{headers:{"User-Agent":"football
 function mapHeaders(h){ const m={}; (h||[]).forEach((x,i)=>m[(x||"").trim().toLowerCase()]=i); return m; }
 function colLetter(i){ return String.fromCharCode("A".charCodeAt(0)+i); }
 function rc(tab, cIdx, r){ const c = colLetter(cIdx); return `${tab}!${c}${r}:${c}${r}`; }
-
-/* === Normalizers: EVEN -> +100, OFF -> "" (blank) === */
-const isOff = v => typeof v==="string" && /off/i.test(v.trim());
-const blankIfOff = v => (isOff(v) ? "" : v);
-function normalizeML(v){
-  if (v===null || v===undefined || v==="") return "";
-  if (isOff(v)) return "";                     // OFF -> blank
-  const s = String(v).trim();
-  if (/^(ev|even)$/i.test(s)) return "+100";   // EVEN/EV -> +100
-  const n = Number(s);
-  if (Number.isFinite(n) && n === 0) return "+100"; // safety: 0 -> +100
-  return s.startsWith("+") || s.startsWith("-") ? s : String(n || s);
-}
-function normalizeSpread(v){
-  // clean "OFF" and pass through numeric-ish strings like "-2.5", "+3.5"
-  if (isOff(v) || v==null || v==="") return "";
-  return String(v).trim();
-}
-function normalizeTotal(v){
-  if (isOff(v) || v==null || v==="") return "";
-  return String(v).trim();
-}
 
 function statusClock(evt){
   const comp = evt.competitions?.[0] || {};
@@ -151,11 +130,11 @@ async function liveOdds(eid){
     const oList = s?.header?.competitions?.[0]?.odds || [];
     const o = oList.find(x=>/live/i.test(x?.details||"")) || oList[0] || {};
     const a=o?.awayTeamOdds||{}, h=o?.homeTeamOdds||{};
-    const overUnder = normalizeTotal(o?.overUnder ?? o?.total ?? "");
-    const aSpread = normalizeSpread(a?.spread ?? "");
-    const hSpread = normalizeSpread(h?.spread ?? "");
-    const aML = normalizeML(a?.moneyLine ?? a?.moneyline ?? "");
-    const hML = normalizeML(h?.moneyLine ?? h?.moneyline ?? "");
+    const overUnder = o?.overUnder ?? o?.total ?? "";
+    const aSpread = a?.spread ?? "";
+    const hSpread = h?.spread ?? "";
+    const aML = a?.moneyLine ?? a?.moneyline ?? "";
+    const hML = h?.moneyLine ?? h?.moneyline ?? "";
 
     const box=s?.boxscore;
     const away=box?.teams?.find(t=>t.homeAway==="away");
@@ -177,7 +156,10 @@ class Sheets{
   async batchReq(reqs){ if(reqs.length) await this.api.spreadsheets.batchUpdate({spreadsheetId:this.id,requestBody:{requests:reqs}}); }
   async sheetId(){ const meta=await this.api.spreadsheets.get({spreadsheetId:this.id}); const s=meta?.data?.sheets?.find(x=>x.properties?.title===this.tab); return s?.properties?.sheetId; }
   async getConditionalFormats(){ 
-    const meta=await this.api.spreadsheets.get({ spreadsheetId:this.id, fields:"sheets.properties,sheets.conditionalFormats" });
+    const meta=await this.api.spreadsheets.get({
+      spreadsheetId:this.id,
+      fields:"sheets.properties,sheets.conditionalFormats"
+    });
     const sheet = meta?.data?.sheets?.find(s=>s.properties?.title===this.tab);
     return { sheetId: sheet?.properties?.sheetId, rules: sheet?.conditionalFormats || [] };
   }
@@ -240,7 +222,7 @@ class Sheets{
     const odds=(comp.odds||ev.odds||[])[0] || {};
     let aSpread="",hSpread="",aML="",hML="",total="";
     if (odds){
-      total = normalizeTotal(odds.overUnder ?? odds.total ?? "");
+      total = odds.overUnder ?? odds.total ?? "";
       const favId = String(odds.favorite||odds.favoriteTeamId||"");
       const spread = Number(odds.spread);
       if (Number.isFinite(spread) && favId){
@@ -248,12 +230,10 @@ class Sheets{
         else if (String(home?.team?.id)===favId){ hSpread=`-${Math.abs(spread)}`; aSpread=`+${Math.abs(spread)}`; }
       }
       const a=odds?.awayTeamOdds||{}, h=odds?.homeTeamOdds||{};
-      aSpread = normalizeSpread(aSpread);
-      hSpread = normalizeSpread(hSpread);
-      aML     = normalizeML(a?.moneyLine ?? a?.moneyline ?? "");
-      hML     = normalizeML(h?.moneyLine ?? h?.moneyline ?? "");
+      aML = a?.moneyLine ?? a?.moneyline ?? "";
+      hML = h?.moneyLine ?? h?.moneyline ?? "";
     }
-    prefillRows.push([id, dateET, sbWeek, status, matchup, "", aSpread, aML, hSpread, hML, total, "","","","","",""]);
+    prefillRows.push([id, dateET, sbWeek, status, matchup, "", aSpread, String(aML||""), hSpread, String(hML||""), String(total||""), "","","","","",""]);
   }
   if (prefillRows.length){
     await sh.batch([{ range:`${TAB_NAME}!A2`, values:prefillRows }]);  // start at row 2
@@ -328,6 +308,7 @@ class Sheets{
           { range:rc(TAB_NAME,hmap["status"],row),      values:[["Final"]] },
           { range:rc(TAB_NAME,hmap["final score"],row), values:[[finalScore]] }
         ]);
+        // update in-memory row for later grading
         rows[row-2][hmap["status"]]="Final";
         rows[row-2][hmap["final score"]]=finalScore;
       }
