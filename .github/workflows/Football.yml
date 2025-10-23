@@ -6,12 +6,19 @@ on:
       league:
         description: "Which league(s) to run"
         type: choice
-        options: [both, nfl, college-football]
+        options:
+          - both
+          - nfl
+          - college-football
         default: both
       run_mode:
         description: "Which phase to run"
         type: choice
-        options: [all, prefill, finals, live]
+        options:
+          - all
+          - prefill
+          - finals
+          - live
         default: all
       game_ids:
         description: "Comma-separated Game IDs (optional)"
@@ -29,7 +36,8 @@ jobs:
             tab: NFL
           - league: college-football
             tab: CFB
-    if: ${{ inputs.league == 'both' || matrix.league == inputs.league }}
+    # Use github.event.inputs (not inputs) so the expression resolves correctly
+    if: ${{ github.event.inputs.league == 'both' || matrix.league == github.event.inputs.league }}
     steps:
       - uses: actions/checkout@v4
 
@@ -57,7 +65,7 @@ jobs:
           LEAGUE: ${{ matrix.league }}
           TAB_NAME: ${{ matrix.tab }}
           RUN_SCOPE: week
-          RUN_MODE: ${{ inputs.run_mode }}
-          GAME_IDS: ${{ inputs.game_ids }}
+          RUN_MODE: ${{ github.event.inputs.run_mode }}
+          GAME_IDS: ${{ github.event.inputs.game_ids }}
           GHA_JSON: "1"
         run: node Football.mjs
