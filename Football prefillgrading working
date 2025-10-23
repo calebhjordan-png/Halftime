@@ -1,428 +1,528 @@
 // Football.mjs
-// One script for Prefill + Finals (+ optional Half snapshot)
+// One pass: Prefill + Finals formatting/grading (+ hooks for Live when enabled)
 
 import { google } from "googleapis";
+import axios from "axios";
 
-/* ====== ENV / CONFIG ====== */
-const SHEET_ID = (process.env.GOOGLE_SHEET_ID || "").trim();
-const CREDS_RAW = (process.env.GOOGLE_SERVICE_ACCOUNT || "").trim();
+/* =========================
+   Env / knobs
+   ========================= */
+const SHEET_ID   = (process.env.GOOGLE_SHEET_ID || "").trim();
+const CREDS_RAW  = (process.env.GOOGLE_SERVICE_ACCOUNT || "").trim();
+const LEAGUE_IN  = (process.env.LEAGUE || "nfl").toLowerCase();        // nfl | college-football
+const TAB_NAME   = (process.env.TAB_NAME || (LEAGUE_IN === "college-football" ? "CFB" : "NFL")).trim();
+const RUN_SCOPE  = (process.env.RUN_SCOPE || "week").toLowerCase();    // week | today
+const GAME_IDS   = (process.env.GAME_IDS || process.env.TARGET_GAME_ID || "").trim();
+const LIVE_ENABLED = false; // keep off until we integrate Playwright live scrape again
 
-const LEAGUE = normLeague(process.env.LEAGUE || "nfl");                 // nfl | college-football
-const TAB_NAME = (process.env.TAB_NAME || (LEAGUE==="nfl"?"NFL":"CFB")).trim();
-const GAME_IDS = (process.env.GAME_IDS || "").trim();                   // "4017...,4017..."
-const MODE = (process.env.MODE || "prefill_and_finals").toLowerCase();  // prefill_and_finals | prefill_only | finals_only | live_only
-const RUN_SCOPE = (process.env.RUN_SCOPE || "auto").toLowerCase();      // auto|today|week
-const REWRITE = String(process.env.REWRITE ?? "1") !== "0";             // allow finals pass to rewrite odds if needed
+const GHA = String(process.env.GHA_JSON || "0") === "1";
+const ET  = "America/New_York";
 
-// Clear backgrounds in all NON-GRADED columns every run.
-// Graded columns are ONLY G..J (A/H Spread + A/H ML). Total (K) is NOT graded per request.
-const CLEAR_NON_GRADED_ALWAYS = true;
-
-const ET_TZ = "America/New_York";
-
-/* Column headers (A..Q) */
+/* =========================
+   Sheet column model
+   ========================= */
 const HEADERS = [
-  "Game ID","Date","Week","Status","Matchup","Final Score",     // A..F
-  "A Spread","A ML","H Spread","H ML","Total",                   // G..K   (Grade only G..J)
-  "H Score","Half A Spread","Half A ML","Half H Spread","Half H ML","Half Total" // L..Q
+  "Game ID","Date","Week","Status","Matchup","Final Score",
+  "A Spread","A ML","H Spread","H ML","Total"
 ];
+// NB: Live columns will be added later; we lock grading to G..K only
 
-/* ====== Small utils ====== */
-const log=(...a)=>console.log(...a);
-const warn=(...a)=>console.warn(...a);
-function normLeague(x){ return /college-football|ncaaf/i.test(x) ? "college-football" : "nfl"; }
-function fmtET(d, opts){ return new Intl.DateTimeFormat("en-US",{timeZone:ET_TZ, ...opts}).format(new Date(d)); }
-function statusPregame(d){ return `${fmtET(d,{month:"2-digit",day:"2-digit"})} - ${fmtET(d,{hour:"numeric",minute:"2-digit",hour12:true})}`; }
-function yyyymmddInET(d=new Date()){ const p=fmtET(d,{year:"numeric",month:"2-digit",day:"2-digit"}).split("/"); return p[2]+p[0]+p[1]; }
-async function fetchJson(u){ const r=await fetch(u,{headers:{'User-Agent':'halftime-bot'}}); if(!r.ok) throw new Error(r.status+" "+u); return r.json(); }
-async function fetchText(u){ const r=await fetch(u,{headers:{'User-Agent':'halftime-bot'}}); if(!r.ok) throw new Error(r.status+" "+u); return r.text(); }
+/* =========================
+   Utilities
+   ========================= */
+const log  = (...a)=> GHA ? console.error(...a) : console.log(...a);
+const warn = (...a)=> GHA ? console.error(...a) : console.warn(...a);
 
-function scoreboardUrl(lg,dates){ const extra = lg==="college-football" ? "&groups=80&limit=300" : ""; return `https://site.api.espn.com/apis/site/v2/sports/football/${lg}/scoreboard?dates=${dates}${extra}`; }
-function summaryUrl(lg,id){ return `https://site.api.espn.com/apis/site/v2/sports/football/${lg}/summary?event=${id}`; }
-function gameUrl(lg,id){ return `https://www.espn.com/${lg}/game/_/gameId/${id}`; }
+function parseServiceAccount(raw) {
+  if (!raw) throw new Error("GOOGLE_SERVICE_ACCOUNT empty");
+  if (raw.trim().startsWith("{")) return JSON.parse(raw);
+  return JSON.parse(Buffer.from(raw, "base64").toString("utf8"));
+}
+function fmtET(d, opt) {
+  return new Intl.DateTimeFormat("en-US",{ timeZone: ET, ...opt }).format(new Date(d));
+}
+function fmtStatusDateTime(d){
+  // "MM/DD - h:mm AM/PM" (no year)
+  const mmdd = fmtET(d,{month:"2-digit",day:"2-digit"});
+  const tm   = fmtET(d,{hour:"numeric",minute:"2-digit",hour12:true});
+  return `${mmdd} - ${tm}`;
+}
+function yyyymmddET(d=new Date()){
+  const parts = new Intl.DateTimeFormat("en-US",{timeZone:ET,year:"numeric",month:"2-digit",day:"2-digit"}).formatToParts(new Date(d));
+  const g = k => parts.find(p=>p.type===k)?.value || "";
+  return `${g("year")}${g("month")}${g("day")}`;
+}
+const sleep = ms=> new Promise(r=>setTimeout(r,ms));
 
-function isFinalEvent(evt){ return /(FINAL)/i.test(evt?.status?.type?.name || evt?.competitions?.[0]?.status?.type?.name || ""); }
-function isHalf(evt){ const s=(evt?.status?.type?.shortDetail||"").toUpperCase(); return /HALF/.test(s) || /(Q2).*(0:0?0)/.test(s); }
-
-function mapHeadersToIndex(h){ const m={}; h.forEach((v,i)=>m[(v||"").trim().toLowerCase()]=i); return m; }
-function colLetter(i){ return String.fromCharCode(65+i); }
-
-function pickOdds(arr=[]){
-  if(!arr?.length) return null;
-  return arr.find(o=>/espn\s*bet/i.test(o.provider?.name||o.provider?.displayName||"")) || arr[0];
+function leagueKey(x){
+  return (x==="ncaaf"||x==="college-football")?"college-football":"nfl";
+}
+function sbUrl(lg, date){
+  lg = leagueKey(lg);
+  const extra = lg === "college-football" ? "&groups=80&limit=300" : "";
+  return `https://site.api.espn.com/apis/site/v2/sports/football/${lg}/scoreboard?dates=${date}${extra}`;
+}
+function sumUrl(lg, id){
+  lg = leagueKey(lg);
+  return `https://site.api.espn.com/apis/site/v2/sports/football/${lg}/summary?event=${id}`;
 }
 
-function resolveFavAndLine(o, awayId, homeId){
-  let aSpread="", hSpread="", total = o?.overUnder ?? o?.total ?? "";
-  const favId = String(o?.favoriteTeamId ?? o?.favorite ?? "");
-  const raw = typeof o?.spread==="string" ? parseFloat(o.spread) : (Number.isFinite(o?.spread)?o.spread:NaN);
-  if(!Number.isNaN(raw) && favId){
-    if(String(awayId)===favId){ aSpread = -Math.abs(raw); hSpread = +Math.abs(raw); }
-    else if(String(homeId)===favId){ hSpread = -Math.abs(raw); aSpread = +Math.abs(raw); }
-  }else if(o?.details){
-    const m=o.details.match(/([+-]?\d+(\.\d+)?)/);
-    if(m){ const n=parseFloat(m[1]); if(n<0){ hSpread=n; aSpread=Math.abs(n); } else { aSpread=n; hSpread=-Math.abs(n); } }
-  }
-  return {aSpread:String(aSpread||""), hSpread:String(hSpread||""), total:String(total||""), favId};
+/* =========================
+   ESPN pulls
+   ========================= */
+async function fetchJSON(url){
+  const r = await axios.get(url, { headers: { "User-Agent":"football-bot/1.0" }, timeout: 15000 });
+  return r.data;
 }
-
-function resolveMLs(o, awayId, homeId){
-  const s=v=>v==null? "": String(v);
-
-  if(o?.awayTeamOdds||o?.homeTeamOdds){
-    return {aML:s(o.awayTeamOdds?.moneyLine ?? o.awayTeamOdds?.moneyline),
-            hML:s(o.homeTeamOdds?.moneyLine ?? o.homeTeamOdds?.moneyline)};
+function resolveWeekLabel(sb, eventDateISO, lg){
+  // Prefer explicit number -> "Week N", else text, else calendar entry label
+  if (Number.isFinite(sb?.week?.number)) return `Week ${sb.week.number}`;
+  const txt = (sb?.week?.text || "").trim();
+  if (txt) {
+    // ESPN sometimes returns "Week 9" already
+    return /^week\s+\d+/i.test(txt) ? txt.replace(/^\w/,(c)=>c.toUpperCase()) : txt;
   }
-  if(o?.moneyline){
-    return {aML:s(o.moneyline?.away?.close?.odds ?? o.moneyline?.away?.open?.odds),
-            hML:s(o.moneyline?.home?.close?.odds ?? o.moneyline?.home?.open?.odds)};
-  }
-  if(Array.isArray(o?.teamOdds)){
-    let a="",h="";
-    for(const t of o.teamOdds){
-      const tid=String(t?.teamId ?? t?.team?.id ?? "");
-      const ml=t?.moneyLine ?? t?.moneyline;
-      if(ml==null) continue;
-      if(tid===String(awayId)) a=String(ml);
-      if(tid===String(homeId)) h=String(ml);
+  const cal = sb?.leagues?.[0]?.calendar || sb?.calendar || [];
+  const t = new Date(eventDateISO).getTime();
+  for (const item of cal) {
+    const entries = Array.isArray(item?.entries) ? item.entries : [item];
+    for (const e of entries) {
+      const s = new Date(e?.startDate || e?.start || 0).getTime();
+      const ed= new Date(e?.endDate   || e?.end   || 0).getTime();
+      const label = (e?.label || e?.detail || e?.text || "").trim();
+      if (Number.isFinite(s) && Number.isFinite(ed) && t>=s && t<=ed) {
+        if (/week\s+\d+/i.test(label)) return label;
+        const m = label.match(/\d+/);
+        return m? `Week ${m[0]}` : label || (lg==="college-football"?"Week":"Week");
+      }
     }
-    return {aML:a,hML:h};
   }
-  const favId=String(o?.favoriteTeamId ?? o?.favorite ?? "");
-  const fav=o?.favoriteMoneyLine ?? o?.favoriteMl;
-  const dog=o?.underdogMoneyLine ?? o?.dogMl;
-  if(favId){
-    if(String(awayId)===favId) return {aML:String(fav??""), hML:String(dog??"")};
-    if(String(homeId)===favId)  return {hML:String(fav??""), aML:String(dog??"")};
-  }
-  return {aML:"",hML:""};
+  return "Week";
 }
 
-/* Fallback to summary endpoint for MLs / lines (prefers ESPN BET) */
-async function fillOddsFromSummaryIfMissing(ev, aSpread, hSpread, total, aML, hML){
-  if(aML && hML && (aSpread || hSpread) && total) return {aSpread,hSpread,total,aML,hML,favAway:null};
-  try{
-    const sum = await fetchJson(summaryUrl(LEAGUE, ev.id));
-    const pools=[];
-    if(Array.isArray(sum?.header?.competitions?.[0]?.odds)) pools.push(...sum.header.competitions[0].odds);
-    if(Array.isArray(sum?.odds)) pools.push(...sum.odds);
-    if(Array.isArray(sum?.pickcenter)) pools.push(...sum.pickcenter);
-    const chosen = pickOdds(pools);
-    if(chosen){
-      const ids = {
-        away: ev.competitions?.[0]?.competitors?.find(c=>c.homeAway==="away")?.team?.id,
-        home: ev.competitions?.[0]?.competitors?.find(c=>c.homeAway==="home")?.team?.id,
-      };
-      const lines = resolveFavAndLine(chosen, ids.away, ids.home);
-      const mls   = resolveMLs(chosen, ids.away, ids.home);
-      return {
-        aSpread: aSpread || lines.aSpread,
-        hSpread: hSpread || lines.hSpread,
-        total:   total   || lines.total,
-        aML:     aML     || mls.aML,
-        hML:     hML     || mls.hML,
-        favAway: lines.favId && String(lines.favId)===String(ids.away)
-      };
+/* =========================
+   Odds helpers
+   ========================= */
+function pickESPNBet(oddsArr=[]) {
+  if (!Array.isArray(oddsArr)) return null;
+  return oddsArr.find(o=>/espn\s*bet/i.test(o?.provider?.name || o?.provider?.displayName || "")) || oddsArr[0] || null;
+}
+function extractBaseOdds(event){
+  const comp = event?.competitions?.[0] || {};
+  const away = comp.competitors?.find(c=>c.homeAway==="away");
+  const home = comp.competitors?.find(c=>c.homeAway==="home");
+  const o = pickESPNBet(comp.odds || event.odds || []);
+  let spread = null, favId = null, total = null, aML="", hML="";
+  if (o) {
+    total = Number.isFinite(+o.overUnder) ? +o.overUnder : (Number.isFinite(+o.total)? +o.total : null);
+    // Spread
+    if (o?.details) {
+      // details sometimes "Fav -6.5"
+      const m = o.details.match(/([+-]?\d+(?:\.\d+)?)/);
+      if (m) spread = Math.abs(parseFloat(m[1]));
     }
-  }catch(e){ /* ignore */ }
-  return {aSpread,hSpread,total,aML,hML,favAway:null};
+    if (Number.isFinite(+o.spread)) spread = Math.abs(+o.spread);
+    favId = String(o.favoriteTeamId || o.favorite || "");
+    // Moneylines – try multiple shapes
+    const a = o?.awayTeamOdds || {};
+    const h = o?.homeTeamOdds || {};
+    aML = a?.moneyLine ?? a?.moneyline ?? a?.money_line ?? "";
+    hML = h?.moneyLine ?? h?.moneyline ?? h?.money_line ?? "";
+    if (aML==="" || hML==="") {
+      if (o.moneyline?.away?.close?.odds || o.moneyline?.away?.open?.odds) {
+        aML = (o.moneyline.away.close?.odds ?? o.moneyline.away.open?.odds ?? aML);
+      }
+      if (o.moneyline?.home?.close?.odds || o.moneyline?.home?.open?.odds) {
+        hML = (o.moneyline.home.close?.odds ?? o.moneyline.home.open?.odds ?? hML);
+      }
+    }
+  }
+  // Fallback to summary if needed (rare for prefill)
+  return { spread, favId, total, aML: aML===""?"":String(aML), hML: hML===""?"":String(hML), away, home };
+}
+function buildSpreads(spread, favId, awayId, homeId){
+  let aS="", hS="";
+  if (!Number.isFinite(spread) || !favId) return {aS, hS};
+  if (String(awayId) === String(favId)) {
+    aS = `-${spread}`; hS = `+${spread}`;
+  } else if (String(homeId) === String(favId)) {
+    hS = `-${spread}`; aS = `+${spread}`;
+  }
+  return {aS,hS};
 }
 
-function buildRuns(matchup, underlineAway, boldAway, boldHome){
-  const at = matchup.indexOf(" @ ");
-  const L = matchup.length;
-  if(at<0) return [{startIndex:0,format:{bold:false,underline:false}}];
-  const A0=0, H0=at+3;
-  const runs=[
-    {startIndex:0, format:{bold:false, underline:false}},
-    {startIndex:A0, format:{bold:!!boldAway, underline:!!underlineAway}},
-    {startIndex:H0, format:{bold:!!boldHome, underline:!underlineAway}},
-  ];
-  return runs.map(r=>({...r, startIndex: Math.min(Math.max(r.startIndex,0), Math.max(L-1,0))}))
-             .sort((x,y)=>x.startIndex-y.startIndex);
-}
-
-async function halftimeSnapshot(gameId){
-  try{
-    const t=(await fetchText(gameUrl(LEAGUE, gameId))).replace(/\u00a0/g," ").replace(/\s+/g," ");
-    const i=t.toUpperCase().indexOf("LIVE ODDS"); if(i<0) return null;
-    const sec=t.slice(i, i+2000);
-    const spreads=[...sec.matchAll(/([+-]\d+(\.\d+)?)/g)].map(m=>m[1]);
-    const liveAwaySpread = spreads?.[2] ?? spreads?.[0] ?? "";
-    const liveHomeSpread = spreads?.[3] ?? spreads?.[1] ?? "";
-    const o = sec.match(/o\s?(\d+(\.\d+)?)/i)?.[1] || "";
-    const u = sec.match(/u\s?(\d+(\.\d+)?)/i)?.[1] || "";
-    const liveTotal = o || u || "";
-    const mls=[...sec.matchAll(/\s[+-]\d{2,4}\b/g)].map(m=>m[0].trim());
-    const liveAwayML = mls?.[0] || "";
-    const liveHomeML = mls?.[1] || "";
-    const score = t.match(/\b(\d{1,2})\s*-\s*(\d{1,2})\b/);
-    const hScore = score ? `${score[1]}-${score[2]}` : "";
-    return {liveAwaySpread, liveHomeSpread, liveTotal, liveAwayML, liveHomeML, hScore};
-  }catch(e){ warn("halftimeSnapshot:", e.message); return null; }
-}
-
-/* ====== Sheets helper ====== */
+/* =========================
+   Sheets wrapper
+   ========================= */
 class Sheets {
-  constructor(auth, spreadsheetId, tab){ this.api=google.sheets({version:"v4",auth}); this.sid=spreadsheetId; this.tab=tab; }
-  async ensureHeader(){
-    const r=await this.api.spreadsheets.values.get({spreadsheetId:this.sid, range:`${this.tab}!A1:Z`});
-    const v=r.data.values||[];
-    if(!v[0]?.length){
-      await this.api.spreadsheets.values.update({spreadsheetId:this.sid, range:`${this.tab}!A1`, valueInputOption:"RAW", requestBody:{values:[HEADERS]}});
-      return HEADERS.slice();
+  constructor(auth, sheetId, tab){
+    this.api  = google.sheets({version:"v4", auth});
+    this.id   = sheetId;
+    this.tab  = tab;
+    this._meta = null;
+    this._values = null;
+    this.hmap = {};
+  }
+  async meta(){
+    if (!this._meta) {
+      this._meta = await this.api.spreadsheets.get({ spreadsheetId: this.id });
     }
-    return v[0];
+    return this._meta;
   }
-  async readAll(){ const r=await this.api.spreadsheets.values.get({spreadsheetId:this.sid, range:`${this.tab}!A1:Z`}); return r.data.values||[]; }
-  async append(vals){ if(vals.length) await this.api.spreadsheets.values.append({spreadsheetId:this.sid, range:`${this.tab}!A1`, valueInputOption:"RAW", requestBody:{values:vals}}); }
-  async batchWrite(data){ if(data.length) await this.api.spreadsheets.values.batchUpdate({spreadsheetId:this.sid, requestBody:{valueInputOption:"RAW", data}}); }
-  async sheetId(){ const m=await this.api.spreadsheets.get({spreadsheetId:this.sid}); return (m.data.sheets||[]).find(s=>s.properties?.title===this.tab)?.properties?.sheetId; }
-  async updateTextRuns(row, colIdx, text, runs){
-    const sheetId=await this.sheetId();
-    await this.api.spreadsheets.batchUpdate({
-      spreadsheetId:this.sid,
-      requestBody:{requests:[{updateCells:{range:{sheetId,startRowIndex:row-1,endRowIndex:row,startColumnIndex:colIdx,endColumnIndex:colIdx+1}, rows:[{values:[{userEnteredValue:{stringValue:text}, textFormatRuns:runs}]}], fields:"userEnteredValue,textFormatRuns"}}]}
-    });
+  async ensureTabAndHeader(){
+    const meta = await this.meta();
+    const present = (meta.data.sheets||[]).find(s=>s.properties?.title===this.tab);
+    if (!present) {
+      await this.api.spreadsheets.batchUpdate({
+        spreadsheetId: this.id,
+        requestBody: { requests: [{ addSheet: { properties: { title: this.tab } } }] }
+      });
+      this._meta = null; await this.meta();
+    }
+    const cur = await this.readAll();
+    if ((cur[0]||[]).length === 0) {
+      await this.api.spreadsheets.values.update({
+        spreadsheetId: this.id, range: `${this.tab}!A1`,
+        valueInputOption:"RAW",
+        requestBody: { values: [HEADERS] }
+      });
+      this._values = null; await this.readAll();
+    }
   }
-
-  // Reset all conditional rules (optional)
-  async resetConditionalFormatting(){
-    const sid = await this.sheetId();
-    const reqs=[];
-    for(let i=0;i<60;i++){ reqs.push({deleteConditionalFormatRule:{index:0, sheetId:sid}}); }
-    try { await this.api.spreadsheets.batchUpdate({spreadsheetId:this.sid, requestBody:{requests:reqs}}); } catch(_) {}
+  async readAll(){
+    if (!this._values) {
+      const r = await this.api.spreadsheets.values.get({
+        spreadsheetId: this.id, range: `${this.tab}!A1:Z`
+      });
+      this._values = r.data.values || [];
+      const header = this._values[0] || [];
+      this.hmap = {};
+      header.forEach((h,i)=>{ this.hmap[h.trim().toLowerCase()] = i; });
+    }
+    return this._values;
   }
-
-  // Grade ONLY G..J
-  async ensureGradingCF(){
-    // remove and recreate only our scoped rules
-    await this.resetConditionalFormatting();
-
-    const sid = await this.sheetId();
-    const green={red:0.85,green:0.95,blue:0.85}, red={red:0.98,green:0.85,blue:0.85};
-    const mk = (colIdx, passFormula, failFormula) => ([
-      { addConditionalFormatRule:{ index:0, rule:{ ranges:[{sheetId:sid,startRowIndex:1,startColumnIndex:colIdx,endColumnIndex:colIdx+1}], booleanRule:{condition:{type:"CUSTOM_FORMULA", values:[{userEnteredValue:passFormula}]}, format:{backgroundColor:green}}}}},
-      { addConditionalFormatRule:{ index:0, rule:{ ranges:[{sheetId:sid,startRowIndex:1,startColumnIndex:colIdx,endColumnIndex:colIdx+1}], booleanRule:{condition:{type:"CUSTOM_FORMULA", values:[{userEnteredValue:failFormula}]}, format:{backgroundColor:red}}}}}
-    ]);
-
-    const HAS_FINAL = '$F2<>""';
-    const AWAY = 'VALUE(LEFT($F2,FIND("-",$F2)-1))';
-    const HOME = 'VALUE(MID($F2,FIND("-",$F2)+1,99))';
-
-    // G (A Spread): (Away pts - Home pts + spread) >= 0
-    const gPass = `=AND(${HAS_FINAL}, ${AWAY} - ${HOME} + G2 >= 0)`;
-    const gFail = `=AND(${HAS_FINAL}, ${AWAY} - ${HOME} + G2 < 0)`;
-
-    // I (H Spread): (Home pts - Away pts + spread) >= 0
-    const iPass = `=AND(${HAS_FINAL}, ${HOME} - ${AWAY} + I2 >= 0)`;
-    const iFail = `=AND(${HAS_FINAL}, ${HOME} - ${AWAY} + I2 < 0)`;
-
-    // H (A ML): away wins
-    const hPass = `=AND(${HAS_FINAL}, ${AWAY} > ${HOME}, H2<>"")`;
-    const hFail = `=AND(${HAS_FINAL}, ${AWAY} <= ${HOME}, H2<>"")`;
-
-    // J (H ML): home wins
-    const jPass = `=AND(${HAS_FINAL}, ${HOME} > ${AWAY}, J2<>"")`;
-    const jFail = `=AND(${HAS_FINAL}, ${HOME} <= ${AWAY}, J2<>"")`;
-
-    const reqs=[
-      ...mk(6, gPass, gFail),   // G
-      ...mk(7, hPass, hFail),   // H
-      ...mk(8, iPass, iFail),   // I
-      ...mk(9, jPass, jFail)    // J
-    ];
-    try { await this.api.spreadsheets.batchUpdate({spreadsheetId:this.sid, requestBody:{requests:reqs}}); } catch(e){ warn("ensureGradingCF:", e.message); }
-  }
-
-  // Clear backgrounds on all NON-GRADED columns (A..F and K..Q)
-  async clearNonGradedBackgrounds(rowCount){
-    if(!CLEAR_NON_GRADED_ALWAYS) return;
-    const sid = await this.sheetId();
-    const requests = [
-      { repeatCell:{ range:{sheetId:sid,startRowIndex:1,endRowIndex:rowCount,startColumnIndex:0,endColumnIndex:6}, cell:{userEnteredFormat:{backgroundColor:null, backgroundColorStyle:null}}, fields:"userEnteredFormat.backgroundColor,userEnteredFormat.backgroundColorStyle" }}, // A..F
-      { repeatCell:{ range:{sheetId:sid,startRowIndex:1,endRowIndex:rowCount,startColumnIndex:10,endColumnIndex:17}, cell:{userEnteredFormat:{backgroundColor:null, backgroundColorStyle:null}}, fields:"userEnteredFormat.backgroundColor,userEnteredFormat.backgroundColorStyle" }}, // K..Q
-    ];
-    await this.api.spreadsheets.batchUpdate({spreadsheetId:this.sid, requestBody:{requests}});
-  }
+  col(c){ return String.fromCharCode("A".charCodeAt(0)+c); }
 }
 
-/* ====== MAIN ====== */
-(async () => {
-  if(!SHEET_ID||!CREDS_RAW){ console.error("Missing GOOGLE_SHEET_ID or GOOGLE_SERVICE_ACCOUNT"); process.exit(1); }
-  const creds = CREDS_RAW.trim().startsWith("{") ? JSON.parse(CREDS_RAW) : JSON.parse(Buffer.from(CREDS_RAW,"base64").toString("utf8"));
-  const auth = new google.auth.GoogleAuth({credentials:{client_email:creds.client_email, private_key:creds.private_key}, scopes:["https://www.googleapis.com/auth/spreadsheets"]});
-  const sh = new Sheets(auth, SHEET_ID, TAB_NAME);
+/* =========================
+   Text formatting for Matchup
+   ========================= */
+function makeMatchupRuns(matchup, favoriteSide, winnerSide){
+  // matchup "Away @ Home"
+  const sepIdx = matchup.indexOf(" @ ");
+  if (sepIdx < 0) return []; // fallback: no runs
+  const awayStart = 0, awayEnd = sepIdx;
+  const homeStart = sepIdx + 3, homeEnd = matchup.length;
 
-  const header = await sh.ensureHeader();
-  const hmap = mapHeadersToIndex(header);
-  const all = await sh.readAll();
-  const rows = all.slice(1);
-  const lastRowIndex = Math.max(2, rows.length+1);
-
-  const rowById = new Map();
-  rows.forEach((r,i)=>{ const id=(r[hmap["game id"]]||"").toString().trim(); if(id) rowById.set(id, i+2); });
-
-  // dates to fetch
-  const dates = RUN_SCOPE==="today" ? [yyyymmddInET()]
-              : RUN_SCOPE==="week"  ? Array.from({length:7},(_,i)=>yyyymmddInET(new Date(Date.now()+i*86400000)))
-                                    : Array.from({length:7},(_,i)=>yyyymmddInET(new Date(Date.now()+i*86400000)));
-
-  // pull events
-  let events=[]; for(const d of dates){ const sb=await fetchJson(scoreboardUrl(LEAGUE,d)); events.push(...(sb?.events||[])); }
-  const onlyIds = GAME_IDS ? GAME_IDS.split(",").map(s=>s.trim()) : null;
-  if(onlyIds?.length) events = events.filter(e=>onlyIds.includes(String(e.id)));
-  log("Events found:", events.length);
-
-  /* ---------- PREFILL ---------- */
-  if(MODE==="prefill_only" || MODE==="prefill_and_finals"){
-    const toAppend=[], toUpdate=[];
-    for(const ev of events){
-      const comp=ev.competitions?.[0]||{};
-      const away=comp.competitors?.find(c=>c.homeAway==="away");
-      const home=comp.competitors?.find(c=>c.homeAway==="home");
-      const awayName=away?.team?.shortDisplayName || away?.team?.abbreviation || "Away";
-      const homeName=home?.team?.shortDisplayName || home?.team?.abbreviation || "Home";
-      const matchup = `${awayName} @ ${homeName}`;
-      const preStatus = statusPregame(ev.date);
-      const rowNum = rowById.get(String(ev.id));
-
-      let odds = pickOdds(comp.odds || ev.odds || []);
-      let aSpread="",hSpread="",total="",aML="",hML="", favAway=false;
-
-      if(odds){
-        const lines = resolveFavAndLine(odds, away?.team?.id, home?.team?.id);
-        const mls   = resolveMLs(odds, away?.team?.id, home?.team?.id);
-        aSpread=lines.aSpread; hSpread=lines.hSpread; total=lines.total; aML=mls.aML; hML=mls.hML;
-        favAway = lines.favId && String(lines.favId)===String(away?.team?.id);
-      }
-
-      // Fallback to summary if MLs/lines are missing
-      ({aSpread,hSpread,total,aML,hML,favAway} = await fillOddsFromSummaryIfMissing(ev, aSpread,hSpread,total,aML,hML));
-
-      if(!rowNum){
-        toAppend.push([
-          String(ev.id), fmtET(ev.date,{year:"numeric",month:"2-digit",day:"2-digit"}), comp.week?.text || ("Week "+(comp.week?.number??"")), preStatus,
-          matchup, "", aSpread, aML, hSpread, hML, total, "", "", "", "", "", ""
-        ]);
-      }else{
-        const existing = all[rowNum-1]||[];
-        const curStatus=(existing[hmap["status"]]||"").toString();
-        // don't overwrite once live/finished
-        if(curStatus && (/(Final|Q\d|Half|End of)/i.test(curStatus))) continue;
-
-        const set=(name,val)=>{ const idx=hmap[name.toLowerCase()]; if(idx==null) return; toUpdate.push({range:`${TAB_NAME}!${colLetter(idx)}${rowNum}:${colLetter(idx)}${rowNum}`, values:[[val??""]]}); };
-        set("status", preStatus);
-        set("matchup", matchup);
-        set("a spread", aSpread); set("h spread", hSpread);
-        set("a ml", aML); set("h ml", hML); set("total", total);
-
-        try { const runs = buildRuns(matchup, !!favAway, false, false); await sh.updateTextRuns(rowNum, hmap["matchup"], matchup, runs); } catch(_) {}
-      }
+  // Build segments with flags
+  const segs = [
+    {start: awayStart, end: awayEnd, underline: favoriteSide==="away", bold: winnerSide==="away"},
+    {start: homeStart, end: homeEnd, underline: favoriteSide==="home", bold: winnerSide==="home"},
+  ];
+  // Convert to textFormatRuns: start-indexed changes. Merge if both true.
+  // Google API requires startIndex < string length.
+  const runs = [];
+  // Base (index 0) explicitly set to no-style to “clear” residuals
+  runs.push({ startIndex:0, format:{ bold:false, underline:false }});
+  for (const s of segs) {
+    const fmt = {};
+    if (s.bold) fmt.bold = true;
+    if (s.underline) fmt.underline = true;
+    runs.push({ startIndex: s.start, format: Object.keys(fmt).length? fmt : { bold:false, underline:false }});
+    // and reset at end if not at end of string
+    if (s.end < matchup.length) {
+      runs.push({ startIndex: s.end, format: { bold:false, underline:false }});
     }
-    if(toAppend.length) await sh.append(toAppend);
-    if(toUpdate.length) await sh.batchWrite(toUpdate);
+  }
+  // sort and de-dupe by startIndex (last one wins)
+  const map = new Map();
+  for (const r of runs) map.set(r.startIndex, r);
+  return [...map.values()].sort((a,b)=>a.startIndex-b.startIndex).filter(r=>r.startIndex < matchup.length);
+}
+
+/* =========================
+   Grading helpers
+   ========================= */
+function toNum(v){ const n=Number(v); return Number.isFinite(n)?n:null; }
+
+function gradeRow(finalScore, aSpread, aML, hSpread, hML, total){
+  // returns {G..K backgrounds}
+  const out = { G:null, H:null, I:null, J:null, K:null };
+  const m = (finalScore||"").match(/(\d+)\s*-\s*(\d+)/);
+  if (!m) return out;
+  const a = +m[1], h = +m[2];
+
+  // Spreads (against the number)
+  if (aSpread){ // "+3.5" or "-6.5"
+    const aLine = parseFloat(aSpread);
+    const diff = a - h;
+    const cover = diff + (aLine||0) > 0 ? (aLine<0 ? diff > -aLine : diff + aLine > 0) : diff + aLine > 0;
+    // Better: evaluate ATS: teamScore + spread vs oppScore
+    const aAdj = a + (aLine||0);
+    out.G = (aAdj > h) ? "green" : "red";
+  }
+  if (hSpread){
+    const hLine = parseFloat(hSpread);
+    const hAdj = h + (hLine||0);
+    out.I = (hAdj > a) ? "green" : "red";
+  }
+  // Moneylines: just who won
+  if (aML) out.H = (a>h) ? "green" : "red";
+  if (hML) out.J = (h>a) ? "green" : "red";
+  // Total: Over = green, Under = red (push left uncolored)
+  if (total){
+    const t = parseFloat(total);
+    if (Number.isFinite(t)){
+      const sum = a + h;
+      out.K = (sum > t) ? "green" : (sum < t ? "red" : null);
+    }
+  }
+  return out;
+}
+
+/* =========================
+   Main
+   ========================= */
+(async function main(){
+  if (!SHEET_ID || !CREDS_RAW) throw new Error("Missing Google creds / sheet id");
+  const CREDS = parseServiceAccount(CREDS_RAW);
+  const auth  = new google.auth.GoogleAuth({
+    credentials: { client_email: CREDS.client_email, private_key: CREDS.private_key },
+    scopes: ["https://www.googleapis.com/auth/spreadsheets"]
+  });
+  const sheets = new Sheets(await auth.getClient(), SHEET_ID, TAB_NAME);
+  await sheets.ensureTabAndHeader();
+  const values = await sheets.readAll();
+  const h = sheets.hmap;
+
+  // Build existing key->row map by Game ID
+  const keyRow = new Map();
+  (values.slice(1)).forEach((r,i)=>{
+    const id = (r[h["game id"]]||"").toString().trim();
+    if (id) keyRow.set(id, i+2); // 1-based + header
+  });
+
+  // Dates to pull
+  const dates = RUN_SCOPE==="today"
+    ? [yyyymmddET()]
+    : Array.from({length:7},(_,i)=>{ const d=new Date(); d.setDate(d.getDate()+i); return yyyymmddET(d); });
+
+  // Optional filter by GAME_IDS (CSV)
+  const forcedIds = GAME_IDS ? GAME_IDS.split(",").map(s=>s.trim()).filter(Boolean) : [];
+
+  // 1) Pull events for dates
+  let masterSB=null, events=[];
+  for (const d of dates){
+    const sb = await fetchJSON(sbUrl(LEAGUE_IN, d));
+    if (!masterSB) masterSB = sb;
+    events = events.concat(sb?.events || []);
+  }
+  // de-dupe
+  const seen = new Set();
+  events = events.filter(e=>!seen.has(e?.id) && seen.add(e.id));
+
+  // If GAME_IDS provided, keep only those (but still need week label)
+  const filterSet = forcedIds.length ? new Set(forcedIds) : null;
+  if (filterSet) events = events.filter(e=>filterSet.has(String(e.id)));
+
+  log(`Events found: ${events.length}`);
+
+  const valueUpdates = []; // for batch values write
+  const formatRequests = []; // for batch format writes (repeatCell / updateCells with textFormatRuns)
+
+  // helper for scheduling single-cell value update
+  function updCell(row, colIdx, val){
+    const A = sheets.col(colIdx), range = `${TAB_NAME}!${A}${row}:${A}${row}`;
+    valueUpdates.push({ range, values:[[val==null?"":val]] });
   }
 
-  /* ---------- FINALS ---------- */
-  if(MODE==="finals_only" || MODE==="prefill_and_finals"){
-    const batch=[], formatQueue=[];
-    for(const ev of events){
-      const comp=ev.competitions?.[0]||{};
-      const away=comp.competitors?.find(c=>c.homeAway==="away");
-      const home=comp.competitors?.find(c=>c.homeAway==="home");
-      const matchup = `${away?.team?.shortDisplayName||"Away"} @ ${home?.team?.shortDisplayName||"Home"}`;
-      const rowNum=rowById.get(String(ev.id)); if(!rowNum) continue;
+  // iterate events
+  for (const ev of events){
+    const comp = ev.competitions?.[0] || {};
+    const away = comp.competitors?.find(c=>c.homeAway==="away");
+    const home = comp.competitors?.find(c=>c.homeAway==="home");
+    const awayName = away?.team?.shortDisplayName || away?.team?.abbreviation || away?.team?.name || "Away";
+    const homeName = home?.team?.shortDisplayName || home?.team?.abbreviation || home?.team?.name || "Home";
+    const matchup  = `${awayName} @ ${homeName}`;
 
-      const set=(name,val)=>{ const idx=hmap[name.toLowerCase()]; if(idx==null) return; batch.push({range:`${TAB_NAME}!${colLetter(idx)}${rowNum}:${colLetter(idx)}${rowNum}`, values:[[val??""]]}); };
+    const gameId = String(ev.id);
+    const rowNum = keyRow.get(gameId);
 
-      let finalNow = isFinalEvent(ev);
-      let aPts = Number(away?.score||0), hPts = Number(home?.score||0);
-      let finalScore = (aPts||hPts) ? `${aPts}-${hPts}` : "";
+    // status text
+    const statusName = (ev.status?.type?.name || comp.status?.type?.name || "").toUpperCase();
+    const isFinal = statusName.includes("FINAL");
+    const displayWhen = isFinal ? "Final" : fmtStatusDateTime(ev.date);
 
-      const sheetRow = all[rowNum-1] || [];
-      const sheetFinalScore = (sheetRow[hmap["final score"]]||"").toString().trim();
-      if(sheetFinalScore && !finalNow){
-        finalNow = true; finalScore = sheetFinalScore;
-        const m = sheetFinalScore.match(/(\d+)\s*-\s*(\d+)/);
-        if(m){ aPts=Number(m[1]||0); hPts=Number(m[2]||0); }
+    const weekLabel = resolveWeekLabel(masterSB, ev.date, LEAGUE_IN);
+    const dateET   = fmtET(ev.date, {year:"numeric",month:"2-digit",day:"2-digit"});
+
+    // Precompute odds/spreads
+    const { spread, favId, total, aML, hML } = extractBaseOdds(ev);
+    const { aS, hS } = buildSpreads(spread, favId, away?.team?.id, home?.team?.id);
+
+    // Append new row if not present
+    if (!rowNum){
+      const row = new Array(HEADERS.length).fill("");
+      row[h["game id"]] = gameId;
+      row[h["date"]]    = dateET;
+      row[h["week"]]    = weekLabel;
+      row[h["status"]]  = displayWhen;
+      row[h["matchup"]] = matchup;
+      row[h["final score"]] = isFinal ? `${away?.score??""}-${home?.score??""}` : "";
+
+      row[h["a spread"]] = aS || "";
+      row[h["a ml"]]     = aML || "";
+      row[h["h spread"]] = hS || "";
+      row[h["h ml"]]     = hML || "";
+      row[h["total"]]    = Number.isFinite(total)? String(total):"";
+
+      // queue append by values
+      valueUpdates.push({ range:`${TAB_NAME}!A1`, values:[row] });
+
+      // underline favorite (if known)
+      let favSide = null;
+      if (favId) favSide = String(favId)===String(away?.team?.id) ? "away" : "home";
+      const runs = makeMatchupRuns(matchup, favSide, null);
+      if (runs.length){
+        // We don't yet know the absolute row; append happens before format.
+        // We'll apply text runs after we refresh row map at the very end (2nd batch). See below addToPostpass.
+        postpassTextRuns.push({ gameId, runs, matchupText: matchup });
       }
 
-      if(finalNow){
-        if(finalScore) set("final score", finalScore);
-        set("status","Final");
+    } else {
+      // Existing row: prefill refresh for odds prior to kickoff; DO NOT clobber finals
+      // Update status only if game has not started (we don’t override live.mjs updates)
+      const row = values[rowNum-1] || [];
+      const curStatus = (row[h["status"]]||"").toString().trim();
+      if (!/final/i.test(curStatus) && !/(\d+:\d+\s*-\s*\d+(?:st|nd|rd|th)|half|q\d)/i.test(curStatus)) {
+        updCell(rowNum, h["status"], displayWhen);
+      }
+      // Week / date refresh (safe)
+      if ((row[h["week"]]||"") !== weekLabel) updCell(rowNum, h["week"], weekLabel);
+      if ((row[h["date"]]||"") !== dateET)     updCell(rowNum, h["date"], dateET);
 
-        if(REWRITE){
-          let odds = pickOdds(comp.odds||ev.odds||[]);
-          if(!odds){
-            try{
-              const sum=await fetchJson(summaryUrl(LEAGUE, ev.id));
-              const pool=[]; if(Array.isArray(sum?.odds)) pool.push(...sum.odds);
-              if(Array.isArray(sum?.pickcenter)) pool.push(...sum.pickcenter);
-              odds = pickOdds(pool);
-            }catch(_){}
-          }
-          if(odds){
-            const lines = resolveFavAndLine(odds, away?.team?.id, home?.team?.id);
-            const mls   = resolveMLs(odds, away?.team?.id, home?.team?.id);
-            set("a spread", lines.aSpread);
-            set("h spread", lines.hSpread);
-            set("total",   lines.total);
-            set("a ml",    mls.aML);
-            set("h ml",    mls.hML);
-            const favAway = lines.favId && String(lines.favId)===String(away?.team?.id);
-            const boldAway = aPts>hPts, boldHome = hPts>aPts;
-            formatQueue.push({rowNum, text:matchup, favAway, boldAway, boldHome});
-          }else{
-            const boldAway = aPts>hPts, boldHome = hPts>aPts;
-            formatQueue.push({rowNum, text:matchup, favAway:false, boldAway, boldHome});
-          }
-        }else{
-          const boldAway = aPts>hPts, boldHome = hPts>aPts;
-          formatQueue.push({rowNum, text:matchup, favAway:false, boldAway, boldHome});
+      // Refresh odds only before start
+      const gameStarted = /in_progress|live|halftime|final/i.test(statusName);
+      if (!gameStarted){
+        if (aS)   updCell(rowNum, h["a spread"], aS);
+        if (hS)   updCell(rowNum, h["h spread"], hS);
+        if (aML!=="") updCell(rowNum, h["a ml"], aML);
+        if (hML!=="") updCell(rowNum, h["h ml"], hML);
+        if (Number.isFinite(total)) updCell(rowNum, h["total"], String(total));
+
+        // underline favorite
+        let favSide = null;
+        if (favId) favSide = String(favId)===String(away?.team?.id) ? "away" : "home";
+        const runs = makeMatchupRuns(matchup, favSide, null);
+        if (runs.length){
+          formatRequests.push({
+            updateCells: {
+              range: { sheetId: getSheetIdFromMeta(sheets._meta, TAB_NAME), startRowIndex: rowNum-1, endRowIndex: rowNum, startColumnIndex: h["matchup"], endColumnIndex: h["matchup"]+1 },
+              rows: [{ values: [{ userEnteredValue:{ stringValue: matchup }, textFormatRuns: runs }] }],
+              fields: "userEnteredValue,textFormatRuns"
+            }
+          });
         }
       }
-    }
 
-    if(batch.length) await sh.batchWrite(batch);
-    for(const f of formatQueue){
-      try{ const runs=buildRuns(f.text, f.favAway, f.boldAway, f.boldHome); await sh.updateTextRuns(f.rowNum, hmap["matchup"], f.text, runs); }catch(_){}
-    }
-    await sh.ensureGradingCF();
-
-    // Safety sweep: if Final Score exists but Status != Final, fix it.
-    const fixPayload=[];
-    rows.forEach((r,i)=>{
-      const rowNum=i+2;
-      const fs=(r[hmap["final score"]]||"").toString().trim();
-      const st=(r[hmap["status"]]||"").toString().trim();
-      if(fs && st.toLowerCase()!=="final"){
-        fixPayload.push({range:`${TAB_NAME}!${colLetter(hmap["status"])}${rowNum}:${colLetter(hmap["status"])}${rowNum}`, values:[["Final"]]});
+      // Finals handling: write final score, bold winner, grade G..K
+      if (isFinal){
+        const finalPair = `${away?.score??""}-${home?.score??""}`;
+        if ((row[h["final score"]]||"") !== finalPair) updCell(rowNum, h["final score"], finalPair);
+        // winner side
+        let winner = null;
+        if (Number.isFinite(+away?.score) && Number.isFinite(+home?.score)) {
+          winner = (+away.score > +home.score) ? "away" : (+home.score > +away.score ? "home" : null);
+        }
+        const favSide = favId ? (String(favId)===String(away?.team?.id) ? "away" : "home") : null;
+        const runs = makeMatchupRuns(matchup, favSide, winner);
+        if (runs.length){
+          formatRequests.push({
+            updateCells: {
+              range: { sheetId: getSheetIdFromMeta(sheets._meta, TAB_NAME), startRowIndex: rowNum-1, endRowIndex: rowNum, startColumnIndex: h["matchup"], endColumnIndex: h["matchup"]+1 },
+              rows: [{ values: [{ userEnteredValue:{ stringValue: matchup }, textFormatRuns: runs }] }],
+              fields: "userEnteredValue,textFormatRuns"
+            }
+          });
+        }
+        // grading
+        const grading = gradeRow(finalPair, row[h["a spread"]], row[h["a ml"]], row[h["h spread"]], row[h["h ml"]], row[h["total"]]);
+        const colorMap = { green:{red:0.85,green:0.95,blue:0.85}, red:{red:0.98,green:0.85,blue:0.85} };
+        const colIdx = { G:h["a spread"], H:h["a ml"], I:h["h spread"], J:h["h ml"], K:h["total"] };
+        for (const key of ["G","H","I","J","K"]){
+          const ci = colIdx[key];
+          if (ci==null) continue;
+          const bg = grading[key];
+          formatRequests.push({
+            repeatCell:{
+              range:{ sheetId: getSheetIdFromMeta(sheets._meta, TAB_NAME), startRowIndex: rowNum-1, endRowIndex: rowNum, startColumnIndex: ci, endColumnIndex: ci+1 },
+              cell:{ userEnteredFormat:{ backgroundColor: bg ? colorMap[bg] : {red:1,green:1,blue:1} } },
+              fields:"userEnteredFormat.backgroundColor"
+            }
+          });
+        }
+        // Ensure Status shows Final
+        updCell(rowNum, h["status"], "Final");
       }
-    });
-    if(fixPayload.length) await sh.batchWrite(fixPayload);
-  }
-
-  /* ---------- LIVE halftime snapshot (optional) ---------- */
-  if(MODE==="live_only"){
-    const batch=[];
-    for(const ev of events){
-      if(!isHalf(ev)) continue;
-      const rowNum=rowById.get(String(ev.id)); if(!rowNum) continue;
-      const snap=await halftimeSnapshot(String(ev.id)); if(!snap) continue;
-      const put=(name,val)=>{ const idx=hmap[name.toLowerCase()]; if(idx==null || !val) return; batch.push({range:`${TAB_NAME}!${colLetter(idx)}${rowNum}:${colLetter(idx)}${rowNum}`, values:[[val]]}); };
-      put("h score", snap.hScore);
-      put("half a spread", snap.liveAwaySpread);
-      put("half h spread", snap.liveHomeSpread);
-      put("half a ml", snap.liveAwayML);
-      put("half h ml", snap.liveHomeML);
-      put("half total", snap.liveTotal);
     }
-    if(batch.length) await sh.batchWrite(batch);
   }
 
-  // Keep only G..J colored: clear backgrounds on A..F and K..Q
-  await sh.clearNonGradedBackgrounds(lastRowIndex);
+  // 2) Flush batched value updates
+  if (valueUpdates.length){
+    // Combine appends at end by separating append vs direct updates
+    const appends = valueUpdates.filter(d=>d.range.endsWith("!A1"));
+    const updates = valueUpdates.filter(d=>!d.range.endsWith("!A1"));
+
+    if (appends.length){
+      await sheets.api.spreadsheets.values.append({
+        spreadsheetId: SHEET_ID,
+        range: `${TAB_NAME}!A1`,
+        valueInputOption: "RAW",
+        requestBody: { values: appends.flatMap(x=>x.values) }
+      });
+      // refresh cache & row map (needed for postpass text runs if we used it)
+      sheets._values = null; const newVals = await sheets.readAll();
+      const h2 = sheets.hmap;
+      keyRow.clear();
+      (newVals.slice(1)).forEach((r,i)=>{ const id=(r[h2["game id"]]||"").toString().trim(); if(id) keyRow.set(id,i+2); });
+    }
+
+    if (updates.length){
+      await sheets.api.spreadsheets.values.batchUpdate({
+        spreadsheetId: SHEET_ID,
+        requestBody:{ valueInputOption:"RAW", data: updates }
+      });
+    }
+  }
+
+  // 3) Flush format requests
+  if (formatRequests.length){
+    await sheets.api.spreadsheets.batchUpdate({
+      spreadsheetId: SHEET_ID,
+      requestBody:{ requests: formatRequests }
+    });
+  }
 
   log("Done.");
-})().catch(e=>{ console.error("Fatal:", e); process.exit(1); });
+  if (GHA) process.stdout.write(JSON.stringify({ok:true, tab:TAB_NAME, events:events.length})+"\n");
+
+})().catch(err=>{
+  warn("Fatal:", err?.message || err);
+  if (GHA) process.stdout.write(JSON.stringify({ok:false, error:String(err?.message||err)})+"\n");
+  process.exit(1);
+});
+
+/* =========================
+   Helpers needing sheetId
+   ========================= */
+function getSheetIdFromMeta(meta, title){
+  const s = (meta?.data?.sheets||[]).find(x=>x.properties?.title===title);
+  return s?.properties?.sheetId;
+}
+
+/* =========================
+   Post-append text runs holder
+   (kept for future use if you want a second-pass apply;
+   current implementation writes runs inline when row exists)
+   ========================= */
+const postpassTextRuns = [];
