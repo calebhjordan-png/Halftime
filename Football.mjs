@@ -1,5 +1,4 @@
-// Football.mjs — Prefill + Finals + Live (safe headers + safe grading)
-// Node >=20, package.json should be "type": "module"
+// Football.mjs — Prefill + Finals + Live + Finals-backfill + Direct grading colors (G..K)
 
 import { google } from "googleapis";
 import axios from "axios";
@@ -39,7 +38,7 @@ const fetchJSON = async u => (await axios.get(u,{headers:{"User-Agent":"football
 
 function mapHeaders(h){ const m={}; (h||[]).forEach((x,i)=>m[(x||"").trim().toLowerCase()]=i); return m; }
 function colLetter(i){ return String.fromCharCode("A".charCodeAt(0)+i); }
-function rangeRC(tab, colIdx, row){ const c = colLetter(colIdx); return `${tab}!${c}${row}:${c}${row}`; }
+function rc(tab, cIdx, r){ const c = colLetter(cIdx); return `${tab}!${c}${r}:${c}${r}`; }
 
 function statusClock(evt){
   const comp = evt.competitions?.[0] || {};
@@ -142,7 +141,10 @@ async function liveOdds(eid){
     const home=box?.teams?.find(t=>t.homeAway==="home");
     const score = `${away?.score??""}-${home?.score??""}`;
 
-    return { score, aSpread, aML, hSpread, hML, total:overUnder };
+    const comp=s?.header?.competitions?.[0]||{};
+    const name=(comp.status?.type?.name||"").toUpperCase();
+
+    return { score, aSpread, aML, hSpread, hML, total:overUnder, statusName:name };
   }catch{ return null; }
 }
 
@@ -240,13 +242,13 @@ class Sheets{
     const name=(comp.status?.type?.name||ev.status?.type?.name||"").toUpperCase();
 
     // always update Status
-    if (hmap["status"]!==undefined) valWrites.push({ range:rangeRC(TAB_NAME,hmap["status"],row), values:[[ statusClock(ev) ]]});
+    if (hmap["status"]!==undefined) valWrites.push({ range:rc(TAB_NAME,hmap["status"],row), values:[[ statusClock(ev) ]]});
 
     if (name.includes("FINAL")){
       const away=comp.competitors?.find(c=>c.homeAway==="away");
       const home=comp.competitors?.find(c=>c.homeAway==="home");
       const finalScore=`${away?.score??""}-${home?.score??""}`;
-      if (hmap["final score"]!==undefined) valWrites.push({ range:rangeRC(TAB_NAME,hmap["final score"],row), values:[[finalScore]]});
+      if (hmap["final score"]!==undefined) valWrites.push({ range:rc(TAB_NAME,hmap["final score"],row), values:[[finalScore]]});
 
       if (hmap["matchup"]!==undefined && sheetId!=null){
         const full = (rows[row-2]?.[hmap["matchup"]] ?? matchupText(ev));
@@ -259,7 +261,7 @@ class Sheets{
           }
         });
       }
-    } else if (!/in_progress|live/i.test(name)){ // pregame
+    } else if (!/in_progress|live/i.test(name)){ // pregame underline favorite
       if (hmap["matchup"]!==undefined && sheetId!=null){
         const full = (rows[row-2]?.[hmap["matchup"]] ?? matchupText(ev));
         const runs = textRunsForMatchup(full, favoriteFromOdds(ev), null);
@@ -278,7 +280,32 @@ class Sheets{
   await sh.batch(valWrites);
   await sh.batchReq(fmtReqs);
 
-  /* --- Live odds (L–Q) --- */
+  /* --- Finals backfill sweep (promote non-Final rows to Final if summary says so) --- */
+  const needCheck = [];
+  rows.forEach((r,i)=>{
+    const id=(r[hmap["game id"]]||"").toString().trim();
+    const status=(r[hmap["status"]]||"").toString().toLowerCase();
+    if (id && !/final/.test(status)) needCheck.push({id,row:i+2});
+  });
+  // limit to avoid quota storms
+  for (const {id,row} of needCheck.slice(0,120)){
+    try{
+      const s=await fetchJSON(sumUrl(id));
+      const comp=s?.header?.competitions?.[0]||{};
+      const nm=(comp.status?.type?.name||"").toUpperCase();
+      if (nm.includes("FINAL")){
+        const away=comp.competitors?.find(c=>c.homeAway==="away");
+        const home=comp.competitors?.find(c=>c.homeAway==="home");
+        const finalScore=`${away?.score??""}-${home?.score??""}`;
+        await sh.batch([
+          { range:rc(TAB_NAME,hmap["status"],row),      values:[["Final"]] },
+          { range:rc(TAB_NAME,hmap["final score"],row), values:[[finalScore]] }
+        ]);
+      }
+    }catch{ /* ignore */ }
+  }
+
+  /* --- Live odds (L–Q) & live status --- */
   const liveWrites=[];
   for (const ev of events){
     const id=String(ev.id); const row=rowById.get(id); if(!row||row<2) continue;
@@ -288,7 +315,7 @@ class Sheets{
     const live=await liveOdds(id); if(!live) continue;
 
     const put=(key,val)=>{ const idx=hmap[key.toLowerCase()]; if(idx===undefined || val==null || val==="") return;
-      liveWrites.push({ range:rangeRC(TAB_NAME,idx,row), values:[[ String(val) ]]});
+      liveWrites.push({ range:rc(TAB_NAME,idx,row), values:[[ String(val) ]]});
     };
     put("H Score", live.score);
     put("H A Spread", live.aSpread);
@@ -296,52 +323,59 @@ class Sheets{
     put("H H Spread", live.hSpread);
     put("H H ML", live.hML);
     put("H Total", live.total);
+    if (hmap["status"]!==undefined){
+      const sText = live.statusName?.includes("HALF") ? "Half" :
+                    (live.statusName?.includes("IN_PROGRESS") ? "In Progress" : null);
+      if (sText) liveWrites.push({ range:rc(TAB_NAME,hmap["status"],row), values:[[sText]]});
+    }
   }
   await sh.batch(liveWrites);
 
-  /* --- Grading rules (G..K only) --- */
-  const needed = ["a spread","a ml","h spread","h ml","total","final score"].every(k=>Number.isInteger(hmap[k]));
-  if (sheetId!=null && needed){
-    // try to clear first rule (ignore if none)
-    try{ await sh.batchReq([{ deleteConditionalFormatRule:{ sheetId, index:0 } }]); }catch{}
-
-    const G=hmap["a spread"], H=hmap["a ml"], I=hmap["h spread"], J=hmap["h ml"], K=hmap["total"];
-    const c = i => `$${colLetter(i)}2`;
-
-    const AWAY = `INDEX(SPLIT($${colLetter(hmap["final score"])}2,"-"),1)`;
-    const HOME = `INDEX(SPLIT($${colLetter(hmap["final score"])}2,"-"),2)`;
-    const add = (formula, color)=>({
-      addConditionalFormatRule:{
-        rule:{
-          ranges:[{ sheetId, startRowIndex:1, startColumnIndex:0, endColumnIndex:17 }],
-          booleanRule:{ condition:{ type:"CUSTOM_FORMULA", values:[{ userEnteredValue:formula }]},
-            format:{ backgroundColor:color } }
-        }, index:0
+  /* --- Direct grading colors for G..K based on Final Score --- */
+  if (sheetId!=null){
+    const GREEN={red:0.85,green:0.95,blue:0.85}, RED={red:0.97,green:0.85,blue:0.85}, CLEAR={red:1,green:1,blue:1};
+    const reqs=[];
+    for (let r=0; r<rows.length; r++){
+      const rowNum = r+2;
+      const F = (rows[r][hmap["final score"]]||"").toString();
+      const G = toNum(rows[r][hmap["a spread"]]);
+      const H = toNum(rows[r][hmap["a ml"]]);
+      const I = toNum(rows[r][hmap["h spread"]]);
+      const J = toNum(rows[r][hmap["h ml"]]);
+      const K = toNum(rows[r][hmap["total"]]);
+      // clear first
+      for (const idx of [hmap["a spread"],hmap["a ml"],hmap["h spread"],hmap["h ml"],hmap["total"]]){
+        if (idx===undefined) continue;
+        reqs.push({ repeatCell:{
+          range:{ sheetId, startRowIndex:rowNum-1, endRowIndex:rowNum, startColumnIndex:idx, endColumnIndex:idx+1 },
+          cell:{ userEnteredFormat:{ backgroundColor:CLEAR }}, fields:"userEnteredFormat.backgroundColor"
+        }});
       }
-    });
-    const green={red:0.85,green:0.95,blue:0.85}, red={red:0.97,green:0.85,blue:0.85};
+      if (!F || !F.includes("-")) continue;
+      const [aStr,hStr]=F.split("-");
+      const a = toNum(aStr), h = toNum(hStr);
+      if (a==null || h==null) continue;
 
-    // A Spread (G)
-    const gWin  = `=AND($${colLetter(hmap["final score"])}2<>"",${c(G)}<>"", ${AWAY}+${c(G)}>${HOME})`;
-    const gLoss = `=AND($${colLetter(hmap["final score"])}2<>"",${c(G)}<>"", ${AWAY}+${c(G)}<=${HOME})`;
-    // A ML (H)
-    const hWin  = `=AND($${colLetter(hmap["final score"])}2<>"",${c(H)}<>"", ${AWAY}>${HOME})`;
-    const hLoss = `=AND($${colLetter(hmap["final score"])}2<>"",${c(H)}<>"", ${AWAY}<=${HOME})`;
-    // H Spread (I)
-    const iWin  = `=AND($${colLetter(hmap["final score"])}2<>"",${c(I)}<>"", ${HOME}+${c(I)}>${AWAY})`;
-    const iLoss = `=AND($${colLetter(hmap["final score"])}2<>"",${c(I)}<>"", ${HOME}+${c(I)}<=${AWAY})`;
-    // H ML (J)
-    const jWin  = `=AND($${colLetter(hmap["final score"])}2<>"",${c(J)}<>"", ${HOME}>${AWAY})`;
-    const jLoss = `=AND($${colLetter(hmap["final score"])}2<>"",${c(J)}<>"", ${HOME}<=${AWAY})`;
-    // Total (K)
-    const sum   = `(${AWAY}+${HOME})`;
-    const kOver = `=AND($${colLetter(hmap["final score"])}2<>"",${c(K)}<>"", ${sum}>${c(K)})`;
-    const kUnder= `=AND($${colLetter(hmap["final score"])}2<>"",${c(K)}<>"", ${sum}<=${c(K)})`;
+      const paint = (idx,color)=>{
+        if (idx===undefined) return;
+        reqs.push({ repeatCell:{
+          range:{ sheetId, startRowIndex:rowNum-1, endRowIndex:rowNum, startColumnIndex:idx, endColumnIndex:idx+1 },
+          cell:{ userEnteredFormat:{ backgroundColor:color }}, fields:"userEnteredFormat.backgroundColor"
+        }});
+      };
 
-    const rules = [ add(gWin,green),add(gLoss,red), add(hWin,green),add(hLoss,red),
-                    add(iWin,green),add(iLoss,red), add(jWin,green),add(jLoss,red),
-                    add(kOver,green),add(kUnder,red) ];
-    try{ await sh.batchReq(rules); }catch(e){ console.error("CF rules install skipped:", e.message); }
+      // A Spread: a + spread > h wins
+      if (G!=null) paint(hmap["a spread"], (a + G > h) ? GREEN : RED);
+      // A ML: a > h wins
+      if (H!=null) paint(hmap["a ml"], (a > h) ? GREEN : RED);
+      // H Spread: h + spread > a wins
+      if (I!=null) paint(hmap["h spread"], (h + I > a) ? GREEN : RED);
+      // H ML: h > a wins
+      if (J!=null) paint(hmap["h ml"], (h > a) ? GREEN : RED);
+      // Total: (a+h) > total wins
+      if (K!=null) paint(hmap["total"], ((a+h) > K) ? GREEN : RED);
+    }
+    await sh.batchReq(reqs);
   }
 
   const out = { ok:true, tab:TAB_NAME, events:events.length };
