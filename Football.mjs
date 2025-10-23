@@ -1,5 +1,4 @@
-// Football.mjs — Prefill + Finals + Live + Finals-backfill + Direct grading (G..K) + safe appends
-
+// Football.mjs — Prefill + Finals + Live + Finals-backfill + Direct grading (G..K) + CF purge
 import { google } from "googleapis";
 import axios from "axios";
 
@@ -45,13 +44,22 @@ const isOff = v => typeof v==="string" && /off/i.test(v.trim());
 const blankIfOff = v => (isOff(v) ? "" : v);
 function normalizeML(v){
   if (v===null || v===undefined || v==="") return "";
-  if (isOff(v)) return "";
+  if (isOff(v)) return "";                     // OFF -> blank
   const s = String(v).trim();
-  if (/^(ev|even)$/i.test(s) || Number(s)===0) return "+100";
-  return s.startsWith("+") || s.startsWith("-") ? s : String(Number(s)||s);
+  if (/^(ev|even)$/i.test(s)) return "+100";   // EVEN/EV -> +100
+  const n = Number(s);
+  if (Number.isFinite(n) && n === 0) return "+100"; // safety: 0 -> +100
+  return s.startsWith("+") || s.startsWith("-") ? s : String(n || s);
 }
-function normalizeSpread(v){ if (isOff(v) || v==null || v==="") return ""; return String(v).trim(); }
-function normalizeTotal(v){ if (isOff(v) || v==null || v==="") return ""; return String(v).trim(); }
+function normalizeSpread(v){
+  // clean "OFF" and pass through numeric-ish strings like "-2.5", "+3.5"
+  if (isOff(v) || v==null || v==="") return "";
+  return String(v).trim();
+}
+function normalizeTotal(v){
+  if (isOff(v) || v==null || v==="") return "";
+  return String(v).trim();
+}
 
 function statusClock(evt){
   const comp = evt.competitions?.[0] || {};
@@ -166,16 +174,6 @@ class Sheets{
   constructor(auth,id,tab){ this.api=google.sheets({version:"v4",auth}); this.id=id; this.tab=tab; }
   async read(){ const r=await this.api.spreadsheets.values.get({spreadsheetId:this.id,range:`${this.tab}!A1:Q`}); return r.data.values||[]; }
   async batch(values){ if(values.length) await this.api.spreadsheets.values.batchUpdate({spreadsheetId:this.id,requestBody:{valueInputOption:"RAW",data:values}}); }
-  async append(values){ // safe append, inserts rows
-    if(!values.length) return;
-    await this.api.spreadsheets.values.append({
-      spreadsheetId:this.id,
-      range:`${this.tab}!A1`,
-      valueInputOption:"RAW",
-      insertDataOption:"INSERT_ROWS",
-      requestBody:{ values }
-    });
-  }
   async batchReq(reqs){ if(reqs.length) await this.api.spreadsheets.batchUpdate({spreadsheetId:this.id,requestBody:{requests:reqs}}); }
   async sheetId(){ const meta=await this.api.spreadsheets.get({spreadsheetId:this.id}); const s=meta?.data?.sheets?.find(x=>x.properties?.title===this.tab); return s?.properties?.sheetId; }
   async getConditionalFormats(){ 
@@ -224,8 +222,8 @@ class Sheets{
   }
   events = uniq(events.map(e=>e)).filter(Boolean);
 
-  /* --- PREFILL (append missing, never overwrite existing odds) --- */
-  const appendRows = [];
+  /* --- PREFILL (append missing) --- */
+  const prefillRows = [];
   for (const ev of events){
     const id=String(ev.id); if (rowById.get(id)) continue;
     const comp=ev.competitions?.[0]||{};
@@ -255,10 +253,10 @@ class Sheets{
       aML     = normalizeML(a?.moneyLine ?? a?.moneyline ?? "");
       hML     = normalizeML(h?.moneyLine ?? h?.moneyline ?? "");
     }
-    appendRows.push([id, dateET, sbWeek, status, matchup, "", aSpread, aML, hSpread, hML, total, "","","","","",""]);
+    prefillRows.push([id, dateET, sbWeek, status, matchup, "", aSpread, aML, hSpread, hML, total, "","","","","",""]);
   }
-  if (appendRows.length){
-    await sh.append(appendRows);                 // INSERT_ROWS (no overwrite)
+  if (prefillRows.length){
+    await sh.batch([{ range:`${TAB_NAME}!A2`, values:prefillRows }]);  // start at row 2
     // refresh index
     const g2=await sh.read(); const r2=g2.slice(1); hmap = mapHeaders(g2[0]); rows=r2;
     r2.forEach((r,i)=>{ const id=(r[hmap["game id"]]||"").toString().trim(); if(id) rowById.set(id, i+2); });
@@ -310,7 +308,7 @@ class Sheets{
   await sh.batch(valWrites);
   await sh.batchReq(fmtReqs);
 
-  /* --- Finals backfill sweep --- */
+  /* --- Finals backfill sweep (promote non-Final rows to Final if summary says so) --- */
   const needCheck = [];
   rows.forEach((r,i)=>{
     const id=(r[hmap["game id"]]||"").toString().trim();
@@ -408,15 +406,29 @@ class Sheets{
         }});
       };
 
+      // A Spread: a + spread > h wins
       if (G!=null) paint(hmap["a spread"], (a + G > h) ? GREEN : RED);
+      // A ML: a > h wins
       if (H!=null) paint(hmap["a ml"], (a > h) ? GREEN : RED);
+      // H Spread: h + spread > a wins
       if (I!=null) paint(hmap["h spread"], (h + I > a) ? GREEN : RED);
+      // H ML: h > a wins
       if (J!=null) paint(hmap["h ml"], (h > a) ? GREEN : RED);
+      // Total: (a+h) > total wins (Over green)
       if (K!=null) paint(hmap["total"], ((a+h) > K) ? GREEN : RED);
     }
     await sh.batchReq(reqs);
   }
 
+function normalizeML(v){
+  if (v == null || v === "") return "";
+  const s = String(v).trim();
+  if (/^(ev|even)$/i.test(s) || Number(s) === 0) return "+100";
+  if (/off/i.test(s)) return "";   // keep OFF blank
+  return s.startsWith("+") || s.startsWith("-") ? s : String(Number(s) || s);
+}
+
+  
   const out = { ok:true, tab:TAB_NAME, events:events.length };
   process.stdout.write(`***${JSON.stringify(out)}***\n`);
 })().catch(e=>{
