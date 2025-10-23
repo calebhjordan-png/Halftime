@@ -1,18 +1,13 @@
 {
-  "name": "halftime-bot",
+  "name": "sports-bot",
   "version": "1.0.0",
   "type": "module",
   "private": true,
   "scripts": {
-    "start": "node orchestrator.mjs",
-    "live:cfb": "LEAGUE=college-football TAB_NAME=CFB node live-game.mjs",
-    "live:nfl": "LEAGUE=nfl TAB_NAME=NFL node live-game.mjs"
+    "start": "node Football.mjs"
   },
   "dependencies": {
     "axios": "1.12.2",
-    "googleapis": "129.0.0",
-    "luxon": "3.7.2",
-    "dotenv": "17.2.3",
-    "playwright": "1.48.2"
+    "googleapis": "129.0.0"
   }
 }
