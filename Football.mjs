@@ -420,15 +420,6 @@ class Sheets{
     await sh.batchReq(reqs);
   }
 
-function normalizeML(v){
-  if (v == null || v === "") return "";
-  const s = String(v).trim();
-  if (/^(ev|even)$/i.test(s) || Number(s) === 0) return "+100";
-  if (/off/i.test(s)) return "";   // keep OFF blank
-  return s.startsWith("+") || s.startsWith("-") ? s : String(Number(s) || s);
-}
-
-  
   const out = { ok:true, tab:TAB_NAME, events:events.length };
   process.stdout.write(`***${JSON.stringify(out)}***\n`);
 })().catch(e=>{
