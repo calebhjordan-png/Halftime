@@ -26,51 +26,50 @@ on:
         default: ""
 
 jobs:
-  run:
+  nfl:
+    if: ${{ inputs.league == 'both' || inputs.league == 'nfl' }}
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - league: nfl
-            tab: NFL
-          - league: college-football
-            tab: CFB
-
     steps:
-      - name: Conditional skip (league filter)
-        if: ${{ !(github.event.inputs.league == 'both' || github.event.inputs.league == matrix.league) }}
-        run: |
-          echo "Skipping matrix.league=${{ matrix.league }} because workflow input league=${{ github.event.inputs.league }}"
-          exit 0
-
       - uses: actions/checkout@v4
 
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
 
-      - name: Cache npm
-        uses: actions/cache@v4
-        with:
-          path: ~/.npm
-          key: npm-${{ runner.os }}-${{ hashFiles('package-lock.json', 'package.json') }}
-          restore-keys: |
-            npm-${{ runner.os }}-
-
       - name: Install deps
-        run: |
-          npm ci || npm i
-          npm ls axios googleapis >/dev/null 2>&1 || npm i axios googleapis
+        run: npm i axios googleapis
 
-      - name: Run Football.mjs
+      - name: Run Football.mjs (NFL)
         env:
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
           GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
-          LEAGUE: ${{ matrix.league }}
-          TAB_NAME: ${{ matrix.tab }}
+          LEAGUE: nfl
+          TAB_NAME: NFL
           RUN_SCOPE: week
-          RUN_MODE: ${{ github.event.inputs.run_mode }}
-          GAME_IDS: ${{ github.event.inputs.game_ids }}
-          GHA_JSON: "1"
+          RUN_MODE: ${{ inputs.run_mode }}
+          GAME_IDS: ${{ inputs.game_ids }}
+        run: node Football.mjs
+
+  cfb:
+    if: ${{ inputs.league == 'both' || inputs.league == 'college-football' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install deps
+        run: npm i axios googleapis
+
+      - name: Run Football.mjs (CFB)
+        env:
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+          GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
+          LEAGUE: college-football
+          TAB_NAME: CFB
+          RUN_SCOPE: week
+          RUN_MODE: ${{ inputs.run_mode }}
+          GAME_IDS: ${{ inputs.game_ids }}
         run: node Football.mjs
