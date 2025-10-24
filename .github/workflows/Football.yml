@@ -2,61 +2,39 @@ name: Football (Prefill + Finals + Live)
 
 on:
   workflow_dispatch:
-    inputs:
-      league:
-        description: "League to run"
-        type: choice
-        options: [both, nfl, college-football]
-        default: both
-      game_ids:
-        description: "Optional comma-separated ESPN Game IDs"
-        required: false
-        default: ""
-      run_scope:
-        description: "Range (today | week)"
-        type: choice
-        options: [today, week]
-        default: week
 
 jobs:
   run-nfl:
-    if: ${{ inputs.league == 'both' || inputs.league == 'nfl' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with: { node-version: '20' }
-      - name: Install deps
-        run: npm i axios googleapis
+      - run: npm i googleapis axios
       - name: Run Football.mjs (NFL)
         env:
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
           GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
           LEAGUE: nfl
           TAB_NAME: NFL
-          RUN_SCOPE: ${{ inputs.run_scope }}
-          GAME_IDS: ${{ inputs.game_ids }}
-          GHA_JSON: "1"
-          TZ: America/New_York
-        run: node Football.mjs
+          RUN_SCOPE: week
+        run: |
+          node Football.mjs || (echo "retrying…" && sleep 5 && node Football.mjs)
 
   run-cfb:
-    if: ${{ inputs.league == 'both' || inputs.league == 'college-football' }}
+    needs: run-nfl   # don’t start at the exact same instant
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with: { node-version: '20' }
-      - name: Install deps
-        run: npm i axios googleapis
+      - run: npm i googleapis axios
       - name: Run Football.mjs (CFB)
         env:
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
           GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
           LEAGUE: college-football
           TAB_NAME: CFB
-          RUN_SCOPE: ${{ inputs.run_scope }}
-          GAME_IDS: ${{ inputs.game_ids }}
-          GHA_JSON: "1"
-          TZ: America/New_York
-        run: node Football.mjs
+          RUN_SCOPE: week
+        run: |
+          node Football.mjs || (echo "retrying…" && sleep 5 && node Football.mjs)
